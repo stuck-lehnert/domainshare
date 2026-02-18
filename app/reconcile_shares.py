@@ -336,7 +336,7 @@ def render_dynamic_shares(conn: sqlite3.Connection) -> None:
                 "create mask = 0660",
                 "directory mask = 2770",
                 "inherit permissions = yes",
-                "access based share enumeration = yes",
+                "access based share enum = yes",
                 "",
             ]
         )
@@ -433,7 +433,9 @@ def list_domain_users() -> List[str]:
 def sync_public_directory() -> None:
     workgroup = os.environ["WORKGROUP"]
     public_group = os.getenv("PUBLIC_GROUP", "Domain Users")
-    qualified_group = f"{workgroup}\\{public_group}"
+    qualified_group = (
+        public_group if "\\" in public_group else f"{workgroup}\\{public_group}"
+    )
 
     os.makedirs(PUBLIC_ROOT, exist_ok=True)
     gid = resolve_group_gid(qualified_group)

@@ -3,10 +3,12 @@ services:
     build:
       context: .
     container_name: ad-samba-file-server
-    hostname: ${SAMBA_HOSTNAME:-ad-samba-file-server}
+    hostname: ${SAMBA_HOSTNAME:-adsambafsrv}
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      NETBIOS_NAME: ${NETBIOS_NAME:-ADSAMBAFSRV}
     ports:
       - "445:445"
       - "139:139"

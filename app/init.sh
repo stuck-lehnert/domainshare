@@ -18,6 +18,55 @@ append_winbind_to_nss() {
   sed -ri '/^group:/ { /winbind/! s/$/ winbind/ }' /etc/nsswitch.conf
 }
 
+derive_netbios_name() {
+  local raw_name="${NETBIOS_NAME:-ADSAMBAFSRV}"
+  local upper_name="${raw_name^^}"
+  local cleaned_name
+  cleaned_name="$(printf '%s' "$upper_name" | tr -cd 'A-Z0-9')"
+
+  if [[ -z "$cleaned_name" ]]; then
+    cleaned_name="SAMBAFS"
+  fi
+
+  if [[ ${#cleaned_name} -gt 15 ]]; then
+    log "NETBIOS_NAME derived from '${raw_name}' exceeds 15 chars, truncating."
+  fi
+
+  export NETBIOS_NAME="${cleaned_name:0:15}"
+}
+
+resolve_sid_to_group() {
+  local sid="$1"
+  local group_name=""
+  local sid_output=""
+
+  if sid_output="$(wbinfo --sid-to-fullname "$sid" 2>/dev/null)"; then
+    group_name="${sid_output%%$'\t'*}"
+  fi
+
+  if [[ -z "$group_name" ]] && sid_output="$(wbinfo -s "$sid" 2>/dev/null)"; then
+    group_name="$(printf '%s' "$sid_output" | sed -E 's/[[:space:]]+[0-9]+$//')"
+  fi
+
+  if [[ -z "$group_name" ]]; then
+    printf '[init] ERROR: unable to resolve SID %s via winbind\n' "$sid" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$group_name"
+}
+
+resolve_share_groups_from_sids() {
+  export DOMAIN_USERS_GROUP
+  DOMAIN_USERS_GROUP="$(resolve_sid_to_group "$DOMAIN_USERS_SID")"
+
+  export DOMAIN_ADMINS_GROUP
+  DOMAIN_ADMINS_GROUP="$(resolve_sid_to_group "$DOMAIN_ADMINS_SID")"
+
+  export PUBLIC_GROUP
+  PUBLIC_GROUP="$(resolve_sid_to_group "$PUBLIC_GROUP_SID")"
+}
+
 render_krb5_conf() {
   cat > /etc/krb5.conf <<EOF
 [libdefaults]
@@ -50,13 +99,19 @@ write_runtime_env_file() {
     printf 'export REALM=%q\n' "$REALM"
     printf 'export WORKGROUP=%q\n' "$WORKGROUP"
     printf 'export DOMAIN=%q\n' "$DOMAIN"
+    printf 'export NETBIOS_NAME=%q\n' "$NETBIOS_NAME"
+    printf 'export DOMAIN_USERS_SID=%q\n' "$DOMAIN_USERS_SID"
+    printf 'export DOMAIN_ADMINS_SID=%q\n' "$DOMAIN_ADMINS_SID"
+    printf 'export PUBLIC_GROUP_SID=%q\n' "$PUBLIC_GROUP_SID"
+    printf 'export DOMAIN_USERS_GROUP=%q\n' "$DOMAIN_USERS_GROUP"
+    printf 'export DOMAIN_ADMINS_GROUP=%q\n' "$DOMAIN_ADMINS_GROUP"
+    printf 'export PUBLIC_GROUP=%q\n' "$PUBLIC_GROUP"
     if [[ -n "${JOIN_USER:-}" ]]; then
       printf 'export JOIN_USER=%q\n' "$JOIN_USER"
     fi
     if [[ -n "${JOIN_PASSWORD:-}" ]]; then
       printf 'export JOIN_PASSWORD=%q\n' "$JOIN_PASSWORD"
     fi
-    printf 'export PUBLIC_GROUP=%q\n' "$PUBLIC_GROUP"
     if [[ -n "${LDAP_URI:-}" ]]; then
       printf 'export LDAP_URI=%q\n' "$LDAP_URI"
     fi
@@ -109,9 +164,14 @@ EOF
 require_env REALM
 require_env WORKGROUP
 require_env DOMAIN
+require_env DOMAIN_USERS_SID
+require_env DOMAIN_ADMINS_SID
 
 export REALM WORKGROUP DOMAIN
-export PUBLIC_GROUP="${PUBLIC_GROUP:-Domain Users}"
+export PUBLIC_GROUP_SID="${PUBLIC_GROUP_SID:-${DOMAIN_USERS_SID}}"
+export DOMAIN_USERS_GROUP="${DOMAIN_USERS_SID}"
+export DOMAIN_ADMINS_GROUP="${DOMAIN_ADMINS_SID}"
+export PUBLIC_GROUP="${PUBLIC_GROUP_SID}"
 if [[ -n "${JOIN_USER:-}" ]]; then
   export JOIN_USER
 fi
@@ -123,7 +183,7 @@ mkdir -p /data/private /data/public /data/groups /state /etc/samba/generated /va
 touch /etc/samba/generated/shares.conf /var/log/reconcile.log
 
 append_winbind_to_nss
-write_runtime_env_file
+derive_netbios_name
 render_krb5_conf
 render_smb_conf
 join_domain_if_needed
@@ -132,6 +192,10 @@ log 'Starting winbindd'
 winbindd -F --no-process-group &
 
 wait_for_winbind
+
+resolve_share_groups_from_sids
+render_smb_conf
+write_runtime_env_file
 
 log 'Running startup reconciliation'
 python3 /app/reconcile_shares.py

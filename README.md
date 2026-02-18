@@ -14,6 +14,8 @@ This repository provides a production-oriented Samba file server container that 
   - `/data/groups/<objectGUID>`
 - Samba machine trust/key material is persisted in `/var/lib/samba` to survive container recreation.
 - Container hostname is fixed (`SAMBA_HOSTNAME`) to keep AD computer identity stable.
+- NetBIOS name defaults to `ADSAMBAFSRV` and is clamped to 15 characters (`NETBIOS_NAME` override supported).
+- Setup prompts for well-known authorization groups by SID (`DOMAIN_USERS_SID`, `DOMAIN_ADMINS_SID`) to avoid localized group names.
 - Reconciliation is executed:
   - once on startup
   - every 5 minutes via cron
@@ -48,7 +50,8 @@ CREATE TABLE shares (
 ## AD Requirements
 
 - Existing AD DS domain reachable from the Docker host.
-- A service account with rights to join computers to the domain (`net ads join`).
+- Initial admin credentials with rights to create/reset `FileShare_ServiceAccount` during `./setup`.
+- `FileShare_ServiceAccount` must be allowed to join computers to the domain (`net ads join`) in your AD policy.
 - Dynamic group discovery primarily uses machine-account LDAP (`net ads search -P`); join credentials are only used as a fallback LDAP bind path.
 - Group naming convention for dynamic shares:
   - `FileShare_<ShareName>`
@@ -91,19 +94,30 @@ Kerberos requires close time alignment.
    - `REALM`
    - `WORKGROUP`
    - `DOMAIN`
-   - `JOIN_USER`
-   - `JOIN_PASSWORD`
+   - initial admin credentials (used once for provisioning)
+   - `DOMAIN_USERS_SID`
+   - `DOMAIN_ADMINS_SID`
+   - optional `PUBLIC_GROUP_SID` (defaults to `DOMAIN_USERS_SID`)
 
-3. The setup script writes `.env` and starts the service with:
+   Optional:
+   - `SAMBA_HOSTNAME` (defaults to `adsambafsrv`)
+   - `NETBIOS_NAME` (defaults to `ADSAMBAFSRV`, max 15 chars)
+
+3. Setup behavior:
+   - creates or updates AD account `FileShare_ServiceAccount`
+   - always sets a long random password
+   - writes only service-account credentials to `.env` (initial admin credentials are not stored)
+
+4. The setup script then starts the service with:
 
    ```bash
    docker compose up -d
    ```
 
-4. After startup:
-   - container joins AD (idempotent)
-   - startup reconciliation runs
-   - cron runs reconciliation every 5 minutes
+5. After startup:
+    - container joins AD (idempotent)
+    - startup reconciliation runs
+    - cron runs reconciliation every 5 minutes
 
 ## SMB Shares
 
@@ -123,7 +137,7 @@ Kerberos requires close time alignment.
 
 - Share: `\\server\Public`
 - Path: `/data/public`
-- Read/write for authenticated users in configurable `PUBLIC_GROUP` (default `Domain Users`).
+- Read/write for authenticated users in configurable `PUBLIC_GROUP_SID` (default: `DOMAIN_USERS_SID`, resolved through winbind).
 - No guest access.
 
 ### Dynamic Group Shares
@@ -147,7 +161,7 @@ docker compose exec samba testparm -s
 
 ### Domain join fails
 
-- Verify credentials in `.env`.
+- Verify service account credentials in `.env`.
 - Verify DNS resolution from container:
 
   ```bash
@@ -155,6 +169,11 @@ docker compose exec samba testparm -s
   ```
 
 - Verify time sync on host and AD DCs.
+- Verify NetBIOS name length is <= 15:
+
+  ```bash
+  docker compose exec samba testparm -s | grep -i 'netbios name'
+  ```
 
 ### Winbind user/group resolution fails
 

@@ -2,6 +2,26 @@
 set -euo pipefail
 
 ENV_FILE=".env"
+SERVICE_ACCOUNT_NAME="FileShare_ServiceAccount"
+
+BOOTSTRAP_ENV_FILE=""
+cleanup() {
+  if [[ -n "$BOOTSTRAP_ENV_FILE" && -f "$BOOTSTRAP_ENV_FILE" ]]; then
+    rm -f "$BOOTSTRAP_ENV_FILE"
+  fi
+}
+trap cleanup EXIT
+
+sanitize_netbios_name() {
+  local raw_name="$1"
+  local upper_name="${raw_name^^}"
+  local cleaned_name
+  cleaned_name="$(printf '%s' "$upper_name" | tr -cd 'A-Z0-9')"
+  if [[ -z "$cleaned_name" ]]; then
+    cleaned_name="ADSAMBAFSRV"
+  fi
+  printf '%s' "${cleaned_name:0:15}"
+}
 
 prompt_value() {
   local var_name="$1"
@@ -25,23 +45,106 @@ write_env_file() {
   local realm=""
   local workgroup=""
   local domain=""
-  local join_user=""
-  local join_password=""
+  local admin_user=""
+  local admin_password=""
+  local domain_users_sid=""
+  local domain_admins_sid=""
+  local public_group_sid=""
+  local samba_hostname="adsambafsrv"
+  local netbios_name="ADSAMBAFSRV"
+  local service_password=""
+  local public_group_prompt=""
+  local samba_hostname_input=""
+  local netbios_name_input=""
+  local sanitized_netbios_name=""
 
   prompt_value realm "REALM (e.g. EXAMPLE.COM)"
   prompt_value workgroup "WORKGROUP (NetBIOS, e.g. EXAMPLE)"
   prompt_value domain "DOMAIN (AD DNS name or reachable DC FQDN)"
-  prompt_value join_user "JOIN_USER (AD account with join rights)"
-  prompt_value join_password "JOIN_PASSWORD" true
+  prompt_value admin_user "Initial admin user (for provisioning service account)"
+  prompt_value admin_password "Initial admin password" true
+  prompt_value domain_users_sid "DOMAIN_USERS_SID (e.g. ...-513)"
+  prompt_value domain_admins_sid "DOMAIN_ADMINS_SID (e.g. ...-512)"
+
+  public_group_prompt="PUBLIC_GROUP_SID (press Enter to reuse DOMAIN_USERS_SID)"
+  read -r -p "${public_group_prompt}: " public_group_sid
+  if [[ -z "$public_group_sid" ]]; then
+    public_group_sid="$domain_users_sid"
+  fi
+
+  read -r -p "SAMBA_HOSTNAME [adsambafsrv]: " samba_hostname_input
+  if [[ -n "${samba_hostname_input:-}" ]]; then
+    samba_hostname="$samba_hostname_input"
+  fi
+
+  read -r -p "NETBIOS_NAME [ADSAMBAFSRV]: " netbios_name_input
+  if [[ -n "${netbios_name_input:-}" ]]; then
+    netbios_name="$netbios_name_input"
+  fi
+  sanitized_netbios_name="$(sanitize_netbios_name "$netbios_name")"
+  if [[ "$sanitized_netbios_name" != "$netbios_name" ]]; then
+    printf "Using sanitized NETBIOS_NAME: %s\n" "$sanitized_netbios_name"
+  fi
+  netbios_name="$sanitized_netbios_name"
+
+  service_password="$(tr -dc 'A-Za-z0-9@#%+=:_-' </dev/urandom | head -c 48)"
+
+  BOOTSTRAP_ENV_FILE="$(mktemp)"
+  chmod 600 "$BOOTSTRAP_ENV_FILE"
+
+  cat > "$BOOTSTRAP_ENV_FILE" <<EOF
+REALM=${realm}
+WORKGROUP=${workgroup}
+DOMAIN=${domain}
+JOIN_USER=${admin_user}
+JOIN_PASSWORD=${admin_password}
+SERVICE_ACCOUNT_NAME=${SERVICE_ACCOUNT_NAME}
+SERVICE_ACCOUNT_PASSWORD=${service_password}
+DOMAIN_USERS_SID=${domain_users_sid}
+DOMAIN_ADMINS_SID=${domain_admins_sid}
+PUBLIC_GROUP_SID=${public_group_sid}
+SAMBA_HOSTNAME=${samba_hostname}
+NETBIOS_NAME=${netbios_name}
+EOF
+
+  printf "Building image...\n"
+  docker compose build samba
+
+  printf "Provisioning service account %s...\n" "$SERVICE_ACCOUNT_NAME"
+  docker compose --env-file "$BOOTSTRAP_ENV_FILE" run --rm --entrypoint /bin/bash samba -lc '
+set -euo pipefail
+
+cat > /tmp/bootstrap-smb.conf <<EOF
+[global]
+   security = ADS
+   kerberos method = secrets and keytab
+   realm = ${REALM}
+   workgroup = ${WORKGROUP}
+   netbios name = ${NETBIOS_NAME}
+EOF
+
+run_net() {
+  printf "%s\n" "$JOIN_PASSWORD" | net -s /tmp/bootstrap-smb.conf -U "$JOIN_USER" -S "$DOMAIN" "$@"
+}
+
+if run_net ads search "(&(objectClass=user)(sAMAccountName=${SERVICE_ACCOUNT_NAME}))" sAMAccountName | grep -q "^sAMAccountName: ${SERVICE_ACCOUNT_NAME}$"; then
+  run_net ads password "${SERVICE_ACCOUNT_NAME}" "${SERVICE_ACCOUNT_PASSWORD}"
+else
+  run_net ads user add "${SERVICE_ACCOUNT_NAME}" "${SERVICE_ACCOUNT_PASSWORD}"
+fi
+'
 
   cat > "$ENV_FILE" <<EOF
 REALM=${realm}
 WORKGROUP=${workgroup}
 DOMAIN=${domain}
-JOIN_USER=${join_user}
-JOIN_PASSWORD=${join_password}
-PUBLIC_GROUP=Domain Users
-# SAMBA_HOSTNAME=ad-samba-file-server
+JOIN_USER=${SERVICE_ACCOUNT_NAME}
+JOIN_PASSWORD=${service_password}
+DOMAIN_USERS_SID=${domain_users_sid}
+DOMAIN_ADMINS_SID=${domain_admins_sid}
+PUBLIC_GROUP_SID=${public_group_sid}
+SAMBA_HOSTNAME=${samba_hostname}
+NETBIOS_NAME=${netbios_name}
 # Optional overrides:
 # LDAP_URI=ldaps://${domain}
 # LDAP_BASE_DN=DC=example,DC=com
