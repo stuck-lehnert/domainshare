@@ -210,6 +210,22 @@ docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
   docker compose exec samba cat /etc/samba/generated/shares.conf
   ```
 
+### `acl_xattr.so` or `full_audit.so` module load error
+
+- If logs show `Error loading module .../vfs/acl_xattr.so` (or `full_audit.so`), your running image is missing Samba VFS modules.
+- Rebuild and restart with the updated image:
+
+  ```bash
+  docker compose down
+  docker compose up -d --build
+  ```
+
+- Verify modules exist:
+
+  ```bash
+  docker compose exec samba sh -lc 'mods="$(smbd -b | sed -n "s/^ *MODULESDIR: //p" | head -n1)/vfs"; ls -1 "$mods"/acl_xattr.so "$mods"/full_audit.so'
+  ```
+
 ### Permissions in Private share are incorrect
 
 - Re-run reconciliation to rebuild private directories and ACLs:

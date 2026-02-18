@@ -18,6 +18,33 @@ append_winbind_to_nss() {
   sed -ri '/^group:/ { /winbind/! s/$/ winbind/ }' /etc/nsswitch.conf
 }
 
+detect_modules_dir() {
+  smbd -b | sed -n 's/^ *MODULESDIR: //p' | head -n1
+}
+
+require_vfs_modules() {
+  local modules_dir=""
+  modules_dir="$(detect_modules_dir)"
+  if [[ -z "$modules_dir" ]]; then
+    printf '[init] ERROR: unable to detect Samba MODULESDIR via smbd -b\n' >&2
+    exit 1
+  fi
+
+  local missing=0
+  local module
+  for module in acl_xattr full_audit; do
+    if [[ ! -f "$modules_dir/vfs/${module}.so" ]]; then
+      printf '[init] ERROR: missing VFS module %s at %s/vfs/%s.so\n' "$module" "$modules_dir" "$module" >&2
+      missing=1
+    fi
+  done
+
+  if [[ "$missing" -ne 0 ]]; then
+    printf '[init] Install package samba-vfs-modules and rebuild the image.\n' >&2
+    exit 1
+  fi
+}
+
 derive_netbios_name() {
   local raw_name="${NETBIOS_NAME:-ADSAMBAFSRV}"
   local upper_name="${raw_name^^}"
@@ -205,6 +232,7 @@ mkdir -p /data/private /data/public /data/groups /state /etc/samba/generated /va
 touch /etc/samba/generated/shares.conf /var/log/reconcile.log
 
 append_winbind_to_nss
+require_vfs_modules
 derive_netbios_name
 render_krb5_conf
 render_smb_conf

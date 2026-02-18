@@ -13,6 +13,7 @@ RUN apt-get update \
         libpam-winbind \
         python3 \
         samba \
+        samba-vfs-modules \
         tini \
         winbind \
     && rm -rf /var/lib/apt/lists/*
