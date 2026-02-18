@@ -16,6 +16,7 @@ This repository provides a production-oriented Samba file server container that 
 - Container hostname is fixed (`SAMBA_HOSTNAME`) to keep AD computer identity stable.
 - NetBIOS name defaults to `ADSAMBAFSRV` and is clamped to 15 characters (`NETBIOS_NAME` override supported).
 - Setup prompts for well-known authorization groups by SID (`DOMAIN_USERS_SID`, `DOMAIN_ADMINS_SID`) to avoid localized group names.
+- Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
 - Reconciliation is executed:
   - once on startup
   - every 5 minutes via cron

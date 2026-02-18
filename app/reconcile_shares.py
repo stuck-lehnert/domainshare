@@ -275,10 +275,7 @@ def reconcile_db(conn: sqlite3.Connection, ad_groups: List[Dict[str, str]]) -> N
 
 
 def qualify_group(group_name: str) -> str:
-    workgroup = os.getenv("WORKGROUP", "").strip()
-    if workgroup:
-        return f'@"{workgroup}\\{group_name}"'
-    return f"@{group_name}"
+    return f'+"{group_name}"'
 
 
 def is_valid_share_name(share_name: str) -> bool:
@@ -372,6 +369,38 @@ def resolve_group_gid(qualified_group: str) -> Optional[int]:
         return None
 
 
+def resolve_user_uid_flexible(workgroup: str, username: str) -> Optional[int]:
+    candidates: List[str] = []
+    if "\\" in username:
+        candidates.append(username)
+        candidates.append(username.split("\\", 1)[1])
+    else:
+        candidates.append(f"{workgroup}\\{username}")
+        candidates.append(username)
+
+    for candidate in candidates:
+        uid = resolve_user_uid(candidate)
+        if uid is not None:
+            return uid
+    return None
+
+
+def resolve_group_gid_flexible(workgroup: str, group_name: str) -> Optional[int]:
+    candidates: List[str] = []
+    if "\\" in group_name:
+        candidates.append(group_name)
+        candidates.append(group_name.split("\\", 1)[1])
+    else:
+        candidates.append(f"{workgroup}\\{group_name}")
+        candidates.append(group_name)
+
+    for candidate in candidates:
+        gid = resolve_group_gid(candidate)
+        if gid is not None:
+            return gid
+    return None
+
+
 def set_acl(path: str, user_uid: int, admin_gid: Optional[int]) -> None:
     run_command(["setfacl", "-b", path], check=False)
     acl_entries = [f"u:{user_uid}:rwx", f"d:u:{user_uid}:rwx"]
@@ -433,12 +462,10 @@ def list_domain_users() -> List[str]:
 def sync_public_directory() -> None:
     workgroup = os.environ["WORKGROUP"]
     public_group = os.getenv("PUBLIC_GROUP", "Domain Users")
-    qualified_group = (
-        public_group if "\\" in public_group else f"{workgroup}\\{public_group}"
-    )
+    qualified_group = public_group
 
     os.makedirs(PUBLIC_ROOT, exist_ok=True)
-    gid = resolve_group_gid(qualified_group)
+    gid = resolve_group_gid_flexible(workgroup, qualified_group)
 
     if gid is not None:
         os.chown(PUBLIC_ROOT, 0, gid)
@@ -452,18 +479,17 @@ def sync_public_directory() -> None:
 
 def sync_private_directories() -> None:
     workgroup = os.environ["WORKGROUP"]
-    admin_group = f"{workgroup}\\Domain Admins"
-    admin_gid = resolve_group_gid(admin_group)
+    admin_group = os.getenv("DOMAIN_ADMINS_GROUP", "Domain Admins")
+    admin_gid = resolve_group_gid_flexible(workgroup, admin_group)
 
     os.makedirs(PRIVATE_ROOT, exist_ok=True)
     os.chmod(PRIVATE_ROOT, 0o755)
 
     users = list_domain_users()
     for username in users:
-        qualified_user = f"{workgroup}\\{username}"
-        uid = resolve_user_uid(qualified_user)
+        uid = resolve_user_uid_flexible(workgroup, username)
         if uid is None:
-            log(f"Unable to resolve UID for {qualified_user}, skipping private folder")
+            log(f"Unable to resolve UID for {username}, skipping private folder")
             continue
 
         user_path = os.path.join(PRIVATE_ROOT, username)
@@ -475,7 +501,8 @@ def sync_private_directories() -> None:
 
 def sync_dynamic_directory_permissions(conn: sqlite3.Connection) -> None:
     workgroup = os.environ["WORKGROUP"]
-    admin_gid = resolve_group_gid(f"{workgroup}\\Domain Admins")
+    admin_group = os.getenv("DOMAIN_ADMINS_GROUP", "Domain Admins")
+    admin_gid = resolve_group_gid_flexible(workgroup, admin_group)
 
     rows = conn.execute(
         "SELECT samAccountName, path FROM shares WHERE isActive = 1"
@@ -486,9 +513,9 @@ def sync_dynamic_directory_permissions(conn: sqlite3.Connection) -> None:
         os.makedirs(path, exist_ok=True)
         os.chmod(path, 0o2770)
 
-        gid = resolve_group_gid(f"{workgroup}\\{sam}")
+        gid = resolve_group_gid_flexible(workgroup, sam)
         if gid is None:
-            log(f"Unable to resolve GID for {workgroup}\\{sam}; leaving existing ACLs")
+            log(f"Unable to resolve GID for {sam}; leaving existing ACLs")
             continue
 
         os.chown(path, 0, gid)

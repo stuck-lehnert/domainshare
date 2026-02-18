@@ -37,22 +37,40 @@ derive_netbios_name() {
 
 resolve_sid_to_group() {
   local sid="$1"
+  local resolved_name=""
   local group_name=""
+  local short_name=""
   local sid_output=""
 
   if sid_output="$(wbinfo --sid-to-fullname "$sid" 2>/dev/null)"; then
-    group_name="${sid_output%%$'\t'*}"
+    resolved_name="${sid_output%%$'\t'*}"
   fi
 
-  if [[ -z "$group_name" ]] && sid_output="$(wbinfo -s "$sid" 2>/dev/null)"; then
-    group_name="$(printf '%s' "$sid_output" | sed -E 's/[[:space:]]+[0-9]+$//')"
+  if [[ -z "$resolved_name" ]] && sid_output="$(wbinfo -s "$sid" 2>/dev/null)"; then
+    resolved_name="$(printf '%s' "$sid_output" | sed -E 's/[[:space:]]+[0-9]+$//')"
   fi
 
-  if [[ -z "$group_name" ]]; then
+  if [[ -z "$resolved_name" ]]; then
     printf '[init] ERROR: unable to resolve SID %s via winbind\n' "$sid" >&2
     return 1
   fi
 
+  group_name="$resolved_name"
+  if getent group "$group_name" >/dev/null 2>&1; then
+    printf '%s\n' "$group_name"
+    return 0
+  fi
+
+  short_name="$group_name"
+  if [[ "$short_name" == *\\* ]]; then
+    short_name="${short_name#*\\}"
+  fi
+  if [[ -n "$short_name" ]] && getent group "$short_name" >/dev/null 2>&1; then
+    printf '%s\n' "$short_name"
+    return 0
+  fi
+
+  log "SID ${sid} resolved to '${resolved_name}', but NSS group lookup failed; using raw name."
   printf '%s\n' "$group_name"
 }
 
@@ -65,6 +83,10 @@ resolve_share_groups_from_sids() {
 
   export PUBLIC_GROUP
   PUBLIC_GROUP="$(resolve_sid_to_group "$PUBLIC_GROUP_SID")"
+
+  log "Resolved DOMAIN_USERS_SID to '${DOMAIN_USERS_GROUP}'"
+  log "Resolved DOMAIN_ADMINS_SID to '${DOMAIN_ADMINS_GROUP}'"
+  log "Resolved PUBLIC_GROUP_SID to '${PUBLIC_GROUP}'"
 }
 
 render_krb5_conf() {
