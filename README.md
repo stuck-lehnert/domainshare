@@ -17,6 +17,7 @@ This repository provides a production-oriented Samba file server container that 
 - NetBIOS name defaults to `ADSAMBAFSRV` and is clamped to 15 characters (`NETBIOS_NAME` override supported).
 - Setup prompts for well-known authorization groups by SID (`DOMAIN_USERS_SID`, `DOMAIN_ADMINS_SID`) to avoid localized group names.
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
+- Share operations are audited with Samba `full_audit` (connect, list, read, write, create, delete, rename) and written to Samba log files.
 - Reconciliation is executed:
   - once on startup
   - every 5 minutes via cron
@@ -157,6 +158,7 @@ docker compose logs -f samba
 docker compose exec samba python3 /app/reconcile_shares.py
 docker compose exec samba sqlite3 /state/shares.db 'SELECT * FROM shares;'
 docker compose exec samba testparm -s
+docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
 ```
 
 ## Troubleshooting
