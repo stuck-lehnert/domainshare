@@ -104,7 +104,8 @@ Kerberos requires close time alignment.
    - `NETBIOS_NAME` (defaults to `ADSAMBAFSRV`, max 15 chars)
 
 3. Setup behavior:
-   - creates or updates AD account `FileShare_ServiceAccount`
+   - creates or updates AD service account from desired name `FileShare_ServiceAccount`
+   - uses a valid AD `sAMAccountName` (max 20 chars); default effective value is `FileShare_ServiceAcc`
    - always sets a long random password
    - writes only service-account credentials to `.env` (initial admin credentials are not stored)
 

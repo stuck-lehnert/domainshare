@@ -43,6 +43,20 @@ sanitize_netbios_name() {
   printf '%s' "${cleaned_name:0:15}"
 }
 
+sanitize_sam_account_name() {
+  local raw_name="$1"
+  local cleaned_name
+  cleaned_name="$(printf '%s' "$raw_name" | tr -cd 'A-Za-z0-9._-')"
+  if [[ "$cleaned_name" == "FileShare_ServiceAccount" ]]; then
+    printf '%s' "FileShare_ServiceAcc"
+    return
+  fi
+  if [[ -z "$cleaned_name" ]]; then
+    cleaned_name="FileShareSvc"
+  fi
+  printf '%s' "${cleaned_name:0:20}"
+}
+
 prompt_value() {
   local var_name="$1"
   local prompt_text="$2"
@@ -73,6 +87,7 @@ write_env_file() {
   local samba_hostname="adsambafsrv"
   local netbios_name="ADSAMBAFSRV"
   local service_password=""
+  local service_account_sam=""
   local public_group_prompt=""
   local samba_hostname_input=""
   local netbios_name_input=""
@@ -107,6 +122,11 @@ write_env_file() {
   fi
   netbios_name="$sanitized_netbios_name"
 
+  service_account_sam="$(sanitize_sam_account_name "$SERVICE_ACCOUNT_NAME")"
+  if [[ "$service_account_sam" != "$SERVICE_ACCOUNT_NAME" ]]; then
+    printf "Using sAMAccountName '%s' (AD limit is 20 chars; requested '%s').\n" "$service_account_sam" "$SERVICE_ACCOUNT_NAME"
+  fi
+
   service_password="$(python3 - <<'PY'
 import secrets
 import string
@@ -133,6 +153,7 @@ DOMAIN=${domain}
 JOIN_USER=${admin_user}
 JOIN_PASSWORD=${admin_password}
 SERVICE_ACCOUNT_NAME=${SERVICE_ACCOUNT_NAME}
+SERVICE_ACCOUNT_SAM=${service_account_sam}
 SERVICE_ACCOUNT_PASSWORD=${service_password}
 DOMAIN_USERS_SID=${domain_users_sid}
 DOMAIN_ADMINS_SID=${domain_admins_sid}
@@ -162,13 +183,20 @@ cat > /tmp/bootstrap-smb.conf <<EOF
 EOF
 
 run_net() {
-  printf "%s\n" "$JOIN_PASSWORD" | net -s /tmp/bootstrap-smb.conf -U "$JOIN_USER" -S "$DOMAIN" "$@"
+  net -s /tmp/bootstrap-smb.conf -A /tmp/bootstrap.auth -S "$DOMAIN" "$@"
 }
 
-if run_net ads search "(&(objectClass=user)(sAMAccountName=${SERVICE_ACCOUNT_NAME}))" sAMAccountName | grep -q "^sAMAccountName: ${SERVICE_ACCOUNT_NAME}$"; then
-  run_net ads password "${SERVICE_ACCOUNT_NAME}" "${SERVICE_ACCOUNT_PASSWORD}"
+cat > /tmp/bootstrap.auth <<EOF
+username = ${JOIN_USER}
+password = ${JOIN_PASSWORD}
+domain = ${WORKGROUP}
+EOF
+chmod 600 /tmp/bootstrap.auth
+
+if run_net ads search "(&(objectClass=user)(sAMAccountName=${SERVICE_ACCOUNT_SAM}))" sAMAccountName | grep -q "^sAMAccountName: ${SERVICE_ACCOUNT_SAM}$"; then
+  run_net ads password "${SERVICE_ACCOUNT_SAM}" "${SERVICE_ACCOUNT_PASSWORD}"
 else
-  run_net ads user add "${SERVICE_ACCOUNT_NAME}" "${SERVICE_ACCOUNT_PASSWORD}"
+  run_net ads user add "${SERVICE_ACCOUNT_SAM}" "${SERVICE_ACCOUNT_PASSWORD}"
 fi
 '
 
@@ -176,7 +204,7 @@ fi
 REALM=${realm}
 WORKGROUP=${workgroup}
 DOMAIN=${domain}
-JOIN_USER=${SERVICE_ACCOUNT_NAME}
+JOIN_USER=${service_account_sam}
 JOIN_PASSWORD=${service_password}
 DOMAIN_USERS_SID=${domain_users_sid}
 DOMAIN_ADMINS_SID=${domain_admins_sid}
