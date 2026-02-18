@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() {
+  printf '[redeploy] %s\n' "$*"
+}
+
+if [[ ! -d .git ]]; then
+  printf '[redeploy] ERROR: run this script from the repository root.\n' >&2
+  exit 1
+fi
+
+log 'Stopping stack'
+docker compose down
+
+log 'Removing current local compose image(s)'
+IMAGE_IDS="$(docker compose images -q | sort -u | tr '\n' ' ' | xargs)"
+if [[ -n "$IMAGE_IDS" ]]; then
+  docker image rm -f $IMAGE_IDS
+else
+  log 'No compose-managed local images found to remove.'
+fi
+
+log 'Pulling latest git changes'
+git pull
+
+log 'Starting stack'
+docker compose up -d
+
+log 'Redeploy complete'
