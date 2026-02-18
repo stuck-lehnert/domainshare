@@ -29,7 +29,7 @@ GROUP_PREFIXES = ("FileShare_", "FS_")
 USER_STATUS_FILTER = "(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*))"
 
 REQUIRED_ENV = ["REALM", "WORKGROUP", "DOMAIN"]
-ATTR_RE = re.compile(r"^([^:]+)(::?):\s*(.*)$")
+ATTR_RE = re.compile(r"^([^:]+)(::?)\s*(.*)$")
 SHARE_NAME_INVALID_RE = re.compile(r"[\\/:*?\"<>|;\[\],+=]")
 PRIVATE_SKIP_EXACT = {
     "krbtgt",
