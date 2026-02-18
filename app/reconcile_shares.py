@@ -107,7 +107,7 @@ def parse_ldap_entries(output: str) -> List[Dict[str, Tuple[str, bool]]]:
             continue
 
         key, delimiter, value = match.groups()
-        current[key] = (value, delimiter == "::")
+        current[key.lower()] = (value, delimiter == "::")
 
     if current:
         entries.append(current)
@@ -128,16 +128,16 @@ def parse_groups_from_ldap_output(output: str) -> List[Dict[str, str]]:
 
     groups: List[Dict[str, str]] = []
     for entry in entries:
-        if "objectGUID" not in entry or "sAMAccountName" not in entry:
+        if "objectguid" not in entry or "samaccountname" not in entry:
             continue
 
-        sam_value, _ = entry["sAMAccountName"]
+        sam_value, _ = entry["samaccountname"]
         sam = sam_value.strip()
         share_name = derive_share_name(sam)
         if not share_name:
             continue
 
-        guid_value, is_b64 = entry["objectGUID"]
+        guid_value, is_b64 = entry["objectguid"]
         guid = parse_guid(guid_value.strip(), is_b64)
 
         groups.append(
@@ -255,16 +255,16 @@ def fetch_non_login_users() -> set:
     now_filetime = windows_filetime_now()
 
     for entry in parse_ldap_entries(result.stdout):
-        if "sAMAccountName" not in entry:
+        if "samaccountname" not in entry:
             continue
 
-        username = entry["sAMAccountName"][0].strip().lower()
+        username = entry["samaccountname"][0].strip().lower()
         if not username:
             continue
 
-        uac = parse_int(entry.get("userAccountControl", ("0", False))[0], 0)
-        account_expires = parse_int(entry.get("accountExpires", ("0", False))[0], 0)
-        lockout_time = parse_int(entry.get("lockoutTime", ("0", False))[0], 0)
+        uac = parse_int(entry.get("useraccountcontrol", ("0", False))[0], 0)
+        account_expires = parse_int(entry.get("accountexpires", ("0", False))[0], 0)
+        lockout_time = parse_int(entry.get("lockouttime", ("0", False))[0], 0)
 
         is_disabled = bool(uac & UAC_ACCOUNTDISABLE)
         is_locked = bool(uac & UAC_LOCKOUT) or lockout_time > 0
