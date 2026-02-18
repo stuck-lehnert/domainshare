@@ -386,7 +386,12 @@ def reconcile_db(conn: sqlite3.Connection, ad_groups: List[Dict[str, str]]) -> N
 
 
 def qualify_group(group_name: str) -> str:
-    return f'+"{group_name}"'
+    if "\\" in group_name:
+        return f'@"{group_name}"'
+    workgroup = os.getenv("WORKGROUP", "").strip()
+    if workgroup:
+        return f'@"{workgroup}\\{group_name}"'
+    return f'@"{group_name}"'
 
 
 def is_valid_share_name(share_name: str) -> bool:
@@ -731,7 +736,6 @@ def with_lock() -> bool:
 
         sync_public_directory()
         sync_private_directories()
-        refresh_winbind_cache()
         reload_samba()
         log("Reconciliation completed")
         return True

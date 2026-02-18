@@ -64,21 +64,8 @@ derive_netbios_name() {
 
 resolve_sid_to_group() {
   local sid="$1"
-  local gid=""
-  local gid_entry=""
   local resolved_name=""
   local sid_output=""
-  local candidate=""
-  local lower_candidate=""
-
-  gid="$(wbinfo --sid-to-gid "$sid" 2>/dev/null || true)"
-  if [[ -n "$gid" ]]; then
-    gid_entry="$(getent group "$gid" || true)"
-    if [[ -n "$gid_entry" ]]; then
-      printf '%s\n' "${gid_entry%%:*}"
-      return 0
-    fi
-  fi
 
   if sid_output="$(wbinfo --sid-to-fullname "$sid" 2>/dev/null)"; then
     resolved_name="${sid_output%%$'\t'*}"
@@ -94,23 +81,28 @@ resolve_sid_to_group() {
     return 1
   fi
 
-  for candidate in "$resolved_name" "${resolved_name#*\\}"; do
-    if [[ -z "$candidate" ]]; then
-      continue
-    fi
-    if getent group "$candidate" >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-    lower_candidate="${candidate,,}"
-    if [[ "$lower_candidate" != "$candidate" ]] && getent group "$lower_candidate" >/dev/null 2>&1; then
-      printf '%s\n' "$lower_candidate"
-      return 0
-    fi
-  done
-
-  printf '[init] WARN: SID %s resolved to %s but NSS lookup failed; using raw name.\n' "$sid" "$resolved_name" >&2
+  if [[ "$resolved_name" != *\\* ]]; then
+    resolved_name="${WORKGROUP}\\${resolved_name}"
+  fi
   printf '%s\n' "$resolved_name"
+}
+
+ensure_machine_keytab() {
+  local keytab_path="/var/lib/samba/private/krb5.keytab"
+  mkdir -p /var/lib/samba/private
+
+  if [[ ! -s /etc/krb5.keytab ]]; then
+    if ! net ads keytab create -P >/dev/null 2>&1; then
+      if [[ -n "${JOIN_USER:-}" && -n "${JOIN_PASSWORD:-}" ]]; then
+        printf '%s\n' "$JOIN_PASSWORD" | net ads keytab create -U "$JOIN_USER" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  if [[ -s /etc/krb5.keytab ]]; then
+    cp /etc/krb5.keytab "$keytab_path"
+    chmod 600 "$keytab_path"
+  fi
 }
 
 resolve_share_groups_from_sids() {
@@ -249,6 +241,7 @@ derive_netbios_name
 render_krb5_conf
 render_smb_conf
 join_domain_if_needed
+ensure_machine_keytab
 
 log 'Starting winbindd'
 winbindd -F --no-process-group &

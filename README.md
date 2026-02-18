@@ -154,7 +154,7 @@ Kerberos requires close time alignment.
 - Backing path: `/data/groups/<objectGUID>`
 - Share exposure generated in `/etc/samba/generated/shares.conf`
 - Dynamic share names are validated for SMB compatibility and deduplicated case-insensitively.
-- Group membership changes are refreshed during each reconciliation cycle (winbind cache flush + Samba config reload).
+- Group membership changes are refreshed continuously via winbind cache updates (`winbind cache time = 60`) and Samba config reload during reconciliation.
 
 ## Useful Commands
 
