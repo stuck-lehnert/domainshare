@@ -87,7 +87,14 @@ write_env_file() {
   fi
   netbios_name="$sanitized_netbios_name"
 
-  service_password="$(tr -dc 'A-Za-z0-9@#%+=:_-' </dev/urandom | head -c 48)"
+  service_password="$(python3 - <<'PY'
+import secrets
+import string
+
+alphabet = string.ascii_letters + string.digits + '@#%+=:_-'
+print(''.join(secrets.choice(alphabet) for _ in range(48)))
+PY
+)"
 
   BOOTSTRAP_ENV_FILE="$(mktemp)"
   chmod 600 "$BOOTSTRAP_ENV_FILE"
