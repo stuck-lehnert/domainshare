@@ -493,6 +493,18 @@ def resolve_group_gid_flexible(workgroup: str, group_name: str) -> Optional[int]
     return None
 
 
+def resolve_gid_from_sid(sid: str) -> Optional[int]:
+    if not sid:
+        return None
+    result = run_command(["wbinfo", "--sid-to-gid", sid], check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
 def set_acl(path: str, user_uid: int, admin_gid: Optional[int]) -> None:
     run_command(["setfacl", "-b", path], check=False)
     acl_entries = [f"u:{user_uid}:rwx", f"d:u:{user_uid}:rwx"]
@@ -585,26 +597,36 @@ def should_skip_private_user(username: str) -> bool:
 
 def sync_public_directory() -> None:
     workgroup = os.environ["WORKGROUP"]
-    public_group = os.getenv("PUBLIC_GROUP", "Domain Users")
+    public_group = os.getenv("PUBLIC_GROUP", "")
+    public_group_sid = os.getenv("PUBLIC_GROUP_SID", "")
     qualified_group = public_group
 
     os.makedirs(PUBLIC_ROOT, exist_ok=True)
-    gid = resolve_group_gid_flexible(workgroup, qualified_group)
+    gid = None
+    if qualified_group:
+        gid = resolve_group_gid_flexible(workgroup, qualified_group)
+    if gid is None and public_group_sid:
+        gid = resolve_gid_from_sid(public_group_sid)
 
     if gid is not None:
         os.chown(PUBLIC_ROOT, 0, gid)
         run_command(["setfacl", "-b", PUBLIC_ROOT], check=False)
         set_group_acl(PUBLIC_ROOT, gid)
     else:
-        log(f"Unable to resolve GID for {qualified_group}; public ACLs unchanged")
+        group_display = qualified_group or public_group_sid or "<unset>"
+        log(f"Unable to resolve GID for {group_display}; public ACLs unchanged")
 
     os.chmod(PUBLIC_ROOT, 0o2770)
 
 
 def sync_private_directories() -> None:
     workgroup = os.environ["WORKGROUP"]
-    admin_group = os.getenv("DOMAIN_ADMINS_GROUP", "Domain Admins")
-    admin_gid = resolve_group_gid_flexible(workgroup, admin_group)
+    admin_group = os.getenv("DOMAIN_ADMINS_GROUP", "")
+    admin_gid = None
+    if admin_group:
+        admin_gid = resolve_group_gid_flexible(workgroup, admin_group)
+    if admin_gid is None:
+        admin_gid = resolve_gid_from_sid(os.getenv("DOMAIN_ADMINS_SID", ""))
 
     os.makedirs(PRIVATE_ROOT, exist_ok=True)
     os.chown(PRIVATE_ROOT, 0, 0)
@@ -628,8 +650,12 @@ def sync_private_directories() -> None:
 
 def sync_dynamic_directory_permissions(conn: sqlite3.Connection) -> None:
     workgroup = os.environ["WORKGROUP"]
-    admin_group = os.getenv("DOMAIN_ADMINS_GROUP", "Domain Admins")
-    admin_gid = resolve_group_gid_flexible(workgroup, admin_group)
+    admin_group = os.getenv("DOMAIN_ADMINS_GROUP", "")
+    admin_gid = None
+    if admin_group:
+        admin_gid = resolve_group_gid_flexible(workgroup, admin_group)
+    if admin_gid is None:
+        admin_gid = resolve_gid_from_sid(os.getenv("DOMAIN_ADMINS_SID", ""))
 
     rows = conn.execute(
         "SELECT samAccountName, path FROM shares WHERE isActive = 1"
@@ -666,6 +692,7 @@ def with_lock() -> bool:
         conn = open_db()
         try:
             groups = fetch_fileshare_groups()
+            log(f"Discovered {len(groups)} dynamic share group(s) from AD")
             reconcile_db(conn, groups)
             sync_dynamic_directory_permissions(conn)
             render_dynamic_shares(conn)
