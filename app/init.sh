@@ -64,13 +64,25 @@ derive_netbios_name() {
 
 resolve_sid_to_group() {
   local sid="$1"
+  local gid=""
+  local gid_entry=""
   local resolved_name=""
-  local group_name=""
-  local short_name=""
   local sid_output=""
+  local candidate=""
+  local lower_candidate=""
+
+  gid="$(wbinfo --sid-to-gid "$sid" 2>/dev/null || true)"
+  if [[ -n "$gid" ]]; then
+    gid_entry="$(getent group "$gid" || true)"
+    if [[ -n "$gid_entry" ]]; then
+      printf '%s\n' "${gid_entry%%:*}"
+      return 0
+    fi
+  fi
 
   if sid_output="$(wbinfo --sid-to-fullname "$sid" 2>/dev/null)"; then
     resolved_name="${sid_output%%$'\t'*}"
+    resolved_name="$(printf '%s' "$resolved_name" | sed -E 's/[[:space:]]+[0-9]+$//')"
   fi
 
   if [[ -z "$resolved_name" ]] && sid_output="$(wbinfo -s "$sid" 2>/dev/null)"; then
@@ -82,23 +94,23 @@ resolve_sid_to_group() {
     return 1
   fi
 
-  group_name="$resolved_name"
-  if getent group "$group_name" >/dev/null 2>&1; then
-    printf '%s\n' "$group_name"
-    return 0
-  fi
+  for candidate in "$resolved_name" "${resolved_name#*\\}"; do
+    if [[ -z "$candidate" ]]; then
+      continue
+    fi
+    if getent group "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    lower_candidate="${candidate,,}"
+    if [[ "$lower_candidate" != "$candidate" ]] && getent group "$lower_candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$lower_candidate"
+      return 0
+    fi
+  done
 
-  short_name="$group_name"
-  if [[ "$short_name" == *\\* ]]; then
-    short_name="${short_name#*\\}"
-  fi
-  if [[ -n "$short_name" ]] && getent group "$short_name" >/dev/null 2>&1; then
-    printf '%s\n' "$short_name"
-    return 0
-  fi
-
-  log "SID ${sid} resolved to '${resolved_name}', but NSS group lookup failed; using raw name."
-  printf '%s\n' "$group_name"
+  printf '[init] WARN: SID %s resolved to %s but NSS lookup failed; using raw name.\n' "$sid" "$resolved_name" >&2
+  printf '%s\n' "$resolved_name"
 }
 
 resolve_share_groups_from_sids() {
