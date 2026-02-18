@@ -7,7 +7,7 @@ This repository provides a production-oriented Samba file server container that 
 - Samba runs in ADS mode with `winbind` identity mapping.
 - Static shares:
   - `\\server\Private` -> `/data/private`
-  - `\\server\Public` -> `/data/public`
+  - `\\server\Shared` -> `/data/public`
 - Dynamic shares are generated from AD groups matching `FileShare_*` or `FS_*` and written to `/etc/samba/generated/shares.conf`.
 - Dynamic share records are persisted in SQLite at `/state/shares.db`.
 - Backing storage is GUID-based and stable across group rename:
@@ -132,20 +132,22 @@ Kerberos requires close time alignment.
 - Per-user path: `/data/private/<samAccountName>`
 - Script ensures user directories exist and assigns ownership through winbind identity resolution.
 - Root `/data/private` is enforced read/execute-only (`0555`) to prevent folder creation directly under `\\server\Private`.
-- SMB-side permission changes on `\\server\Private` are blocked (`nt acl support = no` and security masks set to `0000`).
+- SMB-side ACL changes on `\\server\Private` are blocked (`nt acl support = no`).
 - Auto-creation skips well-known/service/non-login accounts (disabled, locked, or expired).
+- Each private user tree is reconciled recursively to homogeneous permissions (dirs `0700`, files `0600`, user/admin ACLs).
 - Permissions:
   - owner user: full control
   - Domain Admins: ACL full control
   - mode: `700`
 - `hide unreadable = yes` + ACLs enforce that users only see their own folder.
 
-### Public
+### Shared
 
-- Share: `\\server\Public`
+- Share: `\\server\Shared`
 - Path: `/data/public`
 - Read/write for authenticated users in configurable `PUBLIC_GROUP_SID` (default: `DOMAIN_USERS_SID`, resolved through winbind).
 - No guest access.
+- Permissions are reconciled recursively so all descendants remain homogeneous (dirs `2770`, files `0660`, shared group/admin ACLs).
 
 ### Dynamic Group Shares
 
@@ -155,6 +157,7 @@ Kerberos requires close time alignment.
 - Share exposure generated in `/etc/samba/generated/shares.conf`
 - Dynamic share names are validated for SMB compatibility and deduplicated case-insensitively.
 - Group membership changes are refreshed continuously via winbind cache updates (`winbind cache time = 60`) and Samba config reload during reconciliation.
+- Dynamic share trees are reconciled recursively so all descendants keep homogeneous permissions.
 
 ## Useful Commands
 

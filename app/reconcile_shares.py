@@ -540,43 +540,107 @@ def resolve_gid_from_sid(sid: str) -> Optional[int]:
         return None
 
 
-def set_acl(path: str, user_uid: int, admin_gid: Optional[int]) -> None:
-    run_command(["setfacl", "-b", path], check=False)
-    acl_entries = [f"u:{user_uid}:rwx", f"d:u:{user_uid}:rwx"]
-    if admin_gid is not None:
-        acl_entries.extend([f"g:{admin_gid}:rwx", f"d:g:{admin_gid}:rwx"])
-
-    result = run_command(
-        ["setfacl", "-m", ",".join(acl_entries), path],
-        check=False,
-    )
-    if result.returncode != 0:
-        log(
-            f"setfacl failed for {path}: {result.stderr.strip() or result.stdout.strip()}"
-        )
-
-
-def set_group_acl(path: str, group_gid: int) -> None:
-    acl_entries = [f"g:{group_gid}:rwx", f"d:g:{group_gid}:rwx"]
-    result = run_command(["setfacl", "-m", ",".join(acl_entries), path], check=False)
-    if result.returncode != 0:
-        log(
-            f"setfacl failed for {path}: {result.stderr.strip() or result.stdout.strip()}"
-        )
-
-
-def set_group_acl_with_admin(
-    path: str, group_gid: int, admin_gid: Optional[int]
+def apply_group_permissions(
+    path: str, group_gid: int, admin_gid: Optional[int], is_dir: bool
 ) -> None:
+    if os.path.islink(path):
+        return
+
+    mode = 0o2770 if is_dir else 0o660
+    group_perms = "rwx" if is_dir else "rw-"
+
+    os.chown(path, 0, group_gid)
+    os.chmod(path, mode)
     run_command(["setfacl", "-b", path], check=False)
-    acl_entries = [f"g:{group_gid}:rwx", f"d:g:{group_gid}:rwx"]
+
+    acl_entries = [f"g:{group_gid}:{group_perms}"]
     if admin_gid is not None:
-        acl_entries.extend([f"g:{admin_gid}:rwx", f"d:g:{admin_gid}:rwx"])
+        acl_entries.append(f"g:{admin_gid}:{group_perms}")
+
+    if is_dir:
+        acl_entries.append(f"d:g:{group_gid}:rwx")
+        if admin_gid is not None:
+            acl_entries.append(f"d:g:{admin_gid}:rwx")
+
     result = run_command(["setfacl", "-m", ",".join(acl_entries), path], check=False)
     if result.returncode != 0:
         log(
             f"setfacl failed for {path}: {result.stderr.strip() or result.stdout.strip()}"
         )
+
+
+def apply_private_permissions(
+    path: str, user_uid: int, user_gid: int, admin_gid: Optional[int], is_dir: bool
+) -> None:
+    if os.path.islink(path):
+        return
+
+    mode = 0o700 if is_dir else 0o600
+    user_perms = "rwx" if is_dir else "rw-"
+
+    os.chown(path, user_uid, user_gid)
+    os.chmod(path, mode)
+    run_command(["setfacl", "-b", path], check=False)
+
+    acl_entries = [f"u:{user_uid}:{user_perms}"]
+    if admin_gid is not None:
+        acl_entries.append(f"g:{admin_gid}:{user_perms}")
+
+    if is_dir:
+        acl_entries.append(f"d:u:{user_uid}:rwx")
+        if admin_gid is not None:
+            acl_entries.append(f"d:g:{admin_gid}:rwx")
+
+    result = run_command(["setfacl", "-m", ",".join(acl_entries), path], check=False)
+    if result.returncode != 0:
+        log(
+            f"setfacl failed for {path}: {result.stderr.strip() or result.stdout.strip()}"
+        )
+
+
+def enforce_group_tree_permissions(
+    root_path: str, group_gid: int, admin_gid: Optional[int]
+) -> None:
+    apply_group_permissions(root_path, group_gid, admin_gid, is_dir=True)
+    for current_root, dirnames, filenames in os.walk(root_path):
+        for dirname in dirnames:
+            apply_group_permissions(
+                os.path.join(current_root, dirname), group_gid, admin_gid, is_dir=True
+            )
+        for filename in filenames:
+            apply_group_permissions(
+                os.path.join(current_root, filename), group_gid, admin_gid, is_dir=False
+            )
+
+
+def resolve_user_primary_gid(uid: int) -> Optional[int]:
+    try:
+        return pwd.getpwuid(uid).pw_gid
+    except KeyError:
+        return None
+
+
+def enforce_private_tree_permissions(
+    root_path: str, user_uid: int, user_gid: int, admin_gid: Optional[int]
+) -> None:
+    apply_private_permissions(root_path, user_uid, user_gid, admin_gid, is_dir=True)
+    for current_root, dirnames, filenames in os.walk(root_path):
+        for dirname in dirnames:
+            apply_private_permissions(
+                os.path.join(current_root, dirname),
+                user_uid,
+                user_gid,
+                admin_gid,
+                is_dir=True,
+            )
+        for filename in filenames:
+            apply_private_permissions(
+                os.path.join(current_root, filename),
+                user_uid,
+                user_gid,
+                admin_gid,
+                is_dir=False,
+            )
 
 
 def list_domain_users(non_login_users: set) -> List[str]:
@@ -644,14 +708,11 @@ def sync_public_directory() -> None:
         gid = resolve_gid_from_sid(public_group_sid)
 
     if gid is not None:
-        os.chown(PUBLIC_ROOT, 0, gid)
-        run_command(["setfacl", "-b", PUBLIC_ROOT], check=False)
-        set_group_acl(PUBLIC_ROOT, gid)
+        admin_gid = resolve_gid_from_sid(os.getenv("DOMAIN_ADMINS_SID", ""))
+        enforce_group_tree_permissions(PUBLIC_ROOT, gid, admin_gid)
     else:
         group_display = qualified_group or public_group_sid or "<unset>"
         log(f"Unable to resolve GID for {group_display}; public ACLs unchanged")
-
-    os.chmod(PUBLIC_ROOT, 0o2770)
 
 
 def sync_private_directories() -> None:
@@ -676,11 +737,16 @@ def sync_private_directories() -> None:
             log(f"Unable to resolve UID for {username}, skipping private folder")
             continue
 
+        user_gid = resolve_user_primary_gid(uid)
+        if user_gid is None:
+            log(
+                f"Unable to resolve primary GID for {username}, skipping private folder"
+            )
+            continue
+
         user_path = os.path.join(PRIVATE_ROOT, username)
         os.makedirs(user_path, exist_ok=True)
-        os.chown(user_path, uid, -1)
-        os.chmod(user_path, 0o700)
-        set_acl(user_path, uid, admin_gid)
+        enforce_private_tree_permissions(user_path, uid, user_gid, admin_gid)
 
 
 def sync_dynamic_directory_permissions(conn: sqlite3.Connection) -> None:
@@ -706,8 +772,7 @@ def sync_dynamic_directory_permissions(conn: sqlite3.Connection) -> None:
             log(f"Unable to resolve GID for {sam}; leaving existing ACLs")
             continue
 
-        os.chown(path, 0, gid)
-        set_group_acl_with_admin(path, gid, admin_gid)
+        enforce_group_tree_permissions(path, gid, admin_gid)
 
 
 def with_lock() -> bool:
