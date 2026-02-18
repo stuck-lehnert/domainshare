@@ -1,0 +1,31 @@
+services:
+  samba:
+    build:
+      context: .
+    container_name: ad-samba-file-server
+    hostname: ${SAMBA_HOSTNAME:-ad-samba-file-server}
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "445:445"
+      - "139:139"
+    volumes:
+      - private_data:/data/private
+      - public_data:/data/public
+      - group_data:/data/groups
+      - state_data:/state
+      - samba_lib_data:/var/lib/samba
+    healthcheck:
+      test: ["CMD-SHELL", "wbinfo -t >/dev/null 2>&1 && testparm -s >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+
+volumes:
+  private_data:
+  public_data:
+  group_data:
+  state_data:
+  samba_lib_data:

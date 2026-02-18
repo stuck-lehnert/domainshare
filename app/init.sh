@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() {
+  printf '[init] %s\n' "$*"
+}
+
+require_env() {
+  local name="$1"
+  if [[ -z "${!name:-}" ]]; then
+    printf '[init] ERROR: missing required env var %s\n' "$name" >&2
+    exit 1
+  fi
+}
+
+append_winbind_to_nss() {
+  sed -ri '/^passwd:/ { /winbind/! s/$/ winbind/ }' /etc/nsswitch.conf
+  sed -ri '/^group:/ { /winbind/! s/$/ winbind/ }' /etc/nsswitch.conf
+}
+
+render_krb5_conf() {
+  cat > /etc/krb5.conf <<EOF
+[libdefaults]
+ default_realm = ${REALM}
+ dns_lookup_realm = false
+ dns_lookup_kdc = true
+ rdns = false
+ ticket_lifetime = 24h
+ forwardable = true
+
+[realms]
+ ${REALM} = {
+  kdc = ${DOMAIN}
+  admin_server = ${DOMAIN}
+ }
+
+[domain_realm]
+ .${DOMAIN} = ${REALM}
+ ${DOMAIN} = ${REALM}
+EOF
+}
+
+render_smb_conf() {
+  envsubst < /app/smb.conf.template > /etc/samba/smb.conf
+  testparm -s /etc/samba/smb.conf >/dev/null
+}
+
+write_runtime_env_file() {
+  {
+    printf 'export REALM=%q\n' "$REALM"
+    printf 'export WORKGROUP=%q\n' "$WORKGROUP"
+    printf 'export DOMAIN=%q\n' "$DOMAIN"
+    if [[ -n "${JOIN_USER:-}" ]]; then
+      printf 'export JOIN_USER=%q\n' "$JOIN_USER"
+    fi
+    if [[ -n "${JOIN_PASSWORD:-}" ]]; then
+      printf 'export JOIN_PASSWORD=%q\n' "$JOIN_PASSWORD"
+    fi
+    printf 'export PUBLIC_GROUP=%q\n' "$PUBLIC_GROUP"
+    if [[ -n "${LDAP_URI:-}" ]]; then
+      printf 'export LDAP_URI=%q\n' "$LDAP_URI"
+    fi
+    if [[ -n "${LDAP_BASE_DN:-}" ]]; then
+      printf 'export LDAP_BASE_DN=%q\n' "$LDAP_BASE_DN"
+    fi
+  } > /app/runtime.env
+  chmod 600 /app/runtime.env
+}
+
+join_domain_if_needed() {
+  if net ads testjoin >/dev/null 2>&1; then
+    log 'Domain join already present; skipping join.'
+    return
+  fi
+
+  require_env JOIN_USER
+  require_env JOIN_PASSWORD
+
+  log "Joining AD domain ${REALM}"
+  if ! printf '%s\n' "$JOIN_PASSWORD" | net ads join -U "$JOIN_USER" -S "$DOMAIN"; then
+    log 'Join using explicit server failed, retrying automatic DC discovery.'
+    printf '%s\n' "$JOIN_PASSWORD" | net ads join -U "$JOIN_USER"
+  fi
+}
+
+wait_for_winbind() {
+  local tries=0
+  local max_tries=30
+  until wbinfo -t >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [[ "$tries" -ge "$max_tries" ]]; then
+      printf '[init] ERROR: winbind trust test failed after %d attempts\n' "$max_tries" >&2
+      return 1
+    fi
+    sleep 2
+  done
+  return 0
+}
+
+install_cron_job() {
+  cat > /etc/cron.d/reconcile-shares <<'EOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root source /app/runtime.env && /usr/bin/python3 /app/reconcile_shares.py >> /var/log/reconcile.log 2>&1
+EOF
+  chmod 0644 /etc/cron.d/reconcile-shares
+}
+
+require_env REALM
+require_env WORKGROUP
+require_env DOMAIN
+
+export REALM WORKGROUP DOMAIN
+export PUBLIC_GROUP="${PUBLIC_GROUP:-Domain Users}"
+if [[ -n "${JOIN_USER:-}" ]]; then
+  export JOIN_USER
+fi
+if [[ -n "${JOIN_PASSWORD:-}" ]]; then
+  export JOIN_PASSWORD
+fi
+
+mkdir -p /data/private /data/public /data/groups /state /etc/samba/generated /var/log/samba
+touch /etc/samba/generated/shares.conf /var/log/reconcile.log
+
+append_winbind_to_nss
+write_runtime_env_file
+render_krb5_conf
+render_smb_conf
+join_domain_if_needed
+
+log 'Starting winbindd'
+winbindd -F --no-process-group &
+
+wait_for_winbind
+
+log 'Running startup reconciliation'
+python3 /app/reconcile_shares.py
+
+install_cron_job
+
+log 'Starting cron daemon'
+cron -f &
+
+log 'Starting smbd in foreground'
+exec smbd -F --no-process-group
