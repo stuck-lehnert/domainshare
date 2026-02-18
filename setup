@@ -5,9 +5,29 @@ ENV_FILE=".env"
 SERVICE_ACCOUNT_NAME="FileShare_ServiceAccount"
 
 BOOTSTRAP_ENV_FILE=""
+ORIGINAL_ENV_BACKUP=""
+BOOTSTRAP_ENV_WRITTEN=0
+FINAL_ENV_WRITTEN=0
+ENV_PREEXISTED=0
+
 cleanup() {
   if [[ -n "$BOOTSTRAP_ENV_FILE" && -f "$BOOTSTRAP_ENV_FILE" ]]; then
     rm -f "$BOOTSTRAP_ENV_FILE"
+  fi
+
+  if [[ "$BOOTSTRAP_ENV_WRITTEN" -eq 1 && "$FINAL_ENV_WRITTEN" -eq 0 ]]; then
+    if [[ "$ENV_PREEXISTED" -eq 1 && -n "$ORIGINAL_ENV_BACKUP" && -f "$ORIGINAL_ENV_BACKUP" ]]; then
+      cp "$ORIGINAL_ENV_BACKUP" "$ENV_FILE"
+      chmod 600 "$ENV_FILE"
+      printf "Restored original %s after setup failure.\n" "$ENV_FILE" >&2
+    else
+      rm -f "$ENV_FILE"
+      printf "Removed temporary %s after setup failure.\n" "$ENV_FILE" >&2
+    fi
+  fi
+
+  if [[ -n "$ORIGINAL_ENV_BACKUP" && -f "$ORIGINAL_ENV_BACKUP" ]]; then
+    rm -f "$ORIGINAL_ENV_BACKUP"
   fi
 }
 trap cleanup EXIT
@@ -96,6 +116,13 @@ print(''.join(secrets.choice(alphabet) for _ in range(48)))
 PY
 )"
 
+  if [[ -f "$ENV_FILE" ]]; then
+    ENV_PREEXISTED=1
+    ORIGINAL_ENV_BACKUP="$(mktemp)"
+    cp "$ENV_FILE" "$ORIGINAL_ENV_BACKUP"
+    chmod 600 "$ORIGINAL_ENV_BACKUP"
+  fi
+
   BOOTSTRAP_ENV_FILE="$(mktemp)"
   chmod 600 "$BOOTSTRAP_ENV_FILE"
 
@@ -114,11 +141,15 @@ SAMBA_HOSTNAME=${samba_hostname}
 NETBIOS_NAME=${netbios_name}
 EOF
 
+  cp "$BOOTSTRAP_ENV_FILE" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  BOOTSTRAP_ENV_WRITTEN=1
+
   printf "Building image...\n"
   docker compose build samba
 
   printf "Provisioning service account %s...\n" "$SERVICE_ACCOUNT_NAME"
-  docker compose --env-file "$BOOTSTRAP_ENV_FILE" run --rm --entrypoint /bin/bash samba -lc '
+  docker compose run --rm --entrypoint /bin/bash samba -lc '
 set -euo pipefail
 
 cat > /tmp/bootstrap-smb.conf <<EOF
@@ -158,6 +189,7 @@ NETBIOS_NAME=${netbios_name}
 EOF
 
   chmod 600 "$ENV_FILE"
+  FINAL_ENV_WRITTEN=1
   printf "Created %s\n" "$ENV_FILE"
 }
 
