@@ -27,6 +27,7 @@ LDAP_FILTER = (
 )
 GROUP_PREFIXES = ("FileShare_", "FS_")
 USER_STATUS_FILTER = "(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*))"
+GROUP_TITLE_ATTRS = ("displayname", "name", "cn")
 
 REQUIRED_ENV = ["REALM", "WORKGROUP", "DOMAIN"]
 ATTR_RE = re.compile(r"^([^:]+)(::?)\s*(.*)$")
@@ -123,6 +124,15 @@ def derive_share_name(sam_account_name: str) -> Optional[str]:
     return None
 
 
+def derive_group_title(entry: Dict[str, Tuple[str, bool]]) -> Optional[str]:
+    for attr in GROUP_TITLE_ATTRS:
+        if attr in entry:
+            value = entry[attr][0].strip()
+            if value:
+                return value
+    return None
+
+
 def parse_groups_from_ldap_output(output: str) -> List[Dict[str, str]]:
     entries = parse_ldap_entries(output)
 
@@ -133,7 +143,7 @@ def parse_groups_from_ldap_output(output: str) -> List[Dict[str, str]]:
 
         sam_value, _ = entry["samaccountname"]
         sam = sam_value.strip()
-        share_name = derive_share_name(sam)
+        share_name = derive_group_title(entry) or derive_share_name(sam)
         if not share_name:
             continue
 
@@ -157,7 +167,18 @@ def parse_groups_from_ldap_output(output: str) -> List[Dict[str, str]]:
 
 def fetch_groups_via_net_ads() -> List[Dict[str, str]]:
     result = run_command(
-        ["net", "ads", "search", "-P", LDAP_FILTER, "objectGUID", "sAMAccountName"],
+        [
+            "net",
+            "ads",
+            "search",
+            "-P",
+            LDAP_FILTER,
+            "objectGUID",
+            "sAMAccountName",
+            "displayName",
+            "name",
+            "cn",
+        ],
         check=False,
     )
     if result.returncode != 0:
@@ -204,6 +225,9 @@ def fetch_groups_via_ldap_bind() -> List[Dict[str, str]]:
                 LDAP_FILTER,
                 "objectGUID",
                 "sAMAccountName",
+                "displayName",
+                "name",
+                "cn",
             ]
         )
         return parse_groups_from_ldap_output(result.stdout)
@@ -445,6 +469,12 @@ def reload_samba() -> None:
     result = run_command(["smbcontrol", "all", "reload-config"], check=False)
     if result.returncode != 0:
         log("smbcontrol reload-config failed; will retry on next run")
+
+
+def refresh_winbind_cache() -> None:
+    result = run_command(["net", "cache", "flush"], check=False)
+    if result.returncode != 0:
+        log("net cache flush failed; group membership updates may be delayed")
 
 
 def resolve_user_uid(qualified_user: str) -> Optional[int]:
@@ -701,6 +731,7 @@ def with_lock() -> bool:
 
         sync_public_directory()
         sync_private_directories()
+        refresh_winbind_cache()
         reload_samba()
         log("Reconciliation completed")
         return True

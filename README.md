@@ -150,10 +150,11 @@ Kerberos requires close time alignment.
 ### Dynamic Group Shares
 
 - AD groups: `FileShare_*` and `FS_*`
-- Share name: prefix removed (`FileShare_Finance` -> `\\server\Finance`, `FS_Finance` -> `\\server\Finance`)
+- Share name: group title from AD (`displayName` -> `name`/`cn` fallback). Prefix stripping from `sAMAccountName` is only a fallback when no title exists.
 - Backing path: `/data/groups/<objectGUID>`
 - Share exposure generated in `/etc/samba/generated/shares.conf`
 - Dynamic share names are validated for SMB compatibility and deduplicated case-insensitively.
+- Group membership changes are refreshed during each reconciliation cycle (winbind cache flush + Samba config reload).
 
 ## Useful Commands
 
