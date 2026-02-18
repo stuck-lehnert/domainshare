@@ -14,9 +14,9 @@ log 'Stopping stack'
 docker compose down
 
 log 'Removing current local compose image(s)'
-IMAGE_IDS="$(docker compose images -q | sort -u | tr '\n' ' ' | xargs)"
-if [[ -n "$IMAGE_IDS" ]]; then
-  docker image rm -f $IMAGE_IDS
+mapfile -t IMAGE_NAMES < <(docker compose config --images 2>/dev/null | sed '/^$/d' | sort -u)
+if [[ "${#IMAGE_NAMES[@]}" -gt 0 ]]; then
+  docker image rm -f "${IMAGE_NAMES[@]}" || true
 else
   log 'No compose-managed local images found to remove.'
 fi
