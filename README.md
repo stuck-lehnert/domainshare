@@ -18,6 +18,7 @@ This repository provides a production-oriented Samba file server container that 
 - Setup prompts for well-known authorization groups by SID (`DOMAIN_USERS_SID`, `DOMAIN_ADMINS_SID`) to avoid localized group names.
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
 - Share operations are audited with Samba `full_audit` (connect, list, read, write, create, delete, rename) and written to Samba log files.
+- Private home creation skips well-known/service accounts by default (including `krbtgt`, `msol_*`, `FileShare_ServiceAcc`).
 - Reconciliation is executed:
   - once on startup
   - every 5 minutes via cron
@@ -130,6 +131,8 @@ Kerberos requires close time alignment.
 - Root path: `/data/private`
 - Per-user path: `/data/private/<samAccountName>`
 - Script ensures user directories exist and assigns ownership through winbind identity resolution.
+- Root `/data/private` is enforced read/execute-only (`0555`) to prevent folder creation directly under `\\server\Private`.
+- SMB-side permission changes on `\\server\Private` are blocked (`nt acl support = no` and security masks set to `0000`).
 - Permissions:
   - owner user: full control
   - Domain Admins: ACL full control

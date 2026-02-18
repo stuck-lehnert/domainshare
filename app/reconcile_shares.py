@@ -28,6 +28,16 @@ GROUP_PREFIX = "FileShare_"
 REQUIRED_ENV = ["REALM", "WORKGROUP", "DOMAIN"]
 ATTR_RE = re.compile(r"^([^:]+)(::?):\s*(.*)$")
 SHARE_NAME_INVALID_RE = re.compile(r"[\\/:*?\"<>|;\[\],+=]")
+PRIVATE_SKIP_EXACT = {
+    "krbtgt",
+    "administrator",
+    "guest",
+    "defaultaccount",
+    "wdagutilityaccount",
+    "fileshare_serviceacc",
+    "fileshare_serviceaccount",
+}
+PRIVATE_SKIP_PREFIXES = ("msol_", "fileshare_service", "aad_")
 
 
 def now_utc() -> str:
@@ -460,8 +470,38 @@ def list_domain_users() -> List[str]:
             candidate = candidate.split("\\", 1)[1]
         if not candidate or candidate.endswith("$"):
             continue
+        if should_skip_private_user(candidate):
+            continue
         users.append(candidate)
     return sorted(set(users))
+
+
+def should_skip_private_user(username: str) -> bool:
+    normalized = username.strip().lower()
+    if not normalized:
+        return True
+    if normalized in PRIVATE_SKIP_EXACT:
+        return True
+    if any(normalized.startswith(prefix) for prefix in PRIVATE_SKIP_PREFIXES):
+        return True
+
+    extra_skip_users = {
+        value.strip().lower()
+        for value in os.getenv("PRIVATE_SKIP_USERS", "").split(",")
+        if value.strip()
+    }
+    if normalized in extra_skip_users:
+        return True
+
+    extra_skip_prefixes = [
+        value.strip().lower()
+        for value in os.getenv("PRIVATE_SKIP_PREFIXES", "").split(",")
+        if value.strip()
+    ]
+    if any(normalized.startswith(prefix) for prefix in extra_skip_prefixes):
+        return True
+
+    return False
 
 
 def sync_public_directory() -> None:
@@ -488,7 +528,9 @@ def sync_private_directories() -> None:
     admin_gid = resolve_group_gid_flexible(workgroup, admin_group)
 
     os.makedirs(PRIVATE_ROOT, exist_ok=True)
-    os.chmod(PRIVATE_ROOT, 0o755)
+    os.chown(PRIVATE_ROOT, 0, 0)
+    run_command(["setfacl", "-b", PRIVATE_ROOT], check=False)
+    os.chmod(PRIVATE_ROOT, 0o555)
 
     users = list_domain_users()
     for username in users:
