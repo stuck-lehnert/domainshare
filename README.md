@@ -8,7 +8,7 @@ This repository provides a production-oriented Samba file server container that 
 - Static shares:
   - `\\server\Private` -> `/data/private`
   - `\\server\Public` -> `/data/public`
-- Dynamic shares are generated from AD groups matching `FileShare_*` and written to `/etc/samba/generated/shares.conf`.
+- Dynamic shares are generated from AD groups matching `FileShare_*` or `FS_*` and written to `/etc/samba/generated/shares.conf`.
 - Dynamic share records are persisted in SQLite at `/state/shares.db`.
 - Backing storage is GUID-based and stable across group rename:
   - `/data/groups/<objectGUID>`
@@ -57,7 +57,7 @@ CREATE TABLE shares (
 - `FileShare_ServiceAccount` must be allowed to join computers to the domain (`net ads join`) in your AD policy.
 - Dynamic group discovery primarily uses machine-account LDAP (`net ads search -P`); join credentials are only used as a fallback LDAP bind path.
 - Group naming convention for dynamic shares:
-  - `FileShare_<ShareName>`
+  - `FileShare_<ShareName>` or `FS_<ShareName>`
 
 ## DNS Requirements
 
@@ -133,6 +133,7 @@ Kerberos requires close time alignment.
 - Script ensures user directories exist and assigns ownership through winbind identity resolution.
 - Root `/data/private` is enforced read/execute-only (`0555`) to prevent folder creation directly under `\\server\Private`.
 - SMB-side permission changes on `\\server\Private` are blocked (`nt acl support = no` and security masks set to `0000`).
+- Auto-creation skips well-known/service/non-login accounts (disabled, locked, or expired).
 - Permissions:
   - owner user: full control
   - Domain Admins: ACL full control
@@ -148,8 +149,8 @@ Kerberos requires close time alignment.
 
 ### Dynamic Group Shares
 
-- AD groups: `FileShare_*`
-- Share name: prefix removed (`FileShare_Finance` -> `\\server\Finance`)
+- AD groups: `FileShare_*` and `FS_*`
+- Share name: prefix removed (`FileShare_Finance` -> `\\server\Finance`, `FS_Finance` -> `\\server\Finance`)
 - Backing path: `/data/groups/<objectGUID>`
 - Share exposure generated in `/etc/samba/generated/shares.conf`
 - Dynamic share names are validated for SMB compatibility and deduplicated case-insensitively.
@@ -199,7 +200,7 @@ docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
 
 ### Dynamic shares not appearing
 
-- Confirm AD groups match `FileShare_*`.
+- Confirm AD groups match `FileShare_*` or `FS_*`.
 - Run manual reconciliation and inspect logs:
 
   ```bash

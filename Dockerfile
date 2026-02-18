@@ -14,6 +14,7 @@ RUN apt-get update \
         python3 \
         samba \
         samba-vfs-modules \
+        sqlite3 \
         tini \
         winbind \
     && rm -rf /var/lib/apt/lists/*
