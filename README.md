@@ -6,8 +6,8 @@ This repository provides a production-oriented Samba file server container that 
 
 - Samba runs in ADS mode with `winbind` identity mapping.
 - Static shares:
-  - `\\server\Private` -> `/data/private`
-  - `\\server\Shared` -> `/data/public`
+  - `\\server\Privat` -> `/data/private`
+  - `\\server\Geteilt` -> `/data/public`
 - Dynamic shares are generated from AD groups matching `FileShare_*` or `FS_*` and written to `/etc/samba/generated/shares.conf`.
 - Dynamic share records are persisted in SQLite at `/state/shares.db`.
 - Backing storage is GUID-based and stable across group rename:
@@ -125,14 +125,14 @@ Kerberos requires close time alignment.
 
 ## SMB Shares
 
-### Private
+### Privat
 
-- Share: `\\server\Private`
+- Share: `\\server\Privat`
 - Root path: `/data/private`
 - Per-user path: `/data/private/<samAccountName>`
 - Script ensures user directories exist and assigns ownership through winbind identity resolution.
-- Root `/data/private` is enforced read/execute-only (`0555`) to prevent folder creation directly under `\\server\Private`.
-- SMB-side ACL changes on `\\server\Private` are blocked (`nt acl support = no`).
+- Root `/data/private` is enforced read/execute-only (`0555`) to prevent folder creation directly under `\\server\Privat`.
+- SMB-side ACL changes on `\\server\Privat` are blocked (`nt acl support = no`).
 - Auto-creation skips well-known/service/non-login accounts (disabled, locked, or expired).
 - Each private user tree is reconciled recursively to homogeneous permissions (dirs `0700`, files `0600`, user/admin ACLs).
 - Permissions:
@@ -141,9 +141,9 @@ Kerberos requires close time alignment.
   - mode: `700`
 - `hide unreadable = yes` + ACLs enforce that users only see their own folder.
 
-### Shared
+### Geteilt
 
-- Share: `\\server\Shared`
+- Share: `\\server\Geteilt`
 - Path: `/data/public`
 - Read/write for authenticated users in configurable `PUBLIC_GROUP_SID` (default: `DOMAIN_USERS_SID`, resolved through winbind).
 - No guest access.
@@ -234,7 +234,7 @@ docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
   docker compose exec samba sh -lc 'mods="$(smbd -b | sed -n "s/^ *MODULESDIR: //p" | head -n1)/vfs"; ls -1 "$mods"/acl_xattr.so "$mods"/full_audit.so'
   ```
 
-### Permissions in Private share are incorrect
+### Permissions in Privat share are incorrect
 
 - Re-run reconciliation to rebuild private directories and ACLs:
 
