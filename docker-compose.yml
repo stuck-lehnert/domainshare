@@ -15,6 +15,7 @@ services:
     volumes:
       - private_data:/data/private
       - public_data:/data/public
+      - fslogix_data:/data/fslogix
       - group_data:/data/groups
       - state_data:/state
       - samba_lib_data:/var/lib/samba
@@ -28,6 +29,7 @@ services:
 volumes:
   private_data:
   public_data:
+  fslogix_data:
   group_data:
   state_data:
   samba_lib_data:

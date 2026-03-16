@@ -8,6 +8,7 @@ This repository provides a production-oriented Samba file server container that 
 - Static shares:
   - `\\server\Privat` -> `/data/private`
   - `\\server\Geteilt` -> `/data/public`
+  - `\\server\FSLogix` -> `/data/fslogix`
 - Dynamic shares are generated from AD groups matching `FileShare_*` or `FS_*` and written to `/etc/samba/generated/shares.conf`.
 - Dynamic share records are persisted in SQLite at `/state/shares.db`.
 - Backing storage is GUID-based and stable across group rename:
@@ -16,6 +17,7 @@ This repository provides a production-oriented Samba file server container that 
 - Container hostname is fixed (`SAMBA_HOSTNAME`) to keep AD computer identity stable.
 - NetBIOS name defaults to `ADSAMBAFSRV` and is clamped to 15 characters (`NETBIOS_NAME` override supported).
 - Setup prompts for well-known authorization groups by SID (`DOMAIN_USERS_SID`, `DOMAIN_ADMINS_SID`) to avoid localized group names.
+- `FSLOGIX_GROUP_SID` controls who can access the default FSLogix share (defaults to `DOMAIN_USERS_SID`).
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
 - Share operations are audited with Samba `full_audit` (connect, list, read, write, create, delete, rename) and written to Samba log files.
 - Private home creation skips well-known/service accounts by default (including `krbtgt`, `msol_*`, `FileShare_ServiceAcc`).
@@ -101,6 +103,7 @@ Kerberos requires close time alignment.
    - `DOMAIN_USERS_SID`
    - `DOMAIN_ADMINS_SID`
    - optional `PUBLIC_GROUP_SID` (defaults to `DOMAIN_USERS_SID`)
+   - optional `FSLOGIX_GROUP_SID` (defaults to `DOMAIN_USERS_SID`)
 
    Optional:
    - `SAMBA_HOSTNAME` (defaults to `adsambafsrv`)
@@ -148,6 +151,14 @@ Kerberos requires close time alignment.
 - Read/write for authenticated users in configurable `PUBLIC_GROUP_SID` (default: `DOMAIN_USERS_SID`, resolved through winbind).
 - No guest access.
 - Permissions are reconciled recursively so all descendants remain homogeneous (dirs `2770`, files `0660`, shared group/admin ACLs).
+
+### FSLogix
+
+- Share: `\\server\FSLogix`
+- Path: `/data/fslogix`
+- Access for authenticated users in configurable `FSLOGIX_GROUP_SID` (default: `DOMAIN_USERS_SID`, resolved through winbind).
+- Semantics intentionally differ from `Geteilt`: only the share root is reconciled (`03770` + ACL defaults), while user-created profile container folders/files are not recursively normalized.
+- Samba masks are profile-container oriented (`create mask = 0600`, `directory mask = 0700`) so profile payload stays user-private by default.
 
 ### Dynamic Group Shares
 

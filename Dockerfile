@@ -19,7 +19,7 @@ RUN apt-get update \
         winbind \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /app /data/private /data/public /data/groups /state /etc/samba/generated
+RUN mkdir -p /app /data/private /data/public /data/fslogix /data/groups /state /etc/samba/generated
 
 COPY app/reconcile_shares.py /app/reconcile_shares.py
 COPY app/init.sh /app/init.sh

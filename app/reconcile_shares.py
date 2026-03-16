@@ -20,6 +20,7 @@ LOCK_PATH = "/state/reconcile.lock"
 GROUP_ROOT = "/data/groups"
 PRIVATE_ROOT = "/data/private"
 PUBLIC_ROOT = "/data/public"
+FSLOGIX_ROOT = "/data/fslogix"
 GENERATED_CONF = "/etc/samba/generated/shares.conf"
 
 LDAP_FILTER = (
@@ -715,6 +716,51 @@ def sync_public_directory() -> None:
         log(f"Unable to resolve GID for {group_display}; public ACLs unchanged")
 
 
+def sync_fslogix_directory() -> None:
+    workgroup = os.environ["WORKGROUP"]
+    fslogix_group = os.getenv("FSLOGIX_GROUP", "")
+    fslogix_group_sid = os.getenv("FSLOGIX_GROUP_SID", "")
+    qualified_group = fslogix_group
+
+    os.makedirs(FSLOGIX_ROOT, exist_ok=True)
+
+    gid = None
+    if qualified_group:
+        gid = resolve_group_gid_flexible(workgroup, qualified_group)
+    if gid is None and fslogix_group_sid:
+        gid = resolve_gid_from_sid(fslogix_group_sid)
+
+    if gid is None:
+        group_display = qualified_group or fslogix_group_sid or "<unset>"
+        log(f"Unable to resolve GID for {group_display}; fslogix ACLs unchanged")
+        return
+
+    admin_group = os.getenv("DOMAIN_ADMINS_GROUP", "")
+    admin_gid = None
+    if admin_group:
+        admin_gid = resolve_group_gid_flexible(workgroup, admin_group)
+    if admin_gid is None:
+        admin_gid = resolve_gid_from_sid(os.getenv("DOMAIN_ADMINS_SID", ""))
+
+    os.chown(FSLOGIX_ROOT, 0, gid)
+    os.chmod(FSLOGIX_ROOT, 0o3770)
+    run_command(["setfacl", "-b", FSLOGIX_ROOT], check=False)
+
+    acl_entries = [f"g:{gid}:rwx", f"d:g:{gid}:rwx"]
+    if admin_gid is not None and admin_gid != gid:
+        acl_entries.append(f"g:{admin_gid}:rwx")
+        acl_entries.append(f"d:g:{admin_gid}:rwx")
+
+    result = run_command(
+        ["setfacl", "-m", ",".join(acl_entries), FSLOGIX_ROOT], check=False
+    )
+    if result.returncode != 0:
+        log(
+            "setfacl failed for fslogix root: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+
+
 def sync_private_directories() -> None:
     workgroup = os.environ["WORKGROUP"]
     admin_group = os.getenv("DOMAIN_ADMINS_GROUP", "")
@@ -800,6 +846,7 @@ def with_lock() -> bool:
             conn.close()
 
         sync_public_directory()
+        sync_fslogix_directory()
         sync_private_directories()
         reload_samba()
         log("Reconciliation completed")

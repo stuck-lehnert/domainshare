@@ -84,11 +84,13 @@ write_env_file() {
   local domain_users_sid=""
   local domain_admins_sid=""
   local public_group_sid=""
+  local fslogix_group_sid=""
   local samba_hostname="adsambafsrv"
   local netbios_name="ADSAMBAFSRV"
   local service_password=""
   local service_account_sam=""
   local public_group_prompt=""
+  local fslogix_group_prompt=""
   local samba_hostname_input=""
   local netbios_name_input=""
   local sanitized_netbios_name=""
@@ -105,6 +107,12 @@ write_env_file() {
   read -r -p "${public_group_prompt}: " public_group_sid
   if [[ -z "$public_group_sid" ]]; then
     public_group_sid="$domain_users_sid"
+  fi
+
+  fslogix_group_prompt="FSLOGIX_GROUP_SID (press Enter to reuse DOMAIN_USERS_SID)"
+  read -r -p "${fslogix_group_prompt}: " fslogix_group_sid
+  if [[ -z "$fslogix_group_sid" ]]; then
+    fslogix_group_sid="$domain_users_sid"
   fi
 
   read -r -p "SAMBA_HOSTNAME [adsambafsrv]: " samba_hostname_input
@@ -158,6 +166,7 @@ SERVICE_ACCOUNT_PASSWORD=${service_password}
 DOMAIN_USERS_SID=${domain_users_sid}
 DOMAIN_ADMINS_SID=${domain_admins_sid}
 PUBLIC_GROUP_SID=${public_group_sid}
+FSLOGIX_GROUP_SID=${fslogix_group_sid}
 SAMBA_HOSTNAME=${samba_hostname}
 NETBIOS_NAME=${netbios_name}
 EOF
@@ -209,6 +218,7 @@ JOIN_PASSWORD=${service_password}
 DOMAIN_USERS_SID=${domain_users_sid}
 DOMAIN_ADMINS_SID=${domain_admins_sid}
 PUBLIC_GROUP_SID=${public_group_sid}
+FSLOGIX_GROUP_SID=${fslogix_group_sid}
 SAMBA_HOSTNAME=${samba_hostname}
 NETBIOS_NAME=${netbios_name}
 # Optional overrides:
