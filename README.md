@@ -1,12 +1,12 @@
 # AD-Integrated Containerized Samba File Server
 
-This repository provides a production-oriented Samba file server container that joins an existing Active Directory domain and exposes three SMB shares: `Privat`, `Data`, and `FSLogix`.
+This repository provides a production-oriented Samba file server container that joins an existing Active Directory domain and exposes three SMB shares: `Private`, `Data`, and `FSLogix`.
 
 ## Architecture
 
 - Samba runs in ADS mode with `winbind` identity mapping.
 - Static shares:
-  - `\\server\Privat` -> `/data/private`
+  - `\\server\Private` -> `/data/private`
   - `\\server\Data` -> `/data/groups/data`
   - `\\server\FSLogix` -> `/data/fslogix`
 - FS_* groups are projected as folders inside the Data share (`/data/groups/data/<groupName>`).
@@ -62,8 +62,9 @@ CREATE TABLE shares (
 - Initial admin credentials with rights to create/reset `FileShare_ServiceAccount` during `./setup`.
 - `FileShare_ServiceAccount` must be allowed to join computers to the domain (`net ads join`) in your AD policy.
 - Dynamic group discovery primarily uses machine-account LDAP (`net ads search -P`); join credentials are only used as a fallback LDAP bind path.
-- Group naming convention for Data folders:
-  - `FS_<FolderName>`
+- Group naming convention for Data folder eligibility:
+  - `FS_<Anything>`
+- Folder names use AD group display names (`displayName`, then `name`/`cn` fallback), not pre-2000 (`sAMAccountName`) names.
 
 ## DNS Requirements
 
@@ -137,14 +138,14 @@ Kerberos requires close time alignment.
 
 ## SMB Shares
 
-### Privat
+### Private
 
-- Share: `\\server\Privat`
+- Share: `\\server\Private`
 - Root path: `/data/private`
 - Per-user path: `/data/private/<samAccountName>`
 - Script ensures user directories exist and assigns ownership through winbind identity resolution.
-- Root `/data/private` is enforced read/execute-only (`0555`) to prevent folder creation directly under `\\server\Privat`.
-- SMB-side ACL changes on `\\server\Privat` are blocked (`nt acl support = no`).
+- Root `/data/private` is enforced read/execute-only (`0555`) to prevent folder creation directly under `\\server\Private`.
+- SMB-side ACL changes on `\\server\Private` are blocked (`nt acl support = no`).
 - Auto-creation skips well-known/service/non-login accounts (disabled, locked, or expired).
 - Each private user tree is reconciled recursively to homogeneous permissions (dirs `0700`, files `0600`, user/admin ACLs).
 - Permissions:
@@ -279,7 +280,7 @@ docker compose exec samba sh -lc 'tail -n 200 /var/log/backup.log'
   docker compose exec samba sh -lc 'mods="$(smbd -b | sed -n "s/^ *MODULESDIR: //p" | head -n1)/vfs"; ls -1 "$mods"/acl_xattr.so "$mods"/full_audit.so'
   ```
 
-### Permissions in Privat share are incorrect
+### Permissions in Private share are incorrect
 
 - Re-run reconciliation to rebuild private directories and ACLs:
 

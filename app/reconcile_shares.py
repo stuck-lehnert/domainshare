@@ -24,6 +24,7 @@ FSLOGIX_ROOT = "/data/fslogix"
 
 LDAP_FILTER = "(&(objectClass=group)(sAMAccountName=FS_*))"
 GROUP_PREFIXES = ("FS_",)
+GROUP_TITLE_ATTRS = ("displayname", "name", "cn")
 USER_STATUS_FILTER = "(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*))"
 
 REQUIRED_ENV = ["REALM", "WORKGROUP", "DOMAIN"]
@@ -122,6 +123,15 @@ def derive_share_name(sam_account_name: str) -> Optional[str]:
     return None
 
 
+def derive_group_title(entry: Dict[str, Tuple[str, bool]]) -> Optional[str]:
+    for attr in GROUP_TITLE_ATTRS:
+        if attr in entry:
+            value = entry[attr][0].strip()
+            if value:
+                return value
+    return None
+
+
 def parse_groups_from_ldap_output(output: str) -> List[Dict[str, str]]:
     entries = parse_ldap_entries(output)
 
@@ -132,7 +142,7 @@ def parse_groups_from_ldap_output(output: str) -> List[Dict[str, str]]:
 
         sam_value, _ = entry["samaccountname"]
         sam = sam_value.strip()
-        share_name = derive_share_name(sam)
+        share_name = derive_group_title(entry) or derive_share_name(sam)
         if not share_name:
             continue
 
@@ -223,7 +233,18 @@ def next_available_path(path: str) -> str:
 
 def fetch_groups_via_net_ads() -> List[Dict[str, str]]:
     result = run_command(
-        ["net", "ads", "search", "-P", LDAP_FILTER, "objectGUID", "sAMAccountName"],
+        [
+            "net",
+            "ads",
+            "search",
+            "-P",
+            LDAP_FILTER,
+            "objectGUID",
+            "sAMAccountName",
+            "displayName",
+            "name",
+            "cn",
+        ],
         check=False,
     )
     if result.returncode != 0:
@@ -270,6 +291,9 @@ def fetch_groups_via_ldap_bind() -> List[Dict[str, str]]:
                 LDAP_FILTER,
                 "objectGUID",
                 "sAMAccountName",
+                "displayName",
+                "name",
+                "cn",
             ]
         )
         return parse_groups_from_ldap_output(result.stdout)
