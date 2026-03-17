@@ -85,6 +85,11 @@ write_env_file() {
   local domain_admins_sid=""
   local fslogix_group_sid=""
   local backup_destination=""
+  local backup_start_hour="2"
+  local backup_retention_daily="3"
+  local backup_retention_weekly="2"
+  local backup_retention_monthly="2"
+  local backup_retention_yearly="1"
   local samba_hostname="adsambafsrv"
   local netbios_name="ADSAMBAFSRV"
   local service_password=""
@@ -124,6 +129,16 @@ write_env_file() {
   netbios_name="$sanitized_netbios_name"
 
   read -r -p "BACKUP_DESTINATION (optional URL, press Enter to disable): " backup_destination
+  read -r -p "BACKUP_START_HOUR [2]: " backup_start_hour
+  backup_start_hour="${backup_start_hour:-2}"
+  read -r -p "BACKUP_RETENTION_DAILY [3]: " backup_retention_daily
+  backup_retention_daily="${backup_retention_daily:-3}"
+  read -r -p "BACKUP_RETENTION_WEEKLY [2]: " backup_retention_weekly
+  backup_retention_weekly="${backup_retention_weekly:-2}"
+  read -r -p "BACKUP_RETENTION_MONTHLY [2]: " backup_retention_monthly
+  backup_retention_monthly="${backup_retention_monthly:-2}"
+  read -r -p "BACKUP_RETENTION_YEARLY [1]: " backup_retention_yearly
+  backup_retention_yearly="${backup_retention_yearly:-1}"
 
   service_account_sam="$(sanitize_sam_account_name "$SERVICE_ACCOUNT_NAME")"
   if [[ "$service_account_sam" != "$SERVICE_ACCOUNT_NAME" ]]; then
@@ -162,6 +177,11 @@ DOMAIN_USERS_SID=${domain_users_sid}
 DOMAIN_ADMINS_SID=${domain_admins_sid}
 FSLOGIX_GROUP_SID=${fslogix_group_sid}
 BACKUP_DESTINATION=${backup_destination}
+BACKUP_START_HOUR=${backup_start_hour}
+BACKUP_RETENTION_DAILY=${backup_retention_daily}
+BACKUP_RETENTION_WEEKLY=${backup_retention_weekly}
+BACKUP_RETENTION_MONTHLY=${backup_retention_monthly}
+BACKUP_RETENTION_YEARLY=${backup_retention_yearly}
 SAMBA_HOSTNAME=${samba_hostname}
 NETBIOS_NAME=${netbios_name}
 EOF
@@ -214,6 +234,11 @@ DOMAIN_USERS_SID=${domain_users_sid}
 DOMAIN_ADMINS_SID=${domain_admins_sid}
 FSLOGIX_GROUP_SID=${fslogix_group_sid}
 BACKUP_DESTINATION=${backup_destination}
+BACKUP_START_HOUR=${backup_start_hour}
+BACKUP_RETENTION_DAILY=${backup_retention_daily}
+BACKUP_RETENTION_WEEKLY=${backup_retention_weekly}
+BACKUP_RETENTION_MONTHLY=${backup_retention_monthly}
+BACKUP_RETENTION_YEARLY=${backup_retention_yearly}
 SAMBA_HOSTNAME=${samba_hostname}
 NETBIOS_NAME=${netbios_name}
 # Optional overrides:
@@ -225,6 +250,11 @@ NETBIOS_NAME=${netbios_name}
 # BACKUP_DESTINATION=smb://DOMAIN%5Cuser:pass@backup.example.com/Backups/samba
 # BACKUP_DESTINATION=davfs://user:pass@webdav.example.com/remote.php/dav/files/backup
 # BACKUP_DESTINATION=sftp://user:pass@sftp.example.com/exports/samba
+# BACKUP_START_HOUR=2
+# BACKUP_RETENTION_DAILY=3
+# BACKUP_RETENTION_WEEKLY=2
+# BACKUP_RETENTION_MONTHLY=2
+# BACKUP_RETENTION_YEARLY=1
 EOF
 
   chmod 600 "$ENV_FILE"

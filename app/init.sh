@@ -62,6 +62,17 @@ derive_netbios_name() {
   export NETBIOS_NAME="${cleaned_name:0:15}"
 }
 
+derive_backup_start_hour() {
+  local raw_hour="${BACKUP_START_HOUR:-2}"
+  if [[ "$raw_hour" =~ ^[0-9]+$ ]] && (( raw_hour >= 0 && raw_hour <= 23 )); then
+    printf '%d\n' "$raw_hour"
+    return
+  fi
+
+  log "Invalid BACKUP_START_HOUR '${raw_hour}', defaulting to 2."
+  printf '2\n'
+}
+
 resolve_sid_to_group() {
   local sid="$1"
   local resolved_name=""
@@ -159,8 +170,21 @@ write_runtime_env_file() {
     printf 'export DOMAIN_USERS_GROUP=%q\n' "$DOMAIN_USERS_GROUP"
     printf 'export DOMAIN_ADMINS_GROUP=%q\n' "$DOMAIN_ADMINS_GROUP"
     printf 'export FSLOGIX_GROUP=%q\n' "$FSLOGIX_GROUP"
+    printf 'export BACKUP_START_HOUR=%q\n' "$BACKUP_START_HOUR"
     if [[ -n "${BACKUP_DESTINATION:-}" ]]; then
       printf 'export BACKUP_DESTINATION=%q\n' "$BACKUP_DESTINATION"
+    fi
+    if [[ -n "${BACKUP_RETENTION_DAILY:-}" ]]; then
+      printf 'export BACKUP_RETENTION_DAILY=%q\n' "$BACKUP_RETENTION_DAILY"
+    fi
+    if [[ -n "${BACKUP_RETENTION_WEEKLY:-}" ]]; then
+      printf 'export BACKUP_RETENTION_WEEKLY=%q\n' "$BACKUP_RETENTION_WEEKLY"
+    fi
+    if [[ -n "${BACKUP_RETENTION_MONTHLY:-}" ]]; then
+      printf 'export BACKUP_RETENTION_MONTHLY=%q\n' "$BACKUP_RETENTION_MONTHLY"
+    fi
+    if [[ -n "${BACKUP_RETENTION_YEARLY:-}" ]]; then
+      printf 'export BACKUP_RETENTION_YEARLY=%q\n' "$BACKUP_RETENTION_YEARLY"
     fi
     if [[ -n "${JOIN_USER:-}" ]]; then
       printf 'export JOIN_USER=%q\n' "$JOIN_USER"
@@ -216,8 +240,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
 
   if [[ -n "${BACKUP_DESTINATION:-}" ]]; then
-    cat >> /etc/cron.d/reconcile-shares <<'EOF'
-*/30 * * * * root source /app/runtime.env && /usr/bin/python3 /app/backup_to_destination.py >> /var/log/backup.log 2>&1
+    cat >> /etc/cron.d/reconcile-shares <<EOF
+0 ${BACKUP_START_HOUR} * * * root source /app/runtime.env && /usr/bin/python3 /app/backup_to_destination.py >> /var/log/backup.log 2>&1
 EOF
   fi
 
@@ -231,6 +255,7 @@ require_env DOMAIN_USERS_SID
 require_env DOMAIN_ADMINS_SID
 
 export REALM WORKGROUP DOMAIN
+export BACKUP_START_HOUR="$(derive_backup_start_hour)"
 export FSLOGIX_GROUP_SID="${FSLOGIX_GROUP_SID:-${DOMAIN_USERS_SID}}"
 export DOMAIN_USERS_GROUP="${DOMAIN_USERS_SID}"
 export DOMAIN_ADMINS_GROUP="${DOMAIN_ADMINS_SID}"
@@ -266,12 +291,9 @@ log 'Running startup reconciliation'
 python3 /app/reconcile_shares.py
 
 if [[ -n "${BACKUP_DESTINATION:-}" ]]; then
-  log 'Running startup backup'
-  if ! python3 /app/backup_to_destination.py; then
-    log 'Startup backup failed; continuing service startup.'
-  fi
+  log "Backups enabled: daily at ${BACKUP_START_HOUR}:00 (container local time)."
 else
-  log 'BACKUP_DESTINATION is unset; startup backup skipped'
+  log 'BACKUP_DESTINATION is unset; scheduled backup disabled'
 fi
 
 install_cron_job

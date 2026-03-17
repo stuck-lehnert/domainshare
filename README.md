@@ -27,8 +27,7 @@ This repository provides a production-oriented Samba file server container that 
   - once on startup
   - every 5 minutes via cron
 - Backup is executed:
-  - once on startup (when enabled)
-  - every 30 minutes via cron
+  - daily at `BACKUP_START_HOUR` (default: `2`, i.e. 02:00)
 
 ## Data Folder Lifecycle
 
@@ -109,6 +108,11 @@ Kerberos requires close time alignment.
    - `DOMAIN_ADMINS_SID`
    - optional `FSLOGIX_GROUP_SID` (defaults to `DOMAIN_USERS_SID`)
    - optional `BACKUP_DESTINATION` (empty disables backup)
+   - optional `BACKUP_START_HOUR` (0-23, default `2`)
+   - optional `BACKUP_RETENTION_DAILY` (default `3`)
+   - optional `BACKUP_RETENTION_WEEKLY` (default `2`)
+   - optional `BACKUP_RETENTION_MONTHLY` (default `2`)
+   - optional `BACKUP_RETENTION_YEARLY` (default `1`)
 
    Optional:
    - `SAMBA_HOSTNAME` (defaults to `adsambafsrv`)
@@ -168,12 +172,25 @@ Kerberos requires close time alignment.
 ## Backups
 
 - Backups are enabled only if `BACKUP_DESTINATION` is non-empty.
+- Each run creates a timestamped snapshot under `snapshots/YYYYMMDDTHHMMSSZ` at the destination.
+- Backup job is scheduled daily at `BACKUP_START_HOUR` in container local time.
 - Sources synced to destination on each run:
   - `/data/private` -> `data/private`
   - `/data/groups` -> `data/groups`
   - `/data/fslogix` -> `data/fslogix`
   - `/state` -> `state`
   - `/var/lib/samba/private` -> `samba/private`
+- Retention policy env vars (defaults):
+  - `BACKUP_RETENTION_YEARLY=1`
+  - `BACKUP_RETENTION_MONTHLY=2`
+  - `BACKUP_RETENTION_WEEKLY=2`
+  - `BACKUP_RETENTION_DAILY=3`
+- Retention logic:
+  - daily: newest N snapshots
+  - weekly: newest N snapshots created on week start (Monday)
+  - monthly: newest N snapshots created on day 1
+  - yearly: newest N snapshots created on Jan 1
+  - snapshots selected by any tier are retained; all others are pruned
 - Supported destination schemes:
   - `rsync://user:pass@host/module/path`
   - `smb://user:pass@host/share/path` (domain user example: `smb://DOMAIN%5Cuser:pass@host/share/path`)
@@ -185,6 +202,11 @@ Kerberos requires close time alignment.
 
   ```env
   BACKUP_DESTINATION=sftp://backupuser:StrongPassword@sftp.example.com/exports/samba
+  BACKUP_START_HOUR=2
+  BACKUP_RETENTION_DAILY=3
+  BACKUP_RETENTION_WEEKLY=2
+  BACKUP_RETENTION_MONTHLY=2
+  BACKUP_RETENTION_YEARLY=1
   ```
 
 ## Useful Commands
