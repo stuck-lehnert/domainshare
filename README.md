@@ -1,18 +1,19 @@
 # AD-Integrated Containerized Samba File Server
 
-This repository provides a production-oriented Samba file server container that joins an existing Active Directory domain, exposes static and dynamic SMB shares, and persists share identity by AD `objectGUID`.
+This repository provides a production-oriented Samba file server container that joins an existing Active Directory domain and exposes three SMB shares: `Privat`, `Data`, and `FSLogix`.
 
 ## Architecture
 
 - Samba runs in ADS mode with `winbind` identity mapping.
 - Static shares:
   - `\\server\Privat` -> `/data/private`
-  - `\\server\Geteilt` -> `/data/public`
+  - `\\server\Data` -> `/data/groups/data`
   - `\\server\FSLogix` -> `/data/fslogix`
-- Dynamic shares are generated from AD groups matching `FileShare_*` or `FS_*` and written to `/etc/samba/generated/shares.conf`.
-- Dynamic share records are persisted in SQLite at `/state/shares.db`.
-- Backing storage is GUID-based and stable across group rename:
-  - `/data/groups/<objectGUID>`
+- FS_* groups are projected as folders inside the Data share (`/data/groups/data/<groupName>`).
+- Group records are persisted in SQLite at `/state/shares.db`.
+- Group folders are name-based while active and moved to archive on deactivation:
+  - active: `/data/groups/data/<groupName>`
+  - inactive/deleted groups: `/data/groups/archive/<groupName>`
 - Samba machine trust/key material is persisted in `/var/lib/samba` to survive container recreation.
 - Container hostname is fixed (`SAMBA_HOSTNAME`) to keep AD computer identity stable.
 - NetBIOS name defaults to `ADSAMBAFSRV` and is clamped to 15 characters (`NETBIOS_NAME` override supported).
@@ -20,19 +21,23 @@ This repository provides a production-oriented Samba file server container that 
 - `FSLOGIX_GROUP_SID` controls who can access the default FSLogix share (defaults to `DOMAIN_USERS_SID`).
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
 - Share operations are audited with Samba `full_audit` (connect, list, read, write, create, delete, rename) and written to Samba log files.
+- Optional remote backups run when `BACKUP_DESTINATION` is configured.
 - Private home creation skips well-known/service accounts by default (including `krbtgt`, `msol_*`, `FileShare_ServiceAcc`).
 - Reconciliation is executed:
   - once on startup
   - every 5 minutes via cron
+- Backup is executed:
+  - once on startup (when enabled)
+  - every 30 minutes via cron
 
-## Dynamic Share Lifecycle (objectGUID-first)
+## Data Folder Lifecycle
 
 The reconciliation script (`/app/reconcile_shares.py`) enforces these rules:
 
-1. New matching group -> insert DB row, create `/data/groups/<objectGUID>`, expose share.
-2. Group renamed but still `FileShare_` -> update `samAccountName` and `shareName`, keep same path.
-3. Group removed or no longer matches prefix -> set `isActive=0`, remove Samba exposure, keep data.
-4. Previously inactive group returns -> set `isActive=1`, reuse existing path and data.
+1. New matching `FS_*` group -> insert DB row and create `/data/groups/data/<groupName>`.
+2. Group rename while still matching `FS_*` -> rename/update folder path.
+3. Group removed or no longer matching `FS_*` -> set `isActive=0` and move folder to `/data/groups/archive/...`.
+4. Previously inactive group returns -> set `isActive=1`, move back into `/data/groups/data/...`.
 
 ## SQLite State Database
 
@@ -58,8 +63,8 @@ CREATE TABLE shares (
 - Initial admin credentials with rights to create/reset `FileShare_ServiceAccount` during `./setup`.
 - `FileShare_ServiceAccount` must be allowed to join computers to the domain (`net ads join`) in your AD policy.
 - Dynamic group discovery primarily uses machine-account LDAP (`net ads search -P`); join credentials are only used as a fallback LDAP bind path.
-- Group naming convention for dynamic shares:
-  - `FileShare_<ShareName>` or `FS_<ShareName>`
+- Group naming convention for Data folders:
+  - `FS_<FolderName>`
 
 ## DNS Requirements
 
@@ -84,8 +89,8 @@ Kerberos requires close time alignment.
 - `README.md`
 - `app/init.sh`
 - `app/reconcile_shares.py`
+- `app/backup_to_destination.py`
 - `etc/samba/smb.conf`
-- `etc/samba/generated/`
 
 ## Setup
 
@@ -102,8 +107,8 @@ Kerberos requires close time alignment.
    - initial admin credentials (used once for provisioning)
    - `DOMAIN_USERS_SID`
    - `DOMAIN_ADMINS_SID`
-   - optional `PUBLIC_GROUP_SID` (defaults to `DOMAIN_USERS_SID`)
    - optional `FSLOGIX_GROUP_SID` (defaults to `DOMAIN_USERS_SID`)
+   - optional `BACKUP_DESTINATION` (empty disables backup)
 
    Optional:
    - `SAMBA_HOSTNAME` (defaults to `adsambafsrv`)
@@ -144,31 +149,43 @@ Kerberos requires close time alignment.
   - mode: `700`
 - `hide unreadable = yes` + ACLs enforce that users only see their own folder.
 
-### Geteilt
+### Data
 
-- Share: `\\server\Geteilt`
-- Path: `/data/public`
-- Read/write for authenticated users in configurable `PUBLIC_GROUP_SID` (default: `DOMAIN_USERS_SID`, resolved through winbind).
+- Share: `\\server\Data`
+- Path: `/data/groups/data`
+- Contains one folder per active `FS_*` AD group.
+- Root is discoverable as one share, while access to each group folder is enforced via POSIX/ACL group permissions.
 - No guest access.
-- Permissions are reconciled recursively so all descendants remain homogeneous (dirs `2770`, files `0660`, shared group/admin ACLs).
 
 ### FSLogix
 
 - Share: `\\server\FSLogix`
 - Path: `/data/fslogix`
 - Access for authenticated users in configurable `FSLOGIX_GROUP_SID` (default: `DOMAIN_USERS_SID`, resolved through winbind).
-- Semantics intentionally differ from `Geteilt`: only the share root is reconciled (`03770` + ACL defaults), while user-created profile container folders/files are not recursively normalized.
+- Semantics intentionally differ from `Data`: only the share root is reconciled (`03770` + ACL defaults), while user-created profile container folders/files are not recursively normalized.
 - Samba masks are profile-container oriented (`create mask = 0600`, `directory mask = 0700`) so profile payload stays user-private by default.
 
-### Dynamic Group Shares
+## Backups
 
-- AD groups: `FileShare_*` and `FS_*`
-- Share name: group title from AD (`displayName` -> `name`/`cn` fallback). Prefix stripping from `sAMAccountName` is only a fallback when no title exists.
-- Backing path: `/data/groups/<objectGUID>`
-- Share exposure generated in `/etc/samba/generated/shares.conf`
-- Dynamic share names are validated for SMB compatibility and deduplicated case-insensitively.
-- Group membership changes are refreshed continuously via winbind cache updates (`winbind cache time = 60`) and Samba config reload during reconciliation.
-- Dynamic share trees are reconciled recursively so all descendants keep homogeneous permissions.
+- Backups are enabled only if `BACKUP_DESTINATION` is non-empty.
+- Sources synced to destination on each run:
+  - `/data/private` -> `data/private`
+  - `/data/groups` -> `data/groups`
+  - `/data/fslogix` -> `data/fslogix`
+  - `/state` -> `state`
+  - `/var/lib/samba/private` -> `samba/private`
+- Supported destination schemes:
+  - `rsync://user:pass@host/module/path`
+  - `smb://user:pass@host/share/path` (domain user example: `smb://DOMAIN%5Cuser:pass@host/share/path`)
+  - `davfs://user:pass@host/path` (WebDAV over HTTPS)
+  - `sftp://user:pass@host/path`
+- Username/password components should be URL-encoded when they contain reserved characters (`@`, `:`, `/`, `\`, `%`, `#`, `?`).
+
+- Example:
+
+  ```env
+  BACKUP_DESTINATION=sftp://backupuser:StrongPassword@sftp.example.com/exports/samba
+  ```
 
 ## Useful Commands
 
@@ -178,6 +195,7 @@ docker compose exec samba python3 /app/reconcile_shares.py
 docker compose exec samba sqlite3 /state/shares.db 'SELECT * FROM shares;'
 docker compose exec samba testparm -s
 docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
+docker compose exec samba sh -lc 'tail -n 200 /var/log/backup.log'
 ```
 
 ## Troubleshooting
@@ -213,20 +231,14 @@ docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
   docker compose exec samba wbinfo -g
   ```
 
-### Dynamic shares not appearing
+### Data folders not appearing
 
-- Confirm AD groups match `FileShare_*` or `FS_*`.
+- Confirm AD groups match `FS_*`.
 - Run manual reconciliation and inspect logs:
 
   ```bash
   docker compose exec samba python3 /app/reconcile_shares.py
   docker compose exec samba tail -n 100 /var/log/reconcile.log
-  ```
-
-- Validate generated config:
-
-  ```bash
-  docker compose exec samba cat /etc/samba/generated/shares.conf
   ```
 
 ### `acl_xattr.so` or `full_audit.so` module load error
@@ -262,5 +274,5 @@ docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
 ## Notes
 
 - User data is never automatically deleted.
-- Inactive/deleted groups only stop being exposed as shares.
+- Inactive/deleted FS_* groups are moved to `/data/groups/archive`.
 - Data and state survive container restarts via named Docker volumes (`/data/*`, `/state`, `/var/lib/samba`).

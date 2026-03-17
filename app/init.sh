@@ -112,15 +112,11 @@ resolve_share_groups_from_sids() {
   export DOMAIN_ADMINS_GROUP
   DOMAIN_ADMINS_GROUP="$(resolve_sid_to_group "$DOMAIN_ADMINS_SID")"
 
-  export PUBLIC_GROUP
-  PUBLIC_GROUP="$(resolve_sid_to_group "$PUBLIC_GROUP_SID")"
-
   export FSLOGIX_GROUP
   FSLOGIX_GROUP="$(resolve_sid_to_group "$FSLOGIX_GROUP_SID")"
 
   log "Resolved DOMAIN_USERS_SID to '${DOMAIN_USERS_GROUP}'"
   log "Resolved DOMAIN_ADMINS_SID to '${DOMAIN_ADMINS_GROUP}'"
-  log "Resolved PUBLIC_GROUP_SID to '${PUBLIC_GROUP}'"
   log "Resolved FSLOGIX_GROUP_SID to '${FSLOGIX_GROUP}'"
 }
 
@@ -159,12 +155,13 @@ write_runtime_env_file() {
     printf 'export NETBIOS_NAME=%q\n' "$NETBIOS_NAME"
     printf 'export DOMAIN_USERS_SID=%q\n' "$DOMAIN_USERS_SID"
     printf 'export DOMAIN_ADMINS_SID=%q\n' "$DOMAIN_ADMINS_SID"
-    printf 'export PUBLIC_GROUP_SID=%q\n' "$PUBLIC_GROUP_SID"
     printf 'export FSLOGIX_GROUP_SID=%q\n' "$FSLOGIX_GROUP_SID"
     printf 'export DOMAIN_USERS_GROUP=%q\n' "$DOMAIN_USERS_GROUP"
     printf 'export DOMAIN_ADMINS_GROUP=%q\n' "$DOMAIN_ADMINS_GROUP"
-    printf 'export PUBLIC_GROUP=%q\n' "$PUBLIC_GROUP"
     printf 'export FSLOGIX_GROUP=%q\n' "$FSLOGIX_GROUP"
+    if [[ -n "${BACKUP_DESTINATION:-}" ]]; then
+      printf 'export BACKUP_DESTINATION=%q\n' "$BACKUP_DESTINATION"
+    fi
     if [[ -n "${JOIN_USER:-}" ]]; then
       printf 'export JOIN_USER=%q\n' "$JOIN_USER"
     fi
@@ -217,6 +214,13 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 */5 * * * * root source /app/runtime.env && /usr/bin/python3 /app/reconcile_shares.py >> /var/log/reconcile.log 2>&1
 EOF
+
+  if [[ -n "${BACKUP_DESTINATION:-}" ]]; then
+    cat >> /etc/cron.d/reconcile-shares <<'EOF'
+*/30 * * * * root source /app/runtime.env && /usr/bin/python3 /app/backup_to_destination.py >> /var/log/backup.log 2>&1
+EOF
+  fi
+
   chmod 0644 /etc/cron.d/reconcile-shares
 }
 
@@ -227,11 +231,9 @@ require_env DOMAIN_USERS_SID
 require_env DOMAIN_ADMINS_SID
 
 export REALM WORKGROUP DOMAIN
-export PUBLIC_GROUP_SID="${PUBLIC_GROUP_SID:-${DOMAIN_USERS_SID}}"
 export FSLOGIX_GROUP_SID="${FSLOGIX_GROUP_SID:-${DOMAIN_USERS_SID}}"
 export DOMAIN_USERS_GROUP="${DOMAIN_USERS_SID}"
 export DOMAIN_ADMINS_GROUP="${DOMAIN_ADMINS_SID}"
-export PUBLIC_GROUP="${PUBLIC_GROUP_SID}"
 export FSLOGIX_GROUP="${FSLOGIX_GROUP_SID}"
 if [[ -n "${JOIN_USER:-}" ]]; then
   export JOIN_USER
@@ -240,8 +242,8 @@ if [[ -n "${JOIN_PASSWORD:-}" ]]; then
   export JOIN_PASSWORD
 fi
 
-mkdir -p /data/private /data/public /data/fslogix /data/groups /state /etc/samba/generated /var/log/samba
-touch /etc/samba/generated/shares.conf /var/log/reconcile.log
+mkdir -p /data/private /data/fslogix /data/groups/data /data/groups/archive /state /var/log/samba
+touch /var/log/reconcile.log /var/log/backup.log
 
 append_winbind_to_nss
 require_vfs_modules
@@ -262,6 +264,15 @@ write_runtime_env_file
 
 log 'Running startup reconciliation'
 python3 /app/reconcile_shares.py
+
+if [[ -n "${BACKUP_DESTINATION:-}" ]]; then
+  log 'Running startup backup'
+  if ! python3 /app/backup_to_destination.py; then
+    log 'Startup backup failed; continuing service startup.'
+  fi
+else
+  log 'BACKUP_DESTINATION is unset; startup backup skipped'
+fi
 
 install_cron_job
 

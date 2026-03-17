@@ -83,13 +83,12 @@ write_env_file() {
   local admin_password=""
   local domain_users_sid=""
   local domain_admins_sid=""
-  local public_group_sid=""
   local fslogix_group_sid=""
+  local backup_destination=""
   local samba_hostname="adsambafsrv"
   local netbios_name="ADSAMBAFSRV"
   local service_password=""
   local service_account_sam=""
-  local public_group_prompt=""
   local fslogix_group_prompt=""
   local samba_hostname_input=""
   local netbios_name_input=""
@@ -102,12 +101,6 @@ write_env_file() {
   prompt_value admin_password "Initial admin password" true
   prompt_value domain_users_sid "DOMAIN_USERS_SID (e.g. ...-513)"
   prompt_value domain_admins_sid "DOMAIN_ADMINS_SID (e.g. ...-512)"
-
-  public_group_prompt="PUBLIC_GROUP_SID (press Enter to reuse DOMAIN_USERS_SID)"
-  read -r -p "${public_group_prompt}: " public_group_sid
-  if [[ -z "$public_group_sid" ]]; then
-    public_group_sid="$domain_users_sid"
-  fi
 
   fslogix_group_prompt="FSLOGIX_GROUP_SID (press Enter to reuse DOMAIN_USERS_SID)"
   read -r -p "${fslogix_group_prompt}: " fslogix_group_sid
@@ -129,6 +122,8 @@ write_env_file() {
     printf "Using sanitized NETBIOS_NAME: %s\n" "$sanitized_netbios_name"
   fi
   netbios_name="$sanitized_netbios_name"
+
+  read -r -p "BACKUP_DESTINATION (optional URL, press Enter to disable): " backup_destination
 
   service_account_sam="$(sanitize_sam_account_name "$SERVICE_ACCOUNT_NAME")"
   if [[ "$service_account_sam" != "$SERVICE_ACCOUNT_NAME" ]]; then
@@ -165,8 +160,8 @@ SERVICE_ACCOUNT_SAM=${service_account_sam}
 SERVICE_ACCOUNT_PASSWORD=${service_password}
 DOMAIN_USERS_SID=${domain_users_sid}
 DOMAIN_ADMINS_SID=${domain_admins_sid}
-PUBLIC_GROUP_SID=${public_group_sid}
 FSLOGIX_GROUP_SID=${fslogix_group_sid}
+BACKUP_DESTINATION=${backup_destination}
 SAMBA_HOSTNAME=${samba_hostname}
 NETBIOS_NAME=${netbios_name}
 EOF
@@ -217,8 +212,8 @@ JOIN_USER=${service_account_sam}
 JOIN_PASSWORD=${service_password}
 DOMAIN_USERS_SID=${domain_users_sid}
 DOMAIN_ADMINS_SID=${domain_admins_sid}
-PUBLIC_GROUP_SID=${public_group_sid}
 FSLOGIX_GROUP_SID=${fslogix_group_sid}
+BACKUP_DESTINATION=${backup_destination}
 SAMBA_HOSTNAME=${samba_hostname}
 NETBIOS_NAME=${netbios_name}
 # Optional overrides:
@@ -226,6 +221,10 @@ NETBIOS_NAME=${netbios_name}
 # LDAP_BASE_DN=DC=example,DC=com
 # PRIVATE_SKIP_USERS=svc_backup,svc_sql
 # PRIVATE_SKIP_PREFIXES=svc_,sql_
+# BACKUP_DESTINATION=rsync://user:pass@backup.example.com/samba-backups
+# BACKUP_DESTINATION=smb://DOMAIN%5Cuser:pass@backup.example.com/Backups/samba
+# BACKUP_DESTINATION=davfs://user:pass@webdav.example.com/remote.php/dav/files/backup
+# BACKUP_DESTINATION=sftp://user:pass@sftp.example.com/exports/samba
 EOF
 
   chmod 600 "$ENV_FILE"

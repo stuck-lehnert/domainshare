@@ -17,22 +17,18 @@ from typing import Dict, List, Optional, Tuple
 
 DB_PATH = "/state/shares.db"
 LOCK_PATH = "/state/reconcile.lock"
-GROUP_ROOT = "/data/groups"
+GROUP_ROOT = "/data/groups/data"
+GROUP_ARCHIVE_ROOT = "/data/groups/archive"
 PRIVATE_ROOT = "/data/private"
-PUBLIC_ROOT = "/data/public"
 FSLOGIX_ROOT = "/data/fslogix"
-GENERATED_CONF = "/etc/samba/generated/shares.conf"
 
-LDAP_FILTER = (
-    "(&(objectClass=group)(|(sAMAccountName=FileShare_*)(sAMAccountName=FS_*)))"
-)
-GROUP_PREFIXES = ("FileShare_", "FS_")
+LDAP_FILTER = "(&(objectClass=group)(sAMAccountName=FS_*))"
+GROUP_PREFIXES = ("FS_",)
 USER_STATUS_FILTER = "(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*))"
-GROUP_TITLE_ATTRS = ("displayname", "name", "cn")
 
 REQUIRED_ENV = ["REALM", "WORKGROUP", "DOMAIN"]
 ATTR_RE = re.compile(r"^([^:]+)(::?)\s*(.*)$")
-SHARE_NAME_INVALID_RE = re.compile(r"[\\/:*?\"<>|;\[\],+=]")
+GROUP_FOLDER_INVALID_RE = re.compile(r"[\\/:*?\"<>|;\[\],+=]")
 PRIVATE_SKIP_EXACT = {
     "krbtgt",
     "administrator",
@@ -47,6 +43,7 @@ PRIVATE_SKIP_PREFIXES = ("msol_", "fileshare_service", "aad_")
 UAC_ACCOUNTDISABLE = 0x0002
 UAC_LOCKOUT = 0x0010
 AD_NEVER_EXPIRES_VALUES = {0, 9223372036854775807}
+MAX_GROUP_FOLDER_NAME = 120
 
 
 def now_utc() -> str:
@@ -125,15 +122,6 @@ def derive_share_name(sam_account_name: str) -> Optional[str]:
     return None
 
 
-def derive_group_title(entry: Dict[str, Tuple[str, bool]]) -> Optional[str]:
-    for attr in GROUP_TITLE_ATTRS:
-        if attr in entry:
-            value = entry[attr][0].strip()
-            if value:
-                return value
-    return None
-
-
 def parse_groups_from_ldap_output(output: str) -> List[Dict[str, str]]:
     entries = parse_ldap_entries(output)
 
@@ -144,7 +132,7 @@ def parse_groups_from_ldap_output(output: str) -> List[Dict[str, str]]:
 
         sam_value, _ = entry["samaccountname"]
         sam = sam_value.strip()
-        share_name = derive_group_title(entry) or derive_share_name(sam)
+        share_name = derive_share_name(sam)
         if not share_name:
             continue
 
@@ -166,20 +154,76 @@ def parse_groups_from_ldap_output(output: str) -> List[Dict[str, str]]:
     return list(deduped.values())
 
 
+def sanitize_group_folder_name(raw_name: str) -> str:
+    candidate = GROUP_FOLDER_INVALID_RE.sub("_", raw_name.strip())
+    candidate = candidate.strip().strip(".")
+    candidate = re.sub(r"\s+", " ", candidate)
+    if not candidate:
+        return ""
+    return candidate[:MAX_GROUP_FOLDER_NAME]
+
+
+def with_suffix_limited(base_name: str, suffix: str) -> str:
+    limit = MAX_GROUP_FOLDER_NAME - len(suffix)
+    if limit <= 0:
+        return suffix[-MAX_GROUP_FOLDER_NAME:]
+    trimmed = base_name[:limit].rstrip(" ._")
+    if not trimmed:
+        trimmed = "group"
+    return f"{trimmed}{suffix}"
+
+
+def choose_group_folder_name(
+    preferred_name: str,
+    sam_account_name: str,
+    guid: str,
+    used_names: set,
+    existing_name: str = "",
+) -> str:
+    base_name = sanitize_group_folder_name(preferred_name)
+    if not base_name:
+        base_name = sanitize_group_folder_name(
+            derive_share_name(sam_account_name) or ""
+        )
+    if not base_name:
+        base_name = sanitize_group_folder_name(sam_account_name)
+    if not base_name:
+        base_name = f"group_{guid[:8]}"
+
+    if existing_name:
+        existing_folded = existing_name.casefold()
+        if existing_folded not in used_names:
+            sanitized_existing = sanitize_group_folder_name(existing_name)
+            if sanitized_existing.casefold() == base_name.casefold():
+                used_names.add(existing_folded)
+                return existing_name
+
+    candidate = base_name
+    index = 0
+    while candidate.casefold() in used_names:
+        index += 1
+        suffix = f"_{guid[:8]}" if index == 1 else f"_{guid[:8]}_{index}"
+        candidate = with_suffix_limited(base_name, suffix)
+
+    used_names.add(candidate.casefold())
+    return candidate
+
+
+def next_available_path(path: str) -> str:
+    if not os.path.exists(path):
+        return path
+
+    index = 1
+    while True:
+        candidate = f"{path}_{index}"
+        if not os.path.exists(candidate):
+            return candidate
+        index += 1
+
+
 def fetch_groups_via_net_ads() -> List[Dict[str, str]]:
     result = run_command(
-        [
-            "net",
-            "ads",
-            "search",
-            "-P",
-            LDAP_FILTER,
-            "objectGUID",
-            "sAMAccountName",
-            "displayName",
-            "name",
-            "cn",
-        ],
+        ["net", "ads", "search", "-P", LDAP_FILTER, "objectGUID", "sAMAccountName"],
         check=False,
     )
     if result.returncode != 0:
@@ -226,9 +270,6 @@ def fetch_groups_via_ldap_bind() -> List[Dict[str, str]]:
                 LDAP_FILTER,
                 "objectGUID",
                 "sAMAccountName",
-                "displayName",
-                "name",
-                "cn",
             ]
         )
         return parse_groups_from_ldap_output(result.stdout)
@@ -334,141 +375,101 @@ def reconcile_db(conn: sqlite3.Connection, ad_groups: List[Dict[str, str]]) -> N
     timestamp = now_utc()
     seen = set()
 
+    os.makedirs(GROUP_ROOT, exist_ok=True)
+    os.makedirs(GROUP_ARCHIVE_ROOT, exist_ok=True)
+
+    rows = conn.execute(
+        "SELECT objectGUID, samAccountName, shareName, path, isActive FROM shares"
+    ).fetchall()
+    existing_by_guid = {row["objectGUID"]: row for row in rows}
+    used_names = set()
+
     for group in ad_groups:
         guid = group["objectGUID"]
         sam = group["samAccountName"]
-        share_name = group["shareName"]
+        row = existing_by_guid.get(guid)
+        existing_name = ""
+        if (
+            row is not None
+            and row["isActive"]
+            and row["path"].startswith(f"{GROUP_ROOT}/")
+        ):
+            existing_name = os.path.basename(row["path"])
+
+        folder_name = choose_group_folder_name(
+            group["shareName"], sam, guid, used_names, existing_name
+        )
+        path = os.path.join(GROUP_ROOT, folder_name)
         seen.add(guid)
 
-        row = conn.execute(
-            "SELECT objectGUID, path FROM shares WHERE objectGUID = ?", (guid,)
-        ).fetchone()
-
         if row is None:
-            path = os.path.join(GROUP_ROOT, guid)
             ensure_group_path(path)
             conn.execute(
                 """
                 INSERT INTO shares (objectGUID, samAccountName, shareName, path, createdAt, lastSeenAt, isActive)
                 VALUES (?, ?, ?, ?, ?, ?, 1)
                 """,
-                (guid, sam, share_name, path, timestamp, timestamp),
+                (guid, sam, folder_name, path, timestamp, timestamp),
             )
-            log(f"Discovered new share group {sam} ({guid})")
+            log(f"Discovered new data folder group {sam} ({guid})")
             continue
 
-        path = row["path"]
+        existing_path = row["path"]
+        if existing_path != path:
+            if os.path.exists(existing_path):
+                final_path = next_available_path(path)
+                os.rename(existing_path, final_path)
+                path = final_path
+            else:
+                ensure_group_path(path)
+
         ensure_group_path(path)
         conn.execute(
             """
             UPDATE shares
             SET samAccountName = ?,
                 shareName = ?,
+                path = ?,
                 lastSeenAt = ?,
                 isActive = 1
             WHERE objectGUID = ?
             """,
-            (sam, share_name, timestamp, guid),
+            (sam, folder_name, path, timestamp, guid),
         )
 
-    if seen:
-        placeholders = ",".join("?" for _ in seen)
-        conn.execute(
-            f"UPDATE shares SET isActive = 0, lastSeenAt = ? WHERE isActive = 1 AND objectGUID NOT IN ({placeholders})",
-            (timestamp, *seen),
+    active_rows = conn.execute(
+        "SELECT objectGUID, samAccountName, shareName, path FROM shares WHERE isActive = 1"
+    ).fetchall()
+    for row in active_rows:
+        guid = row["objectGUID"]
+        if guid in seen:
+            continue
+
+        old_path = row["path"]
+        archive_name = choose_group_folder_name(
+            row["shareName"],
+            row["samAccountName"],
+            guid,
+            set(),
         )
-    else:
+        archive_path = os.path.join(GROUP_ARCHIVE_ROOT, archive_name)
+        if os.path.exists(old_path):
+            final_archive_path = next_available_path(archive_path)
+            os.rename(old_path, final_archive_path)
+            archive_path = final_archive_path
+
         conn.execute(
-            "UPDATE shares SET isActive = 0, lastSeenAt = ? WHERE isActive = 1",
-            (timestamp,),
+            """
+            UPDATE shares
+            SET isActive = 0,
+                path = ?,
+                lastSeenAt = ?
+            WHERE objectGUID = ?
+            """,
+            (archive_path, timestamp, guid),
         )
 
     conn.commit()
-
-
-def qualify_group(group_name: str) -> str:
-    if "\\" in group_name:
-        return f'@"{group_name}"'
-    workgroup = os.getenv("WORKGROUP", "").strip()
-    if workgroup:
-        return f'@"{workgroup}\\{group_name}"'
-    return f'@"{group_name}"'
-
-
-def is_valid_share_name(share_name: str) -> bool:
-    if not share_name or share_name.casefold() in {"global", "homes", "printers"}:
-        return False
-    if SHARE_NAME_INVALID_RE.search(share_name):
-        return False
-    return True
-
-
-def render_dynamic_shares(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT objectGUID, samAccountName, shareName, path
-        FROM shares
-        WHERE isActive = 1
-        ORDER BY shareName COLLATE NOCASE
-        """
-    ).fetchall()
-
-    stanzas: List[str] = [
-        "# This file is generated by /app/reconcile_shares.py.",
-        "# Manual changes will be overwritten.",
-        "",
-    ]
-    used_share_names = set()
-
-    for row in rows:
-        share_name = row["shareName"].strip()
-        if not share_name:
-            continue
-        folded_name = share_name.casefold()
-        if folded_name in used_share_names:
-            log(
-                f"Skipping duplicate share name '{share_name}' for objectGUID {row['objectGUID']}"
-            )
-            continue
-
-        if not is_valid_share_name(share_name):
-            log(
-                f"Skipping invalid SMB share name '{share_name}' for objectGUID {row['objectGUID']}"
-            )
-            continue
-
-        used_share_names.add(folded_name)
-        valid_users = qualify_group(row["samAccountName"])
-        stanzas.extend(
-            [
-                f"[{share_name}]",
-                f"path = {row['path']}",
-                "read only = no",
-                "browseable = yes",
-                "guest ok = no",
-                "vfs objects = acl_xattr full_audit",
-                "full_audit:prefix = %T|%u|%I|%m|%S",
-                "full_audit:success = all",
-                "full_audit:failure = all",
-                "full_audit:syslog = false",
-                f"valid users = {valid_users}",
-                "create mask = 0660",
-                "directory mask = 2770",
-                "inherit permissions = yes",
-                "access based share enum = yes",
-                "",
-            ]
-        )
-
-    content = "\n".join(stanzas).rstrip() + "\n"
-    os.makedirs(os.path.dirname(GENERATED_CONF), exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=os.path.dirname(GENERATED_CONF), delete=False
-    ) as tmp_file:
-        tmp_file.write(content)
-        temp_path = tmp_file.name
-
-    os.replace(temp_path, GENERATED_CONF)
 
 
 def reload_samba() -> None:
@@ -695,27 +696,6 @@ def should_skip_private_user(username: str) -> bool:
     return False
 
 
-def sync_public_directory() -> None:
-    workgroup = os.environ["WORKGROUP"]
-    public_group = os.getenv("PUBLIC_GROUP", "")
-    public_group_sid = os.getenv("PUBLIC_GROUP_SID", "")
-    qualified_group = public_group
-
-    os.makedirs(PUBLIC_ROOT, exist_ok=True)
-    gid = None
-    if qualified_group:
-        gid = resolve_group_gid_flexible(workgroup, qualified_group)
-    if gid is None and public_group_sid:
-        gid = resolve_gid_from_sid(public_group_sid)
-
-    if gid is not None:
-        admin_gid = resolve_gid_from_sid(os.getenv("DOMAIN_ADMINS_SID", ""))
-        enforce_group_tree_permissions(PUBLIC_ROOT, gid, admin_gid)
-    else:
-        group_display = qualified_group or public_group_sid or "<unset>"
-        log(f"Unable to resolve GID for {group_display}; public ACLs unchanged")
-
-
 def sync_fslogix_directory() -> None:
     workgroup = os.environ["WORKGROUP"]
     fslogix_group = os.getenv("FSLOGIX_GROUP", "")
@@ -820,6 +800,11 @@ def sync_dynamic_directory_permissions(conn: sqlite3.Connection) -> None:
 
         enforce_group_tree_permissions(path, gid, admin_gid)
 
+    os.makedirs(GROUP_ROOT, exist_ok=True)
+    os.chown(GROUP_ROOT, 0, 0)
+    run_command(["setfacl", "-b", GROUP_ROOT], check=False)
+    os.chmod(GROUP_ROOT, 0o555)
+
 
 def with_lock() -> bool:
     os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
@@ -834,18 +819,17 @@ def with_lock() -> bool:
     try:
         ensure_required_env()
         os.makedirs(GROUP_ROOT, exist_ok=True)
+        os.makedirs(GROUP_ARCHIVE_ROOT, exist_ok=True)
 
         conn = open_db()
         try:
             groups = fetch_fileshare_groups()
-            log(f"Discovered {len(groups)} dynamic share group(s) from AD")
+            log(f"Discovered {len(groups)} data folder group(s) from AD")
             reconcile_db(conn, groups)
             sync_dynamic_directory_permissions(conn)
-            render_dynamic_shares(conn)
         finally:
             conn.close()
 
-        sync_public_directory()
         sync_fslogix_directory()
         sync_private_directories()
         reload_samba()
