@@ -29,7 +29,7 @@ USER_STATUS_FILTER = "(&(objectClass=user)(!(objectClass=computer))(sAMAccountNa
 
 REQUIRED_ENV = ["REALM", "WORKGROUP", "DOMAIN"]
 ATTR_RE = re.compile(r"^([^:]+)(::?)\s*(.*)$")
-GROUP_FOLDER_INVALID_RE = re.compile(r"[\\/:*?\"<>|;\[\],+=]")
+GROUP_FOLDER_INVALID_RE = re.compile(r"[\\/:*?\"<>|]")
 PRIVATE_SKIP_EXACT = {
     "krbtgt",
     "administrator",
