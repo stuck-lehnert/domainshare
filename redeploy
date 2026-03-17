@@ -10,19 +10,26 @@ if [[ ! -d .git ]]; then
   exit 1
 fi
 
-log 'Stopping stack'
-docker compose down
+OLD_COMPOSE_FILE="$(mktemp)"
 
-log 'Removing current local compose image(s)'
-mapfile -t IMAGE_NAMES < <(docker compose config --images 2>/dev/null | sed '/^$/d' | sort -u)
-if [[ "${#IMAGE_NAMES[@]}" -gt 0 ]]; then
-  docker image rm -f "${IMAGE_NAMES[@]}" || true
-else
-  log 'No compose-managed local images found to remove.'
-fi
+cleanup() {
+  if [[ -f "$OLD_COMPOSE_FILE" ]]; then
+    rm -f "$OLD_COMPOSE_FILE"
+  fi
+}
+trap cleanup EXIT
+
+log 'Capturing current compose configuration'
+docker compose config > "$OLD_COMPOSE_FILE"
 
 log 'Pulling latest git changes'
 git pull
+
+log 'Building updated images while current stack is running'
+docker compose build --no-cache
+
+log 'Stopping previous stack using captured configuration'
+docker compose --project-directory "$PWD" -f "$OLD_COMPOSE_FILE" down
 
 log 'Starting stack'
 docker compose up -d
