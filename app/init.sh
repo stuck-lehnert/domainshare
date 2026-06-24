@@ -73,6 +73,30 @@ derive_backup_start_hour() {
   printf '2\n'
 }
 
+derive_ad_dns_name() {
+  local raw_name="${AD_DNS_NAME:-}"
+  local host_name="${SAMBA_HOSTNAME:-}"
+
+  if [[ -z "$host_name" ]]; then
+    host_name="$(hostname -s 2>/dev/null || true)"
+  fi
+  if [[ -z "$host_name" ]]; then
+    host_name="${NETBIOS_NAME,,}"
+  fi
+
+  if [[ -n "$raw_name" ]]; then
+    if [[ "$raw_name" == *.* ]]; then
+      AD_DNS_NAME="$raw_name"
+    else
+      AD_DNS_NAME="${raw_name}.${DOMAIN}"
+    fi
+  else
+    AD_DNS_NAME="${host_name}.${DOMAIN}"
+  fi
+
+  export AD_DNS_NAME="${AD_DNS_NAME,,}"
+}
+
 resolve_sid_to_group() {
   local sid="$1"
   local resolved_name=""
@@ -164,6 +188,10 @@ write_runtime_env_file() {
     printf 'export WORKGROUP=%q\n' "$WORKGROUP"
     printf 'export DOMAIN=%q\n' "$DOMAIN"
     printf 'export NETBIOS_NAME=%q\n' "$NETBIOS_NAME"
+    printf 'export AD_DNS_NAME=%q\n' "$AD_DNS_NAME"
+    if [[ -n "${AD_DNS_IP:-}" ]]; then
+      printf 'export AD_DNS_IP=%q\n' "$AD_DNS_IP"
+    fi
     printf 'export DOMAIN_USERS_SID=%q\n' "$DOMAIN_USERS_SID"
     printf 'export DOMAIN_ADMINS_SID=%q\n' "$DOMAIN_ADMINS_SID"
     printf 'export FSLOGIX_GROUP_SID=%q\n' "$FSLOGIX_GROUP_SID"
@@ -211,10 +239,29 @@ join_domain_if_needed() {
   require_env JOIN_USER
   require_env JOIN_PASSWORD
 
+  local join_options=()
+  if [[ -n "${AD_DNS_IP:-}" ]]; then
+    join_options=(--no-dns-updates "dnshostname=${AD_DNS_NAME}")
+  fi
+
   log "Joining AD domain ${REALM}"
-  if ! printf '%s\n' "$JOIN_PASSWORD" | net ads join -U "$JOIN_USER" -S "$DOMAIN"; then
+  if ! printf '%s\n' "$JOIN_PASSWORD" | net ads join "${join_options[@]}" -U "$JOIN_USER" -S "$DOMAIN"; then
     log 'Join using explicit server failed, retrying automatic DC discovery.'
-    printf '%s\n' "$JOIN_PASSWORD" | net ads join -U "$JOIN_USER"
+    printf '%s\n' "$JOIN_PASSWORD" | net ads join "${join_options[@]}" -U "$JOIN_USER"
+  fi
+}
+
+register_ad_dns_record() {
+  if [[ -z "${AD_DNS_IP:-}" ]]; then
+    log 'AD_DNS_IP is unset; skipping explicit AD DNS registration.'
+    return
+  fi
+
+  log "Registering AD DNS ${AD_DNS_NAME} -> ${AD_DNS_IP}"
+  net ads dns unregister -P "$AD_DNS_NAME" >/dev/null 2>&1 || true
+  if ! net ads dns register -P "$AD_DNS_NAME" "$AD_DNS_IP" >/dev/null; then
+    printf '[init] ERROR: failed to register AD DNS %s -> %s\n' "$AD_DNS_NAME" "$AD_DNS_IP" >&2
+    return 1
   fi
 }
 
@@ -273,6 +320,7 @@ touch /var/log/reconcile.log /var/log/backup.log
 append_winbind_to_nss
 require_vfs_modules
 derive_netbios_name
+derive_ad_dns_name
 render_krb5_conf
 render_smb_conf
 join_domain_if_needed
@@ -283,6 +331,7 @@ winbindd -F --no-process-group &
 
 wait_for_winbind
 
+register_ad_dns_record
 resolve_share_groups_from_sids
 render_smb_conf
 write_runtime_env_file

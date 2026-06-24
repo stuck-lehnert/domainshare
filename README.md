@@ -16,6 +16,7 @@ This repository provides a production-oriented Samba file server container that 
   - inactive/deleted groups: `/data/groups/archive/<groupName>`
 - Samba machine trust/key material is persisted in `/var/lib/samba` to survive container recreation.
 - Container hostname is fixed (`SAMBA_HOSTNAME`) to keep AD computer identity stable.
+- In bridge-mode Docker networking, startup can publish the host LAN IP in AD DNS with `AD_DNS_IP`/`AD_DNS_NAME` instead of the container bridge IP.
 - NetBIOS name defaults to `ADSAMBAFSRV` and is clamped to 15 characters (`NETBIOS_NAME` override supported).
 - Setup prompts for well-known authorization groups by SID (`DOMAIN_USERS_SID`, `DOMAIN_ADMINS_SID`) to avoid localized group names.
 - `FSLOGIX_GROUP_SID` controls who can access the default FSLogix share (defaults to `DOMAIN_USERS_SID`).
@@ -71,6 +72,9 @@ CREATE TABLE shares (
 - Container must resolve AD DNS records (especially SRV records for domain controllers).
 - `DOMAIN` should resolve from inside the container.
 - Preferred setup: Docker host uses AD-integrated DNS or forwards to AD DNS.
+- If Docker bridge networking is used, set `AD_DNS_IP` to the Docker host LAN IP that clients should use for SMB, not the container `172.x` address.
+- When `AD_DNS_IP` is set, domain join uses `--no-dns-updates`; each container startup unregisters/re-registers `AD_DNS_NAME -> AD_DNS_IP` in AD DNS using the machine account.
+- `./setup` and `./redeploy` auto-refresh `AD_DNS_IP` from the host route when `AD_DNS_IP_AUTO=1`.
 
 ## Time Sync Requirements
 
@@ -104,6 +108,8 @@ Kerberos requires close time alignment.
    - `REALM`
    - `WORKGROUP`
    - `DOMAIN`
+   - `AD_DNS_IP` (host LAN IP to publish in AD DNS)
+   - optional `AD_DNS_NAME` (defaults to `SAMBA_HOSTNAME.DOMAIN`)
    - initial admin credentials (used once for provisioning)
    - `DOMAIN_USERS_SID`
    - `DOMAIN_ADMINS_SID`
@@ -124,6 +130,7 @@ Kerberos requires close time alignment.
    - uses a valid AD `sAMAccountName` (max 20 chars); default effective value is `FileShare_ServiceAcc`
    - always sets a long random password
    - writes only service-account credentials to `.env` (initial admin credentials are not stored)
+   - writes `AD_DNS_IP` so container restarts keep AD DNS pointed at the host LAN IP
 
 4. The setup script then starts the service with:
 
@@ -237,6 +244,16 @@ docker compose exec samba sh -lc 'tail -n 200 /var/log/backup.log'
 
   ```bash
   docker compose exec samba testparm -s | grep -i 'netbios name'
+  ```
+
+### AD DNS points at 172.x
+
+- This means Samba registered the container bridge IP.
+- Ensure `.env` contains `AD_DNS_IP=<host LAN IP>` and `AD_DNS_NAME=<server FQDN>`.
+- Recreate/restart the container so startup re-registers AD DNS:
+
+  ```bash
+  docker compose up -d --force-recreate samba
   ```
 
 ### Winbind user/group resolution fails
