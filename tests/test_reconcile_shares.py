@@ -24,6 +24,17 @@ def principal(dn, sam, classes, members=()):
     }
 
 
+class GroupFolderNameTests(unittest.TestCase):
+    def test_sanitizer_preserves_leading_dot(self):
+        self.assertEqual(rs.sanitize_group_folder_name(".Finance"), ".Finance")
+        self.assertEqual(rs.sanitize_group_folder_name("..Finance"), "..Finance")
+
+    def test_sanitizer_still_rejects_dot_only_names(self):
+        self.assertEqual(rs.sanitize_group_folder_name("."), "")
+        self.assertEqual(rs.sanitize_group_folder_name(".."), "")
+        self.assertEqual(rs.sanitize_group_folder_name("Finance."), "Finance")
+
+
 class LdapParsingTests(unittest.TestCase):
     def test_parser_keeps_repeated_members_and_unfolds_lines(self):
         display_name = base64.b64encode(b"Data Folder").decode("ascii")

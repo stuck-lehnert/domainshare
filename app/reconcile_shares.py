@@ -277,7 +277,7 @@ def parse_groups_from_ldap_output(output: str) -> List[Dict[str, object]]:
 
 def sanitize_group_folder_name(raw_name: str) -> str:
     candidate = GROUP_FOLDER_INVALID_RE.sub("_", raw_name.strip())
-    candidate = candidate.strip().strip(".")
+    candidate = candidate.strip().rstrip(".")
     candidate = re.sub(r"\s+", " ", candidate)
     if not candidate:
         return ""
