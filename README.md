@@ -10,6 +10,7 @@ This repository provides a production-oriented Samba file server container that 
   - `\\server\Data` -> `/data/groups/data`
   - `\\server\FSLogix` -> `/data/fslogix`
 - FS_* groups are projected as folders inside the Data share (`/data/groups/data/<groupName>`).
+- Data folder ACLs expand nested AD group membership recursively and detect group cycles.
 - Group records are persisted in SQLite at `/state/shares.db`.
 - Group folders are name-based while active and moved to archive on deactivation:
   - active: `/data/groups/data/<groupName>`
@@ -167,6 +168,7 @@ Kerberos requires close time alignment.
 - Path: `/data/groups/data`
 - Contains one folder per active `FS_*` AD group.
 - Root is discoverable as one share, while access to each group folder is enforced via POSIX/ACL group permissions.
+- `FS_*` groups may contain other AD groups; reconciliation recursively grants ACLs to nested groups and logs detected cycles.
 - No guest access.
 
 ### FSLogix
@@ -279,6 +281,17 @@ docker compose exec samba sh -lc 'tail -n 200 /var/log/backup.log'
   ```bash
   docker compose exec samba python3 /app/reconcile_shares.py
   docker compose exec samba tail -n 100 /var/log/reconcile.log
+  ```
+
+### Nested Data group access fails
+
+- Check reconciliation logs for detected group cycles or unresolved nested members.
+- Verify winbind can resolve every nested group to a local GID:
+
+  ```bash
+  docker compose exec samba getent group 'EXAMPLE\NestedGroup'
+  docker compose exec samba id 'EXAMPLE\alice'
+  docker compose exec samba getfacl /data/groups/data/<groupName>
   ```
 
 ### `acl_xattr.so` or `full_audit.so` module load error
