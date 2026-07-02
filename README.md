@@ -169,6 +169,7 @@ Kerberos requires close time alignment.
 - Contains one folder per active `FS_*` AD group.
 - Root is discoverable as one share, while access to each group folder is enforced via POSIX/ACL group permissions.
 - `FS_*` groups may contain other AD groups; reconciliation recursively grants ACLs to nested groups and logs detected cycles.
+- Dot-prefixed group folder names are allowed and are not hidden over SMB.
 - No guest access.
 
 ### FSLogix
