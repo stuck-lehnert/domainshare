@@ -14,13 +14,14 @@ USER_3_DN = "CN=Carol,OU=Users,DC=example,DC=com"
 COMPUTER_DN = "CN=PC01,OU=Computers,DC=example,DC=com"
 
 
-def principal(dn, sam, classes, members=()):
+def principal(dn, sam, classes, members=(), member_of=()):
     return {
         "dn": dn,
         "objectGUID": "",
         "samAccountName": sam,
         "objectClasses": set(classes),
         "memberDns": list(members),
+        "memberOfDns": list(member_of),
     }
 
 
@@ -75,6 +76,7 @@ sAMAccountName: FS_Data
 displayName: Data Folder
 distinguishedName: {ROOT_DN}
 member: {GROUP_A_DN}
+memberOf: CN=Parent,OU=Groups,DC=example,DC=com
 
 """
 
@@ -85,6 +87,9 @@ member: {GROUP_A_DN}
         self.assertEqual(groups[0]["shareName"], "Data Folder")
         self.assertEqual(groups[0]["distinguishedName"], ROOT_DN)
         self.assertEqual(groups[0]["memberDns"], [GROUP_A_DN])
+        self.assertEqual(
+            groups[0]["memberOfDns"], ["CN=Parent,OU=Groups,DC=example,DC=com"]
+        )
         self.assertEqual(groups[0]["objectClasses"], {"group"})
 
     def test_distinguished_name_filter_escapes_rfc4515_specials(self):
@@ -95,46 +100,49 @@ member: {GROUP_A_DN}
             r"(distinguishedName=CN=A\2aB\28C\29\5c\5cName,DC=example,DC=com)",
         )
 
+    def test_nested_group_filter_uses_recursive_memberof_match(self):
+        self.assertEqual(
+            rs.build_nested_groups_filter(ROOT_DN),
+            "(&(objectClass=group)"
+            f"(memberOf:{rs.LDAP_MATCHING_RULE_IN_CHAIN}:={ROOT_DN}))",
+        )
+
 
 class MembershipExpansionTests(unittest.TestCase):
     def lookup_from(self, principals):
         indexed = {rs.normalize_dn(value["dn"]): value for value in principals}
 
-        def lookup(dns):
+        def lookup(root_dn):
+            self.assertEqual(root_dn, ROOT_DN)
             return {
-                rs.normalize_dn(dn): indexed[rs.normalize_dn(dn)]
-                for dn in dns
-                if rs.normalize_dn(dn) in indexed
+                key: value
+                for key, value in indexed.items()
+                if key != rs.normalize_dn(root_dn)
             }
 
         return lookup
 
-    def test_recursive_expansion_dedupes_groups_users_and_detects_cycle(self):
+    def test_recursive_expansion_dedupes_groups_and_detects_cycle(self):
         root_group = {
             "objectGUID": "root-guid",
             "samAccountName": "FS_Data",
             "distinguishedName": ROOT_DN,
             "memberDns": [USER_1_DN, GROUP_A_DN, GROUP_B_DN, COMPUTER_DN],
+            "memberOfDns": [GROUP_A_DN],
             "objectClasses": {"group"},
         }
         lookup = self.lookup_from(
             [
-                principal(USER_1_DN, "alice", {"user"}),
-                principal(USER_2_DN, "bob", {"user"}),
-                principal(USER_3_DN, "carol", {"user"}),
-                principal(COMPUTER_DN, "PC01$", {"user", "computer"}),
-                principal(GROUP_A_DN, "GroupA", {"group"}, [USER_2_DN, GROUP_B_DN]),
-                principal(GROUP_B_DN, "GroupB", {"group"}, [GROUP_A_DN, USER_3_DN]),
+                principal(GROUP_A_DN, "GroupA", {"group"}, member_of=[ROOT_DN]),
+                principal(GROUP_B_DN, "GroupB", {"group"}, member_of=[GROUP_A_DN]),
             ]
         )
 
         expansion = rs.expand_group_membership(root_group, lookup_func=lookup)
 
         self.assertEqual(expansion.group_sams, ["GroupA", "GroupB"])
-        self.assertEqual(expansion.terminal_user_count, 3)
         self.assertEqual(expansion.unresolved_dns, [])
-        self.assertEqual(expansion.ignored_dns, [COMPUTER_DN])
-        self.assertEqual(expansion.cycle_paths, [["FS_Data", "GroupA", "GroupB", "GroupA"]])
+        self.assertEqual(expansion.cycle_paths, [["FS_Data", "GroupA", "FS_Data"]])
 
     def test_self_cycle_is_reported_once(self):
         root_group = {
@@ -145,27 +153,47 @@ class MembershipExpansionTests(unittest.TestCase):
             "objectClasses": {"group"},
         }
         lookup = self.lookup_from(
-            [principal(GROUP_C_DN, "GroupC", {"group"}, [GROUP_C_DN])]
+            [principal(GROUP_C_DN, "GroupC", {"group"}, member_of=[GROUP_C_DN])]
         )
 
         expansion = rs.expand_group_membership(root_group, lookup_func=lookup)
 
         self.assertEqual(expansion.group_sams, ["GroupC"])
-        self.assertEqual(expansion.cycle_paths, [["FS_Data", "GroupC", "GroupC"]])
+        self.assertEqual(expansion.cycle_paths, [["GroupC", "GroupC"]])
 
-    def test_unresolved_member_is_reported(self):
-        missing_dn = "CN=Missing,OU=Groups,DC=example,DC=com"
+    def test_user_members_are_not_required_for_expansion(self):
+        user_dns = [
+            f"CN=User{index},OU=Users,DC=example,DC=com" for index in range(1000)
+        ]
         root_group = {
             "objectGUID": "root-guid",
             "samAccountName": "FS_Data",
             "distinguishedName": ROOT_DN,
-            "memberDns": [missing_dn],
+            "memberDns": [*user_dns, GROUP_A_DN],
+            "objectClasses": {"group"},
+        }
+        lookup = self.lookup_from(
+            [principal(GROUP_A_DN, "GroupA", {"group"}, member_of=[ROOT_DN])]
+        )
+
+        expansion = rs.expand_group_membership(root_group, lookup_func=lookup)
+
+        self.assertEqual(expansion.group_sams, ["GroupA"])
+        self.assertEqual(expansion.unresolved_dns, [])
+        self.assertEqual(expansion.cycle_paths, [])
+
+    def test_missing_root_dn_is_reported(self):
+        root_group = {
+            "objectGUID": "root-guid",
+            "samAccountName": "FS_Data",
+            "distinguishedName": "",
+            "memberDns": [],
             "objectClasses": {"group"},
         }
 
-        expansion = rs.expand_group_membership(root_group, lookup_func=lambda dns: {})
+        expansion = rs.expand_group_membership(root_group, lookup_func=lambda root_dn: {})
 
-        self.assertEqual(expansion.unresolved_dns, [missing_dn])
+        self.assertEqual(expansion.unresolved_dns, ["<missing root group distinguishedName>"])
         self.assertEqual(expansion.group_sams, [])
 
 

@@ -3,14 +3,13 @@
 import base64
 import datetime as dt
 import fcntl
-import grp
 import os
-import pwd
 import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -35,17 +34,22 @@ GROUP_SEARCH_ATTRS = [
     "cn",
     "distinguishedName",
     "member",
+    "memberOf",
     "objectClass",
 ]
-PRINCIPAL_SEARCH_ATTRS = [
+NESTED_GROUP_SEARCH_ATTRS = [
     "objectGUID",
     "sAMAccountName",
     "distinguishedName",
-    "member",
+    "memberOf",
     "objectClass",
 ]
-LDAP_DN_LOOKUP_BATCH_SIZE = 25
+LDAP_MATCHING_RULE_IN_CHAIN = "1.2.840.113556.1.4.1941"
 SETFACL_ENTRY_CHUNK_SIZE = 40
+SLOW_COMMAND_LOG_SECONDS = 5.0
+AD_COMMAND_TIMEOUT_SECONDS = 120
+WINBIND_COMMAND_TIMEOUT_SECONDS = 30
+NSS_COMMAND_TIMEOUT_SECONDS = 30
 
 REQUIRED_ENV = ["REALM", "WORKGROUP", "DOMAIN"]
 ATTR_RE = re.compile(r"^([^:]+)(::?)\s*(.*)$")
@@ -69,15 +73,13 @@ MAX_GROUP_FOLDER_NAME = 120
 LdapValue = Tuple[str, bool]
 LdapEntry = Dict[str, List[LdapValue]]
 Principal = Dict[str, object]
-PrincipalLookup = Callable[[List[str]], Dict[str, Principal]]
+NestedGroupLookup = Callable[[str], Dict[str, Principal]]
 
 
 @dataclass
 class MembershipExpansion:
     group_sams: List[str] = field(default_factory=list)
-    terminal_user_count: int = 0
     unresolved_dns: List[str] = field(default_factory=list)
-    ignored_dns: List[str] = field(default_factory=list)
     cycle_paths: List[List[str]] = field(default_factory=list)
 
 
@@ -113,11 +115,59 @@ def parse_guid(raw_value: str, is_b64: bool) -> str:
     return str(uuid.UUID(candidate))
 
 
-def run_command(command: List[str], check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(command, capture_output=True, text=True)
+def format_duration(seconds: float) -> str:
+    if seconds >= 1:
+        return f"{seconds:.1f}s"
+    return f"{seconds * 1000:.0f}ms"
+
+
+def command_text(command: List[str]) -> str:
+    return " ".join(command)
+
+
+def completed_timeout(
+    command: List[str], exc: subprocess.TimeoutExpired
+) -> subprocess.CompletedProcess:
+    stdout = exc.stdout or ""
+    stderr = exc.stderr or ""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode(errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    if not stderr:
+        stderr = f"Command timed out after {exc.timeout}s"
+    return subprocess.CompletedProcess(command, 124, stdout, stderr)
+
+
+def run_command(
+    command: List[str], check: bool = True, timeout: Optional[int] = None
+) -> subprocess.CompletedProcess:
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - started
+        log(
+            f"Command timed out after {format_duration(elapsed)}: "
+            f"{command_text(command)}"
+        )
+        result = completed_timeout(command, exc)
+        if check:
+            raise RuntimeError(
+                f"Command timed out ({command_text(command)}): {result.stderr.strip()}"
+            ) from exc
+        return result
+
+    elapsed = time.monotonic() - started
+    if elapsed >= SLOW_COMMAND_LOG_SECONDS:
+        log(f"Slow command took {format_duration(elapsed)}: {command_text(command)}")
+
     if check and result.returncode != 0:
         raise RuntimeError(
-            f"Command failed ({' '.join(command)}): {result.stderr.strip() or result.stdout.strip()}"
+            f"Command failed ({command_text(command)}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
         )
     return result
 
@@ -232,6 +282,7 @@ def parse_principal_from_entry(entry: LdapEntry) -> Optional[Principal]:
         "objectGUID": guid,
         "samAccountName": ldap_first(entry, "sAMAccountName") or "",
         "memberDns": ldap_values(entry, "member"),
+        "memberOfDns": ldap_values(entry, "memberOf"),
         "objectClasses": object_classes,
     }
 
@@ -260,6 +311,7 @@ def parse_groups_from_ldap_entries(entries: List[LdapEntry]) -> List[Dict[str, o
                 "shareName": share_name,
                 "distinguishedName": entry_dn(entry),
                 "memberDns": ldap_values(entry, "member"),
+                "memberOfDns": ldap_values(entry, "memberOf"),
                 "objectClasses": object_classes,
             }
         )
@@ -371,6 +423,7 @@ def search_entries_via_net_ads(
     result = run_command(
         ["net", "ads", "search", "-P", filter_expr, *attributes],
         check=False,
+        timeout=AD_COMMAND_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -417,7 +470,8 @@ def search_entries_via_ldap_bind(
                 base_dn,
                 filter_expr,
                 *attributes,
-            ]
+            ],
+            timeout=AD_COMMAND_TIMEOUT_SECONDS,
         )
         return parse_ldap_entries(result.stdout)
     finally:
@@ -449,6 +503,9 @@ def group_to_principal(group: Dict[str, object]) -> Principal:
         "objectGUID": str(group.get("objectGUID") or ""),
         "samAccountName": str(group.get("samAccountName") or ""),
         "memberDns": [str(dn) for dn in group.get("memberDns", []) if str(dn).strip()],
+        "memberOfDns": [
+            str(dn) for dn in group.get("memberOfDns", []) if str(dn).strip()
+        ],
         "objectClasses": {str(value).lower() for value in object_classes},
     }
 
@@ -474,147 +531,119 @@ def is_user_principal(principal: Principal) -> bool:
     )
 
 
-def lookup_principals_by_dns(dns: List[str]) -> Dict[str, Principal]:
-    unique_dns: List[str] = []
-    seen_dns: Set[str] = set()
-    for dn in dns:
-        key = normalize_dn(dn)
-        if not key or key in seen_dns:
-            continue
-        seen_dns.add(key)
-        unique_dns.append(dn)
+def build_nested_groups_filter(root_dn: str) -> str:
+    escaped_root_dn = escape_ldap_filter_value(root_dn)
+    return (
+        "(&(objectClass=group)"
+        f"(memberOf:{LDAP_MATCHING_RULE_IN_CHAIN}:={escaped_root_dn}))"
+    )
 
+
+def lookup_nested_group_principals(root_dn: str) -> Dict[str, Principal]:
+    if not root_dn.strip():
+        return {}
+
+    entries = search_directory_entries(
+        build_nested_groups_filter(root_dn), NESTED_GROUP_SEARCH_ATTRS
+    )
     principals: Dict[str, Principal] = {}
-    for dn_chunk in chunked(unique_dns, LDAP_DN_LOOKUP_BATCH_SIZE):
-        entries = search_directory_entries(
-            build_distinguished_name_filter(dn_chunk), PRINCIPAL_SEARCH_ATTRS
-        )
-        for entry in entries:
-            principal = parse_principal_from_entry(entry)
-            if principal is None:
-                continue
-            key = normalize_dn(str(principal.get("dn") or ""))
-            if key:
-                principals[key] = principal
-
+    for entry in entries:
+        principal = parse_principal_from_entry(entry)
+        if principal is None or not is_group_principal(principal):
+            continue
+        key = normalize_dn(str(principal.get("dn") or ""))
+        if key:
+            principals[key] = principal
     return principals
 
 
-def load_principals_for_dns(
-    dns: List[str], cache: Dict[str, Principal], lookup_func: PrincipalLookup
-) -> None:
-    missing_dns: List[str] = []
-    seen_dns: Set[str] = set()
-    for dn in dns:
-        key = normalize_dn(dn)
-        if not key or key in cache or key in seen_dns:
-            continue
-        seen_dns.add(key)
-        missing_dns.append(dn)
+def find_group_cycle_paths(principals: Dict[str, Principal]) -> List[List[str]]:
+    graph: Dict[str, List[str]] = {}
+    for key, principal in principals.items():
+        parent_keys = []
+        for parent_dn in principal.get("memberOfDns", []):
+            parent_key = normalize_dn(str(parent_dn))
+            if parent_key in principals:
+                parent_keys.append(parent_key)
+        graph[key] = sorted(set(parent_keys))
 
-    if not missing_dns:
-        return
+    cycle_paths: List[List[str]] = []
+    cycle_keys_seen: Set[str] = set()
+    visited: Set[str] = set()
+    visiting: Set[str] = set()
+    stack: List[str] = []
 
-    for lookup_key, principal in lookup_func(missing_dns).items():
-        principal_key = normalize_dn(str(principal.get("dn") or lookup_key))
-        if principal_key:
-            cache[principal_key] = principal
+    def add_cycle(cycle: List[str]) -> None:
+        labels = [principal_display_name(principals[key]) for key in cycle]
+        cycle_key = " -> ".join(labels).casefold()
+        if cycle_key not in cycle_keys_seen:
+            cycle_keys_seen.add(cycle_key)
+            cycle_paths.append(labels)
+
+    def visit(key: str) -> None:
+        visiting.add(key)
+        stack.append(key)
+        for parent_key in graph.get(key, []):
+            if parent_key in visiting:
+                start_index = stack.index(parent_key)
+                add_cycle(stack[start_index:] + [parent_key])
+                continue
+            if parent_key not in visited:
+                visit(parent_key)
+        stack.pop()
+        visiting.discard(key)
+        visited.add(key)
+
+    for key in sorted(principals):
+        if key not in visited:
+            visit(key)
+
+    return cycle_paths
 
 
 def expand_group_membership(
     root_group: Dict[str, object],
-    principal_cache: Optional[Dict[str, Principal]] = None,
-    lookup_func: PrincipalLookup = lookup_principals_by_dns,
+    nested_group_cache: Optional[Dict[str, Dict[str, Principal]]] = None,
+    lookup_func: NestedGroupLookup = lookup_nested_group_principals,
 ) -> MembershipExpansion:
-    cache = principal_cache if principal_cache is not None else {}
     root_principal = group_to_principal(root_group)
-    root_key = normalize_dn(str(root_principal.get("dn") or ""))
-    if root_key:
-        cache[root_key] = root_principal
+    root_dn = str(root_principal.get("dn") or "")
+    root_key = normalize_dn(root_dn)
 
     expansion = MembershipExpansion()
-    group_sams_seen: Set[str] = set()
-    unresolved_seen: Set[str] = set()
-    ignored_seen: Set[str] = set()
-    user_dns_seen: Set[str] = set()
-    cycle_paths_seen: Set[str] = set()
-    visiting: Set[str] = set()
-    visited: Set[str] = set()
+    if not root_key:
+        expansion.unresolved_dns.append("<missing root group distinguishedName>")
+        return expansion
 
-    def add_unresolved(dn: str) -> None:
-        key = normalize_dn(dn)
-        if key and key not in unresolved_seen:
-            unresolved_seen.add(key)
-            expansion.unresolved_dns.append(dn)
+    cache = nested_group_cache if nested_group_cache is not None else {}
+    if root_key in cache:
+        nested_groups = cache[root_key]
+    else:
+        nested_groups = lookup_func(root_dn)
+        cache[root_key] = nested_groups
 
-    def add_ignored(dn: str) -> None:
-        key = normalize_dn(dn)
-        if key and key not in ignored_seen:
-            ignored_seen.add(key)
-            expansion.ignored_dns.append(dn)
+    all_groups = {root_key: root_principal}
+    all_groups.update(nested_groups)
 
-    def add_cycle(path: List[str]) -> None:
-        key = " -> ".join(path).casefold()
-        if key not in cycle_paths_seen:
-            cycle_paths_seen.add(key)
-            expansion.cycle_paths.append(path)
+    seen_sams: Set[str] = set()
+    for key, principal in sorted(
+        nested_groups.items(),
+        key=lambda item: principal_display_name(item[1]).casefold(),
+    ):
+        if key == root_key:
+            continue
+        sam = str(principal.get("samAccountName") or "").strip()
+        if not sam:
+            dn = str(principal.get("dn") or key)
+            if dn not in expansion.unresolved_dns:
+                expansion.unresolved_dns.append(dn)
+            continue
+        sam_key = sam.casefold()
+        if sam_key not in seen_sams:
+            seen_sams.add(sam_key)
+            expansion.group_sams.append(sam)
 
-    def visit_group(principal: Principal, path: List[str]) -> None:
-        current_key = normalize_dn(str(principal.get("dn") or ""))
-        if current_key:
-            visiting.add(current_key)
-
-        member_dns = [
-            str(dn) for dn in principal.get("memberDns", []) if str(dn).strip()
-        ]
-        load_principals_for_dns(member_dns, cache, lookup_func)
-
-        for member_dn in member_dns:
-            member_key = normalize_dn(member_dn)
-            if not member_key:
-                continue
-
-            member = cache.get(member_key)
-            if member is None:
-                add_unresolved(member_dn)
-                continue
-
-            member_label = principal_display_name(member)
-            if member_key in visiting:
-                add_cycle(path + [member_label])
-                continue
-
-            if is_group_principal(member):
-                member_sam = str(member.get("samAccountName") or "").strip()
-                if not member_sam:
-                    add_unresolved(str(member.get("dn") or member_dn))
-                else:
-                    sam_key = member_sam.casefold()
-                    if sam_key not in group_sams_seen:
-                        group_sams_seen.add(sam_key)
-                        expansion.group_sams.append(member_sam)
-
-                if member_key not in visited:
-                    visit_group(member, path + [member_label])
-                continue
-
-            if is_computer_principal(member):
-                add_ignored(str(member.get("dn") or member_dn))
-                continue
-
-            if is_user_principal(member):
-                if member_key not in user_dns_seen:
-                    user_dns_seen.add(member_key)
-                    expansion.terminal_user_count += 1
-                continue
-
-            add_ignored(str(member.get("dn") or member_dn))
-
-        if current_key:
-            visiting.discard(current_key)
-            visited.add(current_key)
-
-    visit_group(root_principal, [principal_display_name(root_principal)])
+    expansion.cycle_paths = find_group_cycle_paths(all_groups)
     return expansion
 
 
@@ -642,7 +671,7 @@ def fetch_non_login_users() -> set:
         "accountExpires",
         "lockoutTime",
     ]
-    result = run_command(command, check=False)
+    result = run_command(command, check=False, timeout=AD_COMMAND_TIMEOUT_SECONDS)
     if result.returncode != 0:
         log(
             "net ads search for account status failed; private folder filtering will use static skip rules only"
@@ -814,16 +843,36 @@ def refresh_winbind_cache() -> None:
 
 
 def resolve_user_uid(qualified_user: str) -> Optional[int]:
+    result = run_command(
+        ["getent", "passwd", qualified_user],
+        check=False,
+        timeout=NSS_COMMAND_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        return None
+    fields = result.stdout.strip().split(":")
+    if len(fields) < 3:
+        return None
     try:
-        return pwd.getpwnam(qualified_user).pw_uid
-    except KeyError:
+        return int(fields[2])
+    except ValueError:
         return None
 
 
 def resolve_group_gid(qualified_group: str) -> Optional[int]:
+    result = run_command(
+        ["getent", "group", qualified_group],
+        check=False,
+        timeout=NSS_COMMAND_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        return None
+    fields = result.stdout.strip().split(":")
+    if len(fields) < 3:
+        return None
     try:
-        return grp.getgrnam(qualified_group).gr_gid
-    except KeyError:
+        return int(fields[2])
+    except ValueError:
         return None
 
 
@@ -862,7 +911,11 @@ def resolve_group_gid_flexible(workgroup: str, group_name: str) -> Optional[int]
 def resolve_gid_from_sid(sid: str) -> Optional[int]:
     if not sid:
         return None
-    result = run_command(["wbinfo", "--sid-to-gid", sid], check=False)
+    result = run_command(
+        ["wbinfo", "--sid-to-gid", sid],
+        check=False,
+        timeout=WINBIND_COMMAND_TIMEOUT_SECONDS,
+    )
     if result.returncode != 0:
         return None
     try:
@@ -979,12 +1032,15 @@ def enforce_group_tree_permissions(
     owner_group_gid: int,
     acl_group_gids: List[int],
     admin_gid: Optional[int],
-) -> None:
+) -> Tuple[int, int]:
+    dir_count = 1
+    file_count = 0
     apply_group_permissions(
         root_path, owner_group_gid, acl_group_gids, admin_gid, is_dir=True
     )
     for current_root, dirnames, filenames in os.walk(root_path):
         for dirname in dirnames:
+            dir_count += 1
             apply_group_permissions(
                 os.path.join(current_root, dirname),
                 owner_group_gid,
@@ -993,6 +1049,7 @@ def enforce_group_tree_permissions(
                 is_dir=True,
             )
         for filename in filenames:
+            file_count += 1
             apply_group_permissions(
                 os.path.join(current_root, filename),
                 owner_group_gid,
@@ -1000,12 +1057,23 @@ def enforce_group_tree_permissions(
                 admin_gid,
                 is_dir=False,
             )
+    return dir_count, file_count
 
 
 def resolve_user_primary_gid(uid: int) -> Optional[int]:
+    result = run_command(
+        ["getent", "passwd", str(uid)],
+        check=False,
+        timeout=NSS_COMMAND_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        return None
+    fields = result.stdout.strip().split(":")
+    if len(fields) < 4:
+        return None
     try:
-        return pwd.getpwuid(uid).pw_gid
-    except KeyError:
+        return int(fields[3])
+    except ValueError:
         return None
 
 
@@ -1033,7 +1101,9 @@ def enforce_private_tree_permissions(
 
 
 def list_domain_users(non_login_users: set) -> List[str]:
-    result = run_command(["wbinfo", "-u"], check=False)
+    result = run_command(
+        ["wbinfo", "-u"], check=False, timeout=WINBIND_COMMAND_TIMEOUT_SECONDS
+    )
     if result.returncode != 0:
         log("wbinfo -u failed; skipping private directory sync")
         return []
@@ -1180,12 +1250,14 @@ def sync_dynamic_directory_permissions(
         admin_gid = resolve_gid_from_sid(os.getenv("DOMAIN_ADMINS_SID", ""))
 
     ad_groups_by_guid = {str(group["objectGUID"]): group for group in ad_groups}
-    principal_cache: Dict[str, Principal] = {}
+    nested_group_cache: Dict[str, Dict[str, Principal]] = {}
 
     rows = conn.execute(
         "SELECT objectGUID, samAccountName, path FROM shares WHERE isActive = 1"
     ).fetchall()
+    log(f"Syncing permissions for {len(rows)} active data folder group(s)")
     for row in rows:
+        share_started = time.monotonic()
         guid = row["objectGUID"]
         sam = row["samAccountName"]
         path = row["path"]
@@ -1194,35 +1266,34 @@ def sync_dynamic_directory_permissions(
             log(f"No AD data available for {sam}; leaving existing ACLs")
             continue
 
+        log(f"Syncing data folder {sam}")
+        expand_started = time.monotonic()
         try:
-            expansion = expand_group_membership(ad_group, principal_cache)
+            expansion = expand_group_membership(ad_group, nested_group_cache)
         except Exception as exc:  # pylint: disable=broad-except
             log(
                 f"Unable to expand nested members for {sam}: "
                 f"{exc}; leaving existing ACLs"
             )
             continue
+        expand_elapsed = time.monotonic() - expand_started
 
         for cycle_path in expansion.cycle_paths:
             log(f"Detected nested group cycle for {sam}: {' -> '.join(cycle_path)}")
 
-        if expansion.ignored_dns:
-            log(
-                f"Ignoring computer/unsupported nested member(s) for {sam}: "
-                f"{format_dn_list(expansion.ignored_dns)}"
-            )
-
         if expansion.unresolved_dns:
             log(
-                f"Unable to resolve nested member(s) for {sam}: "
+                f"Unable to resolve nested group(s) for {sam}: "
                 f"{format_dn_list(expansion.unresolved_dns)}; leaving existing ACLs"
             )
             continue
 
         acl_group_names = [sam, *expansion.group_sams]
+        gid_started = time.monotonic()
         acl_group_gids, unresolved_groups = resolve_group_gids_for_acl(
             workgroup, acl_group_names
         )
+        gid_elapsed = time.monotonic() - gid_started
         if unresolved_groups:
             log(
                 f"Unable to resolve GID(s) for {sam}: "
@@ -1231,14 +1302,21 @@ def sync_dynamic_directory_permissions(
             continue
 
         owner_group_gid = acl_group_gids[0]
-        if expansion.group_sams or expansion.cycle_paths:
-            log(
-                f"Expanded {sam}: {len(expansion.group_sams)} nested group(s), "
-                f"{expansion.terminal_user_count} terminal user(s)"
-            )
-
         os.makedirs(path, exist_ok=True)
-        enforce_group_tree_permissions(path, owner_group_gid, acl_group_gids, admin_gid)
+        acl_started = time.monotonic()
+        dir_count, file_count = enforce_group_tree_permissions(
+            path, owner_group_gid, acl_group_gids, admin_gid
+        )
+        acl_elapsed = time.monotonic() - acl_started
+        total_elapsed = time.monotonic() - share_started
+        log(
+            f"Synced {sam}: nested_groups={len(expansion.group_sams)}, "
+            f"acl_groups={len(acl_group_gids)}, dirs={dir_count}, files={file_count}, "
+            f"expand={format_duration(expand_elapsed)}, "
+            f"gids={format_duration(gid_elapsed)}, "
+            f"acl={format_duration(acl_elapsed)}, "
+            f"total={format_duration(total_elapsed)}"
+        )
 
     os.makedirs(GROUP_ROOT, exist_ok=True)
     os.chown(GROUP_ROOT, 0, 0)
@@ -1261,19 +1339,61 @@ def with_lock() -> bool:
         os.makedirs(GROUP_ROOT, exist_ok=True)
         os.makedirs(GROUP_ARCHIVE_ROOT, exist_ok=True)
 
+        reconcile_started = time.monotonic()
         conn = open_db()
         try:
+            phase_started = time.monotonic()
             groups = fetch_fileshare_groups()
-            log(f"Discovered {len(groups)} data folder group(s) from AD")
+            log(
+                f"Discovered {len(groups)} data folder group(s) from AD "
+                f"in {format_duration(time.monotonic() - phase_started)}"
+            )
+
+            log("Reconciling data folder DB")
+            phase_started = time.monotonic()
             reconcile_db(conn, groups)
+            log(
+                f"Reconciled data folder DB in "
+                f"{format_duration(time.monotonic() - phase_started)}"
+            )
+
+            log("Syncing data folder permissions")
+            phase_started = time.monotonic()
             sync_dynamic_directory_permissions(conn, groups)
+            log(
+                f"Synced data folder permissions in "
+                f"{format_duration(time.monotonic() - phase_started)}"
+            )
         finally:
             conn.close()
 
+        log("Syncing FSLogix root")
+        phase_started = time.monotonic()
         sync_fslogix_directory()
+        log(
+            f"Synced FSLogix root in "
+            f"{format_duration(time.monotonic() - phase_started)}"
+        )
+
+        log("Syncing private directories")
+        phase_started = time.monotonic()
         sync_private_directories()
+        log(
+            f"Synced private directories in "
+            f"{format_duration(time.monotonic() - phase_started)}"
+        )
+
+        log("Reloading Samba config")
+        phase_started = time.monotonic()
         reload_samba()
-        log("Reconciliation completed")
+        log(
+            f"Reloaded Samba config in "
+            f"{format_duration(time.monotonic() - phase_started)}"
+        )
+        log(
+            f"Reconciliation completed in "
+            f"{format_duration(time.monotonic() - reconcile_started)}"
+        )
         return True
     finally:
         lock_file.close()
