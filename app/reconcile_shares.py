@@ -3,6 +3,7 @@
 import base64
 import datetime as dt
 import fcntl
+import json
 import os
 import re
 import sqlite3
@@ -46,10 +47,14 @@ NESTED_GROUP_SEARCH_ATTRS = [
 ]
 LDAP_MATCHING_RULE_IN_CHAIN = "1.2.840.113556.1.4.1941"
 SETFACL_ENTRY_CHUNK_SIZE = 40
+SETFACL_PATH_CHUNK_SIZE = 100
+DATA_ACL_SIGNATURE_VERSION = 1
+DATA_ACL_REPAIR_ENV = "REPAIR_DATA_ACLS"
 SLOW_COMMAND_LOG_SECONDS = 5.0
 AD_COMMAND_TIMEOUT_SECONDS = 120
 WINBIND_COMMAND_TIMEOUT_SECONDS = 30
 NSS_COMMAND_TIMEOUT_SECONDS = 30
+TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 REQUIRED_ENV = ["REALM", "WORKGROUP", "DOMAIN"]
 ATTR_RE = re.compile(r"^([^:]+)(::?)\s*(.*)$")
@@ -703,6 +708,17 @@ def fetch_non_login_users() -> set:
     return blocked
 
 
+def ensure_share_db_schema(conn: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(shares)").fetchall()
+    }
+    if "aclSignature" not in columns:
+        conn.execute(
+            "ALTER TABLE shares ADD COLUMN aclSignature TEXT NOT NULL DEFAULT ''"
+        )
+
+
 def open_db() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -716,10 +732,12 @@ def open_db() -> sqlite3.Connection:
             path TEXT NOT NULL,
             createdAt TIMESTAMP NOT NULL,
             lastSeenAt TIMESTAMP NOT NULL,
-            isActive INTEGER NOT NULL
+            isActive INTEGER NOT NULL,
+            aclSignature TEXT NOT NULL DEFAULT ''
         )
         """
     )
+    ensure_share_db_schema(conn)
     conn.commit()
     return conn
 
@@ -773,6 +791,7 @@ def reconcile_db(conn: sqlite3.Connection, ad_groups: List[Dict[str, object]]) -
             continue
 
         existing_path = row["path"]
+        reset_acl_signature = not row["isActive"] or existing_path != path
         if existing_path != path:
             if os.path.exists(existing_path):
                 final_path = next_available_path(path)
@@ -789,10 +808,11 @@ def reconcile_db(conn: sqlite3.Connection, ad_groups: List[Dict[str, object]]) -
                 shareName = ?,
                 path = ?,
                 lastSeenAt = ?,
-                isActive = 1
+                isActive = 1,
+                aclSignature = CASE WHEN ? THEN '' ELSE aclSignature END
             WHERE objectGUID = ?
             """,
-            (sam, folder_name, path, timestamp, guid),
+            (sam, folder_name, path, timestamp, 1 if reset_acl_signature else 0, guid),
         )
 
     active_rows = conn.execute(
@@ -821,7 +841,8 @@ def reconcile_db(conn: sqlite3.Connection, ad_groups: List[Dict[str, object]]) -
             UPDATE shares
             SET isActive = 0,
                 path = ?,
-                lastSeenAt = ?
+                lastSeenAt = ?,
+                aclSignature = ''
             WHERE objectGUID = ?
             """,
             (archive_path, timestamp, guid),
@@ -837,7 +858,11 @@ def reload_samba() -> None:
 
 
 def refresh_winbind_cache() -> None:
-    result = run_command(["net", "cache", "flush"], check=False)
+    result = run_command(
+        ["net", "cache", "flush"],
+        check=False,
+        timeout=WINBIND_COMMAND_TIMEOUT_SECONDS,
+    )
     if result.returncode != 0:
         log("net cache flush failed; group membership updates may be delayed")
 
@@ -952,29 +977,9 @@ def resolve_group_gids_for_acl(
     return gids, unresolved
 
 
-def apply_setfacl_entries(path: str, acl_entries: List[str]) -> None:
-    for acl_chunk in chunked(acl_entries, SETFACL_ENTRY_CHUNK_SIZE):
-        result = run_command(["setfacl", "-m", ",".join(acl_chunk), path], check=False)
-        if result.returncode != 0:
-            log(
-                f"setfacl failed for {path}: "
-                f"{result.stderr.strip() or result.stdout.strip()}"
-            )
-            return
-
-
-def apply_group_permissions(
-    path: str,
-    owner_group_gid: int,
-    acl_group_gids: List[int],
-    admin_gid: Optional[int],
-    is_dir: bool,
-) -> None:
-    if os.path.islink(path):
-        return
-
-    mode = 0o2770 if is_dir else 0o660
-    group_perms = "rwx" if is_dir else "rw-"
+def group_acl_gids(
+    owner_group_gid: int, acl_group_gids: List[int], admin_gid: Optional[int]
+) -> List[int]:
     acl_gids: List[int] = []
     seen_gids: Set[int] = set()
     for gid in [owner_group_gid, *acl_group_gids]:
@@ -983,10 +988,17 @@ def apply_group_permissions(
             acl_gids.append(gid)
     if admin_gid is not None and admin_gid not in seen_gids:
         acl_gids.append(admin_gid)
+    return acl_gids
 
-    os.chown(path, 0, owner_group_gid)
-    os.chmod(path, mode)
-    run_command(["setfacl", "-b", path], check=False)
+
+def group_acl_entries(
+    owner_group_gid: int,
+    acl_group_gids: List[int],
+    admin_gid: Optional[int],
+    is_dir: bool,
+) -> List[str]:
+    group_perms = "rwx" if is_dir else "rw-"
+    acl_gids = group_acl_gids(owner_group_gid, acl_group_gids, admin_gid)
 
     acl_entries = [f"g:{gid}:{group_perms}" for gid in acl_gids]
     acl_entries.append(f"m:{group_perms}")
@@ -995,7 +1007,72 @@ def apply_group_permissions(
         acl_entries.extend(f"d:g:{gid}:rwx" for gid in acl_gids)
         acl_entries.append("d:m:rwx")
 
-    apply_setfacl_entries(path, acl_entries)
+    return acl_entries
+
+
+def apply_setfacl_to_paths(paths: List[str], args: List[str]) -> bool:
+    if not paths:
+        return True
+
+    ok = True
+    for path_chunk in chunked(paths, SETFACL_PATH_CHUNK_SIZE):
+        result = run_command(["setfacl", *args, *path_chunk], check=False)
+        if result.returncode != 0:
+            ok = False
+            log(
+                f"setfacl failed for {len(path_chunk)} path(s) starting at "
+                f"{path_chunk[0]}: {result.stderr.strip() or result.stdout.strip()}"
+            )
+    return ok
+
+
+def clear_setfacl_entries(paths: List[str]) -> bool:
+    return apply_setfacl_to_paths(paths, ["-b"])
+
+
+def apply_setfacl_entries_to_paths(paths: List[str], acl_entries: List[str]) -> bool:
+    ok = True
+    for acl_chunk in chunked(acl_entries, SETFACL_ENTRY_CHUNK_SIZE):
+        if not apply_setfacl_to_paths(paths, ["-m", ",".join(acl_chunk)]):
+            ok = False
+    return ok
+
+
+def apply_setfacl_entries(path: str, acl_entries: List[str]) -> bool:
+    return apply_setfacl_entries_to_paths([path], acl_entries)
+
+
+def set_group_ownership_and_mode(
+    paths: List[str], owner_group_gid: int, is_dir: bool
+) -> int:
+    mode = 0o2770 if is_dir else 0o660
+    changed = 0
+    for path in paths:
+        if os.path.islink(path):
+            continue
+        os.chown(path, 0, owner_group_gid)
+        os.chmod(path, mode)
+        changed += 1
+    return changed
+
+
+def apply_group_permissions(
+    path: str,
+    owner_group_gid: int,
+    acl_group_gids: List[int],
+    admin_gid: Optional[int],
+    is_dir: bool,
+) -> bool:
+    if os.path.islink(path):
+        return True
+
+    set_group_ownership_and_mode([path], owner_group_gid, is_dir)
+    ok = clear_setfacl_entries([path])
+    if not apply_setfacl_entries(
+        path, group_acl_entries(owner_group_gid, acl_group_gids, admin_gid, is_dir)
+    ):
+        ok = False
+    return ok
 
 
 def apply_private_permissions(
@@ -1027,37 +1104,45 @@ def apply_private_permissions(
         )
 
 
+def collect_group_tree_paths(root_path: str) -> Tuple[List[str], List[str]]:
+    dir_paths = [] if os.path.islink(root_path) else [root_path]
+    file_paths: List[str] = []
+
+    for current_root, dirnames, filenames in os.walk(root_path):
+        for dirname in dirnames:
+            path = os.path.join(current_root, dirname)
+            if not os.path.islink(path):
+                dir_paths.append(path)
+        for filename in filenames:
+            path = os.path.join(current_root, filename)
+            if not os.path.islink(path):
+                file_paths.append(path)
+
+    return dir_paths, file_paths
+
+
 def enforce_group_tree_permissions(
     root_path: str,
     owner_group_gid: int,
     acl_group_gids: List[int],
     admin_gid: Optional[int],
-) -> Tuple[int, int]:
-    dir_count = 1
-    file_count = 0
-    apply_group_permissions(
-        root_path, owner_group_gid, acl_group_gids, admin_gid, is_dir=True
-    )
-    for current_root, dirnames, filenames in os.walk(root_path):
-        for dirname in dirnames:
-            dir_count += 1
-            apply_group_permissions(
-                os.path.join(current_root, dirname),
-                owner_group_gid,
-                acl_group_gids,
-                admin_gid,
-                is_dir=True,
-            )
-        for filename in filenames:
-            file_count += 1
-            apply_group_permissions(
-                os.path.join(current_root, filename),
-                owner_group_gid,
-                acl_group_gids,
-                admin_gid,
-                is_dir=False,
-            )
-    return dir_count, file_count
+) -> Tuple[int, int, bool]:
+    dir_paths, file_paths = collect_group_tree_paths(root_path)
+
+    set_group_ownership_and_mode(dir_paths, owner_group_gid, is_dir=True)
+    set_group_ownership_and_mode(file_paths, owner_group_gid, is_dir=False)
+
+    ok = clear_setfacl_entries([*dir_paths, *file_paths])
+    if not apply_setfacl_entries_to_paths(
+        dir_paths, group_acl_entries(owner_group_gid, acl_group_gids, admin_gid, True)
+    ):
+        ok = False
+    if not apply_setfacl_entries_to_paths(
+        file_paths, group_acl_entries(owner_group_gid, acl_group_gids, admin_gid, False)
+    ):
+        ok = False
+
+    return len(dir_paths), len(file_paths), ok
 
 
 def resolve_user_primary_gid(uid: int) -> Optional[int]:
@@ -1238,6 +1323,31 @@ def format_dn_list(dns: List[str], limit: int = 3) -> str:
     return ", ".join(shown) + suffix
 
 
+def should_repair_data_acls() -> bool:
+    return os.getenv(DATA_ACL_REPAIR_ENV, "").strip().lower() in TRUE_ENV_VALUES
+
+
+def build_data_acl_signature(
+    owner_group_gid: int, acl_group_gids: List[int], admin_gid: Optional[int]
+) -> str:
+    payload = {
+        "version": DATA_ACL_SIGNATURE_VERSION,
+        "ownerGroupGid": owner_group_gid,
+        "aclGroupGids": sorted(group_acl_gids(owner_group_gid, acl_group_gids, admin_gid)),
+        "adminGid": admin_gid,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def update_data_acl_signature(
+    conn: sqlite3.Connection, object_guid: str, acl_signature: str
+) -> None:
+    conn.execute(
+        "UPDATE shares SET aclSignature = ? WHERE objectGUID = ?",
+        (acl_signature, object_guid),
+    )
+
+
 def sync_dynamic_directory_permissions(
     conn: sqlite3.Connection, ad_groups: List[Dict[str, object]]
 ) -> None:
@@ -1251,11 +1361,15 @@ def sync_dynamic_directory_permissions(
 
     ad_groups_by_guid = {str(group["objectGUID"]): group for group in ad_groups}
     nested_group_cache: Dict[str, Dict[str, Principal]] = {}
+    force_recursive_repair = should_repair_data_acls()
 
     rows = conn.execute(
-        "SELECT objectGUID, samAccountName, path FROM shares WHERE isActive = 1"
+        "SELECT objectGUID, samAccountName, path, aclSignature FROM shares WHERE isActive = 1"
     ).fetchall()
     log(f"Syncing permissions for {len(rows)} active data folder group(s)")
+    if force_recursive_repair:
+        log(f"Data ACL recursive repair is forced by {DATA_ACL_REPAIR_ENV}")
+
     for row in rows:
         share_started = time.monotonic()
         guid = row["objectGUID"]
@@ -1294,23 +1408,52 @@ def sync_dynamic_directory_permissions(
             workgroup, acl_group_names
         )
         gid_elapsed = time.monotonic() - gid_started
-        if unresolved_groups:
-            log(
-                f"Unable to resolve GID(s) for {sam}: "
-                f"{', '.join(unresolved_groups)}; leaving existing ACLs"
-            )
+        if unresolved_groups or not acl_group_gids:
+            missing = ", ".join(unresolved_groups) or sam
+            log(f"Unable to resolve GID(s) for {sam}: {missing}; leaving existing ACLs")
             continue
 
         owner_group_gid = acl_group_gids[0]
+        acl_signature = build_data_acl_signature(
+            owner_group_gid, acl_group_gids, admin_gid
+        )
+        stored_acl_signature = row["aclSignature"] or ""
+        if force_recursive_repair:
+            sync_mode = "forced-repair"
+        elif stored_acl_signature != acl_signature:
+            sync_mode = "changed-acl-repair"
+        else:
+            sync_mode = "root-only"
+
         os.makedirs(path, exist_ok=True)
         acl_started = time.monotonic()
-        dir_count, file_count = enforce_group_tree_permissions(
-            path, owner_group_gid, acl_group_gids, admin_gid
-        )
+        if sync_mode == "root-only":
+            dir_count = 1
+            file_count = 0
+            acl_ok = apply_group_permissions(
+                path, owner_group_gid, acl_group_gids, admin_gid, is_dir=True
+            )
+        else:
+            dir_count, file_count, acl_ok = enforce_group_tree_permissions(
+                path, owner_group_gid, acl_group_gids, admin_gid
+            )
+            if acl_ok:
+                update_data_acl_signature(conn, guid, acl_signature)
+            else:
+                log(
+                    f"ACL repair for {sam} did not complete; "
+                    "stored ACL signature left unchanged"
+                )
         acl_elapsed = time.monotonic() - acl_started
+
+        if sync_mode == "root-only" and not acl_ok:
+            log(f"Root ACL refresh for {sam} did not complete")
+
         total_elapsed = time.monotonic() - share_started
+        status = "ok" if acl_ok else "incomplete"
         log(
-            f"Synced {sam}: nested_groups={len(expansion.group_sams)}, "
+            f"Synced {sam}: mode={sync_mode}, status={status}, "
+            f"nested_groups={len(expansion.group_sams)}, "
             f"acl_groups={len(acl_group_gids)}, dirs={dir_count}, files={file_count}, "
             f"expand={format_duration(expand_elapsed)}, "
             f"gids={format_duration(gid_elapsed)}, "
@@ -1318,6 +1461,7 @@ def sync_dynamic_directory_permissions(
             f"total={format_duration(total_elapsed)}"
         )
 
+    conn.commit()
     os.makedirs(GROUP_ROOT, exist_ok=True)
     os.chown(GROUP_ROOT, 0, 0)
     run_command(["setfacl", "-b", GROUP_ROOT], check=False)
@@ -1340,6 +1484,14 @@ def with_lock() -> bool:
         os.makedirs(GROUP_ARCHIVE_ROOT, exist_ok=True)
 
         reconcile_started = time.monotonic()
+        log("Refreshing winbind cache")
+        phase_started = time.monotonic()
+        refresh_winbind_cache()
+        log(
+            f"Refreshed winbind cache in "
+            f"{format_duration(time.monotonic() - phase_started)}"
+        )
+
         conn = open_db()
         try:
             phase_started = time.monotonic()

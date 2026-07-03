@@ -169,6 +169,8 @@ Kerberos requires close time alignment.
 - Contains one folder per active `FS_*` AD group.
 - Root is discoverable as one share, while access to each group folder is enforced via POSIX/ACL group permissions.
 - `FS_*` groups may contain other AD groups; reconciliation recursively grants ACLs to nested groups and logs detected cycles.
+- Samba blocks SMB-side ACL edits on Data and forces new items to inherit the group folder owner, group, mode, and default ACLs.
+- Normal reconciliation refreshes each group folder root; recursive subtree repair runs only when the resolved ACL signature changes, is missing, or `REPAIR_DATA_ACLS=1` is set.
 - Dot-prefixed group folder names are allowed and are not hidden over SMB.
 - No guest access.
 
@@ -294,6 +296,17 @@ docker compose exec samba sh -lc 'tail -n 200 /var/log/backup.log'
   docker compose exec samba id 'EXAMPLE\alice'
   docker compose exec samba getfacl /data/groups/data/<groupName>
   ```
+
+### Data folder permissions are incorrect
+
+- Normal reconciliation avoids walking every file when the resolved ACL signature is unchanged.
+- Force a recursive repair for all active Data group folders with:
+
+  ```bash
+  docker compose exec samba sh -lc 'REPAIR_DATA_ACLS=1 python3 /app/reconcile_shares.py'
+  ```
+
+- After a successful repair, later cron runs return to root-only Data ACL refreshes unless group ACLs change again.
 
 ### `acl_xattr.so` or `full_audit.so` module load error
 

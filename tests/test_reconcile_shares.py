@@ -1,5 +1,9 @@
 import base64
+import os
+import sqlite3
+import tempfile
 import unittest
+from unittest import mock
 
 from app import reconcile_shares as rs
 
@@ -211,6 +215,209 @@ class AclResolutionTests(unittest.TestCase):
 
         self.assertEqual(gids, [1001, 1002])
         self.assertEqual(unresolved, ["Missing"])
+
+
+class DataAclSyncTests(unittest.TestCase):
+    def make_conn(self, share_path, acl_signature=""):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            CREATE TABLE shares (
+                objectGUID TEXT PRIMARY KEY,
+                samAccountName TEXT NOT NULL,
+                shareName TEXT NOT NULL,
+                path TEXT NOT NULL,
+                createdAt TIMESTAMP NOT NULL,
+                lastSeenAt TIMESTAMP NOT NULL,
+                isActive INTEGER NOT NULL,
+                aclSignature TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO shares (objectGUID, samAccountName, shareName, path, createdAt, lastSeenAt, isActive, aclSignature)
+            VALUES ('guid', 'FS_Data', 'Data', ?, 'now', 'now', 1, ?)
+            """,
+            (share_path, acl_signature),
+        )
+        conn.commit()
+        return conn
+
+    def ad_group(self):
+        return {
+            "objectGUID": "guid",
+            "samAccountName": "FS_Data",
+            "distinguishedName": ROOT_DN,
+            "memberDns": [],
+            "memberOfDns": [],
+            "objectClasses": {"group"},
+        }
+
+    def fetch_signature(self, conn):
+        row = conn.execute(
+            "SELECT aclSignature FROM shares WHERE objectGUID = 'guid'"
+        ).fetchone()
+        return row["aclSignature"]
+
+    def sync_patches(self, tempdir, env=None):
+        env_values = {"WORKGROUP": "EXAMPLE"}
+        if env:
+            env_values.update(env)
+        return (
+            mock.patch.dict(os.environ, env_values, clear=True),
+            mock.patch.object(rs, "GROUP_ROOT", os.path.join(tempdir, "root")),
+            mock.patch.object(
+                rs,
+                "expand_group_membership",
+                return_value=rs.MembershipExpansion(group_sams=["Nested"]),
+            ),
+            mock.patch.object(
+                rs,
+                "resolve_group_gids_for_acl",
+                return_value=([1001, 1002], []),
+            ),
+            mock.patch.object(rs.os, "chown"),
+            mock.patch.object(rs.os, "chmod"),
+            mock.patch.object(
+                rs,
+                "run_command",
+                return_value=rs.subprocess.CompletedProcess([], 0, "", ""),
+            ),
+        )
+
+    def test_data_acl_signature_is_stable_and_deduped(self):
+        self.assertEqual(
+            rs.build_data_acl_signature(20, [30, 20, 30], 10),
+            rs.build_data_acl_signature(20, [20, 30], 10),
+        )
+        self.assertNotEqual(
+            rs.build_data_acl_signature(20, [20, 30], 10),
+            rs.build_data_acl_signature(20, [20, 30], None),
+        )
+
+    def test_repair_env_truthy(self):
+        for value in ("1", "true", "YES", "on"):
+            with mock.patch.dict(os.environ, {rs.DATA_ACL_REPAIR_ENV: value}, clear=True):
+                self.assertTrue(rs.should_repair_data_acls())
+
+        with mock.patch.dict(os.environ, {rs.DATA_ACL_REPAIR_ENV: "0"}, clear=True):
+            self.assertFalse(rs.should_repair_data_acls())
+
+    def test_open_db_migrates_acl_signature_column(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            db_path = os.path.join(tempdir, "shares.db")
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE shares (
+                    objectGUID TEXT PRIMARY KEY,
+                    samAccountName TEXT NOT NULL,
+                    shareName TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    createdAt TIMESTAMP NOT NULL,
+                    lastSeenAt TIMESTAMP NOT NULL,
+                    isActive INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO shares (objectGUID, samAccountName, shareName, path, createdAt, lastSeenAt, isActive)
+                VALUES ('guid', 'FS_Data', 'Data', '/tmp/data', 'now', 'now', 1)
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            with mock.patch.object(rs, "DB_PATH", db_path):
+                migrated = rs.open_db()
+                try:
+                    columns = {
+                        row["name"]
+                        for row in migrated.execute("PRAGMA table_info(shares)")
+                    }
+                    row = migrated.execute(
+                        "SELECT aclSignature FROM shares WHERE objectGUID = 'guid'"
+                    ).fetchone()
+                finally:
+                    migrated.close()
+
+        self.assertIn("aclSignature", columns)
+        self.assertEqual(row["aclSignature"], "")
+
+    def test_sync_data_permissions_uses_root_only_when_signature_matches(self):
+        expected_signature = rs.build_data_acl_signature(1001, [1001, 1002], None)
+        with tempfile.TemporaryDirectory() as tempdir:
+            share_path = os.path.join(tempdir, "share")
+            os.makedirs(share_path)
+            conn = self.make_conn(share_path, expected_signature)
+            patches = self.sync_patches(tempdir)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], \
+                mock.patch.object(rs, "apply_group_permissions", return_value=True) as apply_root, \
+                mock.patch.object(rs, "enforce_group_tree_permissions") as enforce_tree:
+                rs.sync_dynamic_directory_permissions(conn, [self.ad_group()])
+
+            apply_root.assert_called_once_with(
+                share_path, 1001, [1001, 1002], None, is_dir=True
+            )
+            enforce_tree.assert_not_called()
+            self.assertEqual(self.fetch_signature(conn), expected_signature)
+            conn.close()
+
+    def test_sync_data_permissions_repairs_and_stores_signature_when_changed(self):
+        expected_signature = rs.build_data_acl_signature(1001, [1001, 1002], None)
+        with tempfile.TemporaryDirectory() as tempdir:
+            share_path = os.path.join(tempdir, "share")
+            os.makedirs(share_path)
+            conn = self.make_conn(share_path, "old")
+            patches = self.sync_patches(tempdir)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], \
+                mock.patch.object(rs, "apply_group_permissions") as apply_root, \
+                mock.patch.object(
+                    rs, "enforce_group_tree_permissions", return_value=(3, 4, True)
+                ) as enforce_tree:
+                rs.sync_dynamic_directory_permissions(conn, [self.ad_group()])
+
+            apply_root.assert_not_called()
+            enforce_tree.assert_called_once_with(share_path, 1001, [1001, 1002], None)
+            self.assertEqual(self.fetch_signature(conn), expected_signature)
+            conn.close()
+
+    def test_sync_data_permissions_keeps_old_signature_after_failed_repair(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            share_path = os.path.join(tempdir, "share")
+            os.makedirs(share_path)
+            conn = self.make_conn(share_path, "old")
+            patches = self.sync_patches(tempdir)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], \
+                mock.patch.object(
+                    rs, "enforce_group_tree_permissions", return_value=(3, 4, False)
+                ):
+                rs.sync_dynamic_directory_permissions(conn, [self.ad_group()])
+
+            self.assertEqual(self.fetch_signature(conn), "old")
+            conn.close()
+
+    def test_sync_data_permissions_force_repairs_when_signature_matches(self):
+        expected_signature = rs.build_data_acl_signature(1001, [1001, 1002], None)
+        with tempfile.TemporaryDirectory() as tempdir:
+            share_path = os.path.join(tempdir, "share")
+            os.makedirs(share_path)
+            conn = self.make_conn(share_path, expected_signature)
+            patches = self.sync_patches(tempdir, {rs.DATA_ACL_REPAIR_ENV: "1"})
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], \
+                mock.patch.object(rs, "apply_group_permissions") as apply_root, \
+                mock.patch.object(
+                    rs, "enforce_group_tree_permissions", return_value=(3, 4, True)
+                ) as enforce_tree:
+                rs.sync_dynamic_directory_permissions(conn, [self.ad_group()])
+
+            apply_root.assert_not_called()
+            enforce_tree.assert_called_once_with(share_path, 1001, [1001, 1002], None)
+            self.assertEqual(self.fetch_signature(conn), expected_signature)
+            conn.close()
 
 
 if __name__ == "__main__":
