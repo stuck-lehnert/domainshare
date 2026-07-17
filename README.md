@@ -202,8 +202,10 @@ Kerberos requires close time alignment.
   - `BACKUP_RETENTION_WEEKLY=2`
   - `BACKUP_RETENTION_DAILY=3`
 - The backup script writes directly to `BACKUP_LOG_FILE` (default: `/var/log/backup.log`). Cron does not redirect backup output into the logfile.
-- Upload progress is logged per file every `BACKUP_PROGRESS_INTERVAL_SECONDS` seconds and again when a file reaches 100%.
-- `BACKUP_PROGRESS=auto` shows an interactive progress bar only for TTY/manual runs. Use `always` to force it or `never` to suppress the bar. File progress is still logged.
+- Before uploading, the backup script measures all source files so it can report total upload progress.
+- Upload progress is logged per file every `BACKUP_PROGRESS_INTERVAL_SECONDS` seconds and again when a file reaches 100%, including percentage and transferred/remaining bytes with auto-scaled units.
+- `BACKUP_PROGRESS=auto` shows an interactive multi-line progress view only for TTY/manual runs. Current file uploads are shown as separate rows, capped at 12 rows, with the total progress row at the bottom. Use `always` to force it or `never` to suppress the bar. File and total progress are still logged.
+- Rclone-backed destinations cap concurrent file transfers at 12. Rsync remains single-streamed by rsync itself.
 - Retention logic:
   - daily: newest N snapshots
   - weekly: newest N snapshots created on week start (Monday)

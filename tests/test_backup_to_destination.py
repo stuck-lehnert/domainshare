@@ -61,31 +61,45 @@ class ProgressParsingTests(unittest.TestCase):
         self.assertEqual(splitter.feed("\x1b[2Kone\rtwo\n\nthree"), ["one", "two"])
         self.assertEqual(splitter.close(), ["three"])
 
-    def test_parse_rclone_file_progress(self):
+    def test_parse_rclone_file_progress_includes_bytes(self):
         progress = backup.parse_rclone_progress_record(
-            " * data/private/file.txt: 42.5% /10Mi, 2Mi/s, ETA 4s"
+            " * data/private/file.txt: 50% /10Mi, 2Mi/s, ETA 4s"
         )
 
         self.assertEqual(progress.file_path, "data/private/file.txt")
-        self.assertEqual(progress.percent, 42.5)
+        self.assertEqual(progress.percent, 50.0)
+        self.assertEqual(progress.transferred_bytes, 5 * 1024 * 1024)
+        self.assertEqual(progress.total_bytes, 10 * 1024 * 1024)
         self.assertEqual(progress.detail, "/10Mi, 2Mi/s, ETA 4s")
 
-    def test_parse_rsync_file_progress_uses_current_file(self):
+    def test_parse_rsync_file_progress_uses_current_file_and_bytes(self):
         progress = backup.parse_rsync_progress_record(
             "        1,024 50% 1.00MB/s 0:00:01", "dir/file.bin"
         )
 
         self.assertEqual(progress.file_path, "dir/file.bin")
         self.assertEqual(progress.percent, 50.0)
+        self.assertEqual(progress.transferred_bytes, 1024)
+        self.assertEqual(progress.total_bytes, 2048)
         self.assertEqual(progress.detail, "1.00MB/s 0:00:01")
+
+    def test_format_amounts_uses_auto_units(self):
+        self.assertEqual(backup.format_amounts(1536, 4096), "1.50 kB / 2.50 kB left")
+        self.assertEqual(
+            backup.format_amounts(5 * 1024**3, 8 * 1024**3),
+            "5.00 GB / 3.00 GB left",
+        )
 
     def test_reporter_throttles_progress_but_logs_final_event(self):
         clock = [0.0]
         logs = []
+        overall = backup.OverallProgress(100)
         reporter = backup.SyncProgressReporter(
             "rsync",
             "/src",
             "data/private",
+            source_total_bytes=100,
+            overall_progress=overall,
             interval_seconds=10,
             interactive=True,
             stream=io.StringIO(),
@@ -102,11 +116,74 @@ class ProgressParsingTests(unittest.TestCase):
         clock[0] = 11.0
         reporter.observe("       100 100% 1.00MB/s 0:00:00")
 
-        self.assertEqual(len(logs), 3)
-        self.assertIn("dir/file.bin 10%", logs[0][0])
-        self.assertIn("dir/file.bin 30%", logs[1][0])
-        self.assertIn("dir/file.bin 100%", logs[2][0])
-        self.assertEqual([console for _, console in logs], [False, False, False])
+        file_logs = [entry for entry in logs if entry[0].startswith("Upload progress ")]
+
+        self.assertEqual(len(file_logs), 3)
+        self.assertIn("dir/file.bin 10%", file_logs[0][0])
+        self.assertIn("10 B / 90 B left", file_logs[0][0])
+        self.assertIn("dir/file.bin 30%", file_logs[1][0])
+        self.assertIn("dir/file.bin 100%", file_logs[2][0])
+        self.assertTrue(any(entry[0].startswith("Total upload progress") for entry in logs))
+        self.assertTrue(all(console is False for _, console in logs))
+
+
+    def test_interactive_dashboard_renders_total_row_at_bottom(self):
+        stream = io.StringIO()
+        reporter = backup.SyncProgressReporter(
+            "rclone",
+            "/src",
+            "data/private",
+            source_total_bytes=2048,
+            overall_progress=backup.OverallProgress(2048),
+            interval_seconds=10,
+            interactive=True,
+            stream=stream,
+            now=lambda: 0.0,
+            log_func=lambda message, console=True: None,
+        )
+
+        reporter.observe(" * file-a.bin: 50% /1Ki, 1Ki/s, ETA 1s")
+
+        rendered = stream.getvalue()
+        self.assertLess(rendered.index("file-a.bin"), rendered.rindex("TOTAL"))
+
+    def test_visible_active_files_are_limited_to_twelve(self):
+        reporter = backup.SyncProgressReporter(
+            "rclone",
+            "/src",
+            "data/private",
+            source_total_bytes=20 * 1024,
+            overall_progress=backup.OverallProgress(20 * 1024),
+            interval_seconds=10,
+            interactive=False,
+            now=lambda: 100.0,
+            log_func=lambda message, console=True: None,
+        )
+        for index in range(20):
+            reporter._active_files[f"file-{index}"] = backup.FileProgress(
+                file_path=f"file-{index}",
+                percent=10,
+                transferred_bytes=10,
+                total_bytes=100,
+                detail="",
+            )
+            reporter._active_seen_at[f"file-{index}"] = 100.0 + float(index)
+
+        self.assertEqual(len(reporter._visible_active_files()), 12)
+
+    def test_measure_backup_payload_sums_regular_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = os.path.join(tmpdir, "nested")
+            os.mkdir(nested)
+            with open(os.path.join(tmpdir, "one.bin"), "wb") as handle:
+                handle.write(b"a" * 3)
+            with open(os.path.join(nested, "two.bin"), "wb") as handle:
+                handle.write(b"b" * 5)
+
+            sizes, total = backup.measure_backup_payload([(tmpdir, "data/private")])
+
+        self.assertEqual(sizes[tmpdir], 8)
+        self.assertEqual(total, 8)
 
 
 class BackendProgressCommandTests(unittest.TestCase):
@@ -119,6 +196,8 @@ class BackendProgressCommandTests(unittest.TestCase):
                     "20260101T000000Z",
                     "/src",
                     "data/private",
+                    source_total_bytes=1024,
+                    overall_progress=backup.OverallProgress(1024),
                     progress_interval_seconds=7,
                     interactive_progress=False,
                 )
@@ -127,12 +206,14 @@ class BackendProgressCommandTests(unittest.TestCase):
             self.assertIn("--progress", command)
             self.assertIn("--stats", command)
             self.assertIn("7s", command)
+            self.assertIn("--transfers", command)
+            self.assertIn(str(backup.MAX_PARALLEL_FILE_UPLOADS), command)
             self.assertIn("--log-level", command)
             self.assertIn("INFO", command)
             self.assertIn("--config", command)
             self.assertEqual(
-            run_streaming.call_args.kwargs["progress"].backend_name, "rclone"
-        )
+                run_streaming.call_args.kwargs["progress"].backend_name, "rclone"
+            )
         finally:
             backend.close()
 
@@ -145,6 +226,8 @@ class BackendProgressCommandTests(unittest.TestCase):
                 "20260101T000000Z",
                 "/src",
                 "data/private",
+                source_total_bytes=1024,
+                overall_progress=backup.OverallProgress(1024),
                 progress_interval_seconds=7,
                 interactive_progress=False,
             )

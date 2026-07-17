@@ -18,6 +18,7 @@ DEFAULT_BACKUP_LOG_FILE = "/var/log/backup.log"
 DEFAULT_PROGRESS_MODE = "auto"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 10
 PROGRESS_BAR_WIDTH = 28
+MAX_PARALLEL_FILE_UPLOADS = 12
 MAX_CAPTURED_OUTPUT_LINES = 50
 MAX_CAPTURED_OUTPUT_RECORD_LENGTH = 1000
 SNAPSHOT_NAME_RE = re.compile(r"^\d{8}T\d{6}Z$")
@@ -26,7 +27,8 @@ RCLONE_FILE_PROGRESS_RE = re.compile(
     r"^\s*\*\s+(?P<file>.+?):\s+(?P<percent>\d+(?:\.\d+)?)%\s*(?P<detail>.*)$"
 )
 RSYNC_FILE_PROGRESS_RE = re.compile(
-    r"^\s*[\d,.]+[A-Za-z]?\s+(?P<percent>\d+(?:\.\d+)?)%\s+(?P<detail>.+)$"
+    r"^\s*(?P<transferred>[\d,.]+(?:\s*[A-Za-z]+)?)\s+"
+    r"(?P<percent>\d+(?:\.\d+)?)%\s+(?P<detail>.+)$"
 )
 RSYNC_IGNORED_RECORD_PREFIXES = (
     "sending incremental file list",
@@ -91,7 +93,13 @@ class Snapshot:
 class FileProgress:
     file_path: str
     percent: float
+    transferred_bytes: int
+    total_bytes: int
     detail: str
+
+    @property
+    def remaining_bytes(self) -> int:
+        return max(0, self.total_bytes - self.transferred_bytes)
 
 
 class BackupLogger:
@@ -193,6 +201,7 @@ def should_show_progress_bar(mode: str, stream: TextIO = sys.stderr) -> bool:
 
 
 def format_percent(percent: float) -> str:
+    percent = clamp_percent(percent)
     if percent.is_integer():
         return str(int(percent))
     return f"{percent:.1f}".rstrip("0").rstrip(".")
@@ -200,6 +209,12 @@ def format_percent(percent: float) -> str:
 
 def clamp_percent(percent: float) -> float:
     return max(0.0, min(100.0, percent))
+
+
+def percent_for(transferred_bytes: int, total_bytes: int) -> float:
+    if total_bytes <= 0:
+        return 100.0
+    return clamp_percent((transferred_bytes / total_bytes) * 100.0)
 
 
 def shorten_middle(value: str, max_length: int) -> str:
@@ -212,6 +227,117 @@ def shorten_middle(value: str, max_length: int) -> str:
     return f"{value[:left]}...{value[-right:]}"
 
 
+def format_bytes(byte_count: int) -> str:
+    value = float(max(0, byte_count))
+    units = ["B", "kB", "MB", "GB", "TB", "PB"]
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if value < 1024.0 or candidate == units[-1]:
+            break
+        value /= 1024.0
+    if unit == "B":
+        return f"{int(value)} B"
+    if value >= 100.0:
+        return f"{value:.0f} {unit}"
+    if value >= 10.0:
+        return f"{value:.1f} {unit}"
+    return f"{value:.2f} {unit}"
+
+
+def format_amounts(transferred_bytes: int, total_bytes: int) -> str:
+    remaining_bytes = max(0, total_bytes - transferred_bytes)
+    return f"{format_bytes(transferred_bytes)} / {format_bytes(remaining_bytes)} left"
+
+
+def normalize_size_number(raw_value: str) -> float:
+    value = raw_value.strip()
+    if "," in value and "." not in value:
+        if re.match(r"^\d{1,3}(,\d{3})+$", value):
+            value = value.replace(",", "")
+        else:
+            value = value.replace(",", ".")
+    else:
+        value = value.replace(",", "")
+    return float(value)
+
+
+def parse_data_size(raw_value: str) -> Optional[int]:
+    match = re.search(
+        r"(?P<value>\d+(?:[,.]\d+)*)(?:\s*(?P<unit>[A-Za-z]+))?",
+        raw_value.strip().lstrip("/"),
+    )
+    if not match:
+        return None
+
+    unit = (match.group("unit") or "B").lower()
+    multipliers = {
+        "b": 1,
+        "byte": 1,
+        "bytes": 1,
+        "k": 1024,
+        "kb": 1024,
+        "kib": 1024,
+        "ki": 1024,
+        "kbyte": 1024,
+        "kbytes": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mib": 1024**2,
+        "mi": 1024**2,
+        "mbyte": 1024**2,
+        "mbytes": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gib": 1024**3,
+        "gi": 1024**3,
+        "gbyte": 1024**3,
+        "gbytes": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "tib": 1024**4,
+        "ti": 1024**4,
+        "p": 1024**5,
+        "pb": 1024**5,
+        "pib": 1024**5,
+        "pi": 1024**5,
+    }
+    multiplier = multipliers.get(unit)
+    if multiplier is None:
+        return None
+    return int(round(normalize_size_number(match.group("value")) * multiplier))
+
+
+def measure_path_bytes(path: str) -> int:
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError as exc:
+                        log(f"Skipping unreadable backup source entry {entry.path}: {exc}")
+        except OSError as exc:
+            log(f"Skipping unreadable backup source directory {current}: {exc}")
+    return total
+
+
+def measure_backup_payload(sources: List[Tuple[str, str]]) -> Tuple[Dict[str, int], int]:
+    source_sizes: Dict[str, int] = {}
+    total = 0
+    for source_path, _destination_path in sources:
+        size = measure_path_bytes(source_path)
+        source_sizes[source_path] = size
+        total += size
+    return source_sizes, total
+
+
 def clean_output_record(record: str) -> str:
     return ANSI_ESCAPE_RE.sub("", record).strip()
 
@@ -222,14 +348,27 @@ def truncate_output_record(record: str) -> str:
     return f"{record[:MAX_CAPTURED_OUTPUT_RECORD_LENGTH]}..."
 
 
+def parse_rclone_total_bytes(detail: str) -> int:
+    match = re.search(r"/\s*(?P<size>[\d,.]+\s*[A-Za-z]+)", detail)
+    if not match:
+        return 0
+    return parse_data_size(match.group("size")) or 0
+
+
 def parse_rclone_progress_record(record: str) -> Optional[FileProgress]:
     match = RCLONE_FILE_PROGRESS_RE.match(record)
     if not match:
         return None
+    percent = clamp_percent(float(match.group("percent")))
+    detail = match.group("detail").strip()
+    total_bytes = parse_rclone_total_bytes(detail)
+    transferred_bytes = int(round(total_bytes * (percent / 100.0)))
     return FileProgress(
         file_path=match.group("file").strip(),
-        percent=clamp_percent(float(match.group("percent"))),
-        detail=match.group("detail").strip(),
+        percent=percent,
+        transferred_bytes=transferred_bytes,
+        total_bytes=total_bytes,
+        detail=detail,
     )
 
 
@@ -250,16 +389,26 @@ def rsync_file_candidate(record: str) -> Optional[str]:
 
 
 def parse_rsync_progress_record(
-    record: str, current_file: Optional[str]
+    record: str, current_file: Optional[str], known_total_bytes: Optional[int] = None
 ) -> Optional[FileProgress]:
     if not current_file:
         return None
     match = RSYNC_FILE_PROGRESS_RE.match(record)
     if not match:
         return None
+    percent = clamp_percent(float(match.group("percent")))
+    transferred_bytes = parse_data_size(match.group("transferred")) or 0
+    if known_total_bytes is not None and known_total_bytes > 0:
+        total_bytes = known_total_bytes
+    elif percent > 0:
+        total_bytes = int(round(transferred_bytes * 100.0 / percent))
+    else:
+        total_bytes = transferred_bytes
     return FileProgress(
         file_path=current_file,
-        percent=clamp_percent(float(match.group("percent"))),
+        percent=percent,
+        transferred_bytes=min(transferred_bytes, total_bytes),
+        total_bytes=total_bytes,
         detail=match.group("detail").strip(),
     )
 
@@ -288,6 +437,41 @@ class OutputRecordSplitter:
         return [record]
 
 
+class OverallProgress:
+    def __init__(self, total_bytes: int):
+        self.total_bytes = max(0, total_bytes)
+        self.completed_source_bytes = 0
+        self.current_source_bytes = 0
+        self.current_source_total_bytes = 0
+
+    def begin_source(self, source_total_bytes: int) -> None:
+        self.current_source_bytes = 0
+        self.current_source_total_bytes = max(0, source_total_bytes)
+
+    def update_current_source(self, transferred_bytes: int) -> None:
+        capped = min(max(0, transferred_bytes), self.current_source_total_bytes)
+        self.current_source_bytes = max(self.current_source_bytes, capped)
+
+    def complete_source(self) -> None:
+        self.completed_source_bytes = min(
+            self.total_bytes,
+            self.completed_source_bytes + self.current_source_total_bytes,
+        )
+        self.current_source_bytes = 0
+        self.current_source_total_bytes = 0
+
+    @property
+    def transferred_bytes(self) -> int:
+        return min(
+            self.total_bytes,
+            self.completed_source_bytes + self.current_source_bytes,
+        )
+
+    @property
+    def percent(self) -> float:
+        return percent_for(self.transferred_bytes, self.total_bytes)
+
+
 class SyncProgressReporter:
     def __init__(
         self,
@@ -295,6 +479,8 @@ class SyncProgressReporter:
         source_path: str,
         destination_path: str,
         *,
+        source_total_bytes: int,
+        overall_progress: OverallProgress,
         interval_seconds: int,
         interactive: bool,
         stream: TextIO = sys.stderr,
@@ -304,22 +490,37 @@ class SyncProgressReporter:
         self.backend_name = backend_name
         self.source_path = source_path
         self.destination_path = destination_path
+        self.source_total_bytes = max(0, source_total_bytes)
+        self.overall_progress = overall_progress
         self.interval_seconds = interval_seconds
         self.interactive = interactive
         self.stream = stream
         self.now = now
         self.log_func = log_func
         self.current_rsync_file: Optional[str] = None
+        self._completed_file_bytes = 0
+        self._completed_files: Set[str] = set()
+        self._active_files: Dict[str, FileProgress] = {}
+        self._active_seen_at: Dict[str, float] = {}
         self._last_log_at: Dict[str, float] = {}
         self._last_logged_percent: Dict[str, float] = {}
-        self._last_bar_length = 0
+        self._last_total_log_at: Optional[float] = None
+        self._last_logged_total_percent: Optional[float] = None
+        self._rendered_lines = 0
+        self.overall_progress.begin_source(self.source_total_bytes)
 
     def observe(self, record: str) -> None:
         progress: Optional[FileProgress]
         if self.backend_name == "rclone":
             progress = parse_rclone_progress_record(record)
+            if progress is not None:
+                progress = self._with_known_file_size(progress)
         else:
-            progress = parse_rsync_progress_record(record, self.current_rsync_file)
+            progress = parse_rsync_progress_record(
+                record,
+                self.current_rsync_file,
+                self._known_file_size(self.current_rsync_file),
+            )
             if progress is None:
                 candidate = rsync_file_candidate(record)
                 if candidate is not None:
@@ -328,18 +529,96 @@ class SyncProgressReporter:
 
         if progress is None:
             return
-        self._render_bar(progress)
-        self._log_progress(progress)
 
-    def finish(self) -> None:
-        if not self.interactive or self._last_bar_length == 0:
-            return
-        self.stream.write("\r" + (" " * self._last_bar_length) + "\r")
-        self.stream.flush()
-        self._last_bar_length = 0
-
-    def _log_progress(self, progress: FileProgress) -> None:
         now = self.now()
+        self._active_files[progress.file_path] = progress
+        self._active_seen_at[progress.file_path] = now
+        self._sync_total_progress()
+        self._render_dashboard()
+        self._log_progress(progress, now)
+        self._log_total_progress(now)
+
+        if progress.percent >= 100.0:
+            self._complete_file(progress)
+            self._sync_total_progress()
+
+    def finish(self, *, success: bool) -> None:
+        if success:
+            self.overall_progress.complete_source()
+            self._render_dashboard()
+            self._log_total_progress(self.now(), force=True)
+        self._clear_dashboard()
+
+    def _known_file_size(self, file_path: Optional[str]) -> Optional[int]:
+        if not file_path:
+            return None
+        candidates = []
+        if os.path.isabs(file_path):
+            candidates.append(file_path)
+        relative_path = file_path.lstrip("/")
+        candidates.append(os.path.join(self.source_path, relative_path))
+        source_name = os.path.basename(self.source_path.rstrip("/"))
+        prefix = f"{source_name}/"
+        if relative_path.startswith(prefix):
+            candidates.append(os.path.join(self.source_path, relative_path[len(prefix) :]))
+
+        for candidate in candidates:
+            try:
+                return os.stat(candidate).st_size
+            except OSError:
+                continue
+        return None
+
+    def _with_known_file_size(self, progress: FileProgress) -> FileProgress:
+        if progress.total_bytes > 0:
+            return progress
+        total_bytes = self._known_file_size(progress.file_path)
+        if not total_bytes:
+            return progress
+        return FileProgress(
+            file_path=progress.file_path,
+            percent=progress.percent,
+            transferred_bytes=int(round(total_bytes * (progress.percent / 100.0))),
+            total_bytes=total_bytes,
+            detail=progress.detail,
+        )
+
+    def _complete_file(self, progress: FileProgress) -> None:
+        if progress.file_path in self._completed_files:
+            self._active_files.pop(progress.file_path, None)
+            self._active_seen_at.pop(progress.file_path, None)
+            return
+        self._completed_files.add(progress.file_path)
+        self._completed_file_bytes += progress.total_bytes or progress.transferred_bytes
+        self._completed_file_bytes = min(
+            self._completed_file_bytes,
+            self.source_total_bytes,
+        )
+        self._active_files.pop(progress.file_path, None)
+        self._active_seen_at.pop(progress.file_path, None)
+
+    def _source_transferred_bytes(self) -> int:
+        active_bytes = sum(entry.transferred_bytes for entry in self._active_files.values())
+        return min(self.source_total_bytes, self._completed_file_bytes + active_bytes)
+
+    def _sync_total_progress(self) -> None:
+        self.overall_progress.update_current_source(self._source_transferred_bytes())
+
+    def _visible_active_files(self) -> List[FileProgress]:
+        now = self.now()
+        stale_after = max(2, self.interval_seconds * 2)
+        candidates = [
+            entry
+            for path, entry in self._active_files.items()
+            if now - self._active_seen_at.get(path, now) <= stale_after
+        ]
+        candidates.sort(
+            key=lambda entry: self._active_seen_at.get(entry.file_path, 0.0),
+            reverse=True,
+        )
+        return candidates[:MAX_PARALLEL_FILE_UPLOADS]
+
+    def _log_progress(self, progress: FileProgress, now: float) -> None:
         key = progress.file_path
         last_log_at = self._last_log_at.get(key)
         last_logged_percent = self._last_logged_percent.get(key)
@@ -355,30 +634,95 @@ class SyncProgressReporter:
         self.log_func(
             "Upload progress "
             f"{self.source_path} -> {self.destination_path}: "
-            f"{progress.file_path} {format_percent(progress.percent)}%{detail}",
+            f"{progress.file_path} {format_percent(progress.percent)}% "
+            f"({format_amounts(progress.transferred_bytes, progress.total_bytes)})"
+            f"{detail}",
             console=not self.interactive,
         )
         self._last_log_at[key] = now
         self._last_logged_percent[key] = progress.percent
 
-    def _render_bar(self, progress: FileProgress) -> None:
+    def _log_total_progress(self, now: float, *, force: bool = False) -> None:
+        percent = self.overall_progress.percent
+        is_final = percent >= 100.0
+        if (
+            not force
+            and self._last_total_log_at is not None
+            and now - self._last_total_log_at < self.interval_seconds
+            and not (is_final and self._last_logged_total_percent != 100.0)
+        ):
+            return
+
+        self.log_func(
+            "Total upload progress: "
+            f"{format_percent(percent)}% "
+            f"({format_amounts(self.overall_progress.transferred_bytes, self.overall_progress.total_bytes)})",
+            console=not self.interactive,
+        )
+        self._last_total_log_at = now
+        self._last_logged_total_percent = percent
+
+    def _progress_line(self, label: str, percent: float, transferred: int, total: int) -> str:
+        filled = int(PROGRESS_BAR_WIDTH * (clamp_percent(percent) / 100.0))
+        bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+        return (
+            f"[backup] {shorten_middle(label, 44):44} "
+            f"[{bar}] {format_percent(percent):>5}% "
+            f"{format_amounts(transferred, total)}"
+        )
+
+    def _render_dashboard(self) -> None:
         if not self.interactive:
             return
-        filled = int(PROGRESS_BAR_WIDTH * (progress.percent / 100.0))
-        bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
-        file_path = shorten_middle(progress.file_path, 44)
-        source_path = shorten_middle(self.source_path, 24)
-        line = (
-            f"[backup] {source_path}: {file_path} "
-            f"[{bar}] {format_percent(progress.percent)}%"
+        lines = []
+        for progress in self._visible_active_files():
+            lines.append(
+                self._progress_line(
+                    progress.file_path,
+                    progress.percent,
+                    progress.transferred_bytes,
+                    progress.total_bytes,
+                )
+            )
+        lines.append(
+            self._progress_line(
+                "TOTAL",
+                self.overall_progress.percent,
+                self.overall_progress.transferred_bytes,
+                self.overall_progress.total_bytes,
+            )
         )
-        if len(line) >= self._last_bar_length:
-            padding = ""
-        else:
-            padding = " " * (self._last_bar_length - len(line))
-        self.stream.write(f"\r{line}{padding}")
+        self._render_lines(lines)
+
+    def _render_lines(self, lines: List[str]) -> None:
+        rendered_lines = max(self._rendered_lines, len(lines))
+        if self._rendered_lines > 1:
+            self.stream.write(f"\x1b[{self._rendered_lines - 1}F")
+        elif self._rendered_lines == 1:
+            self.stream.write("\r")
+        for index in range(rendered_lines):
+            self.stream.write("\r\x1b[2K")
+            if index < len(lines):
+                self.stream.write(lines[index])
+            if index < rendered_lines - 1:
+                self.stream.write("\n")
         self.stream.flush()
-        self._last_bar_length = len(line)
+        self._rendered_lines = rendered_lines
+
+    def _clear_dashboard(self) -> None:
+        if not self.interactive or self._rendered_lines == 0:
+            return
+        if self._rendered_lines > 1:
+            self.stream.write(f"\x1b[{self._rendered_lines - 1}F")
+        else:
+            self.stream.write("\r")
+        for index in range(self._rendered_lines):
+            self.stream.write("\r\x1b[2K")
+            if index < self._rendered_lines - 1:
+                self.stream.write("\n")
+        self.stream.write("\r")
+        self.stream.flush()
+        self._rendered_lines = 0
 
 
 def run_streaming_command(
@@ -397,6 +741,7 @@ def run_streaming_command(
     )
     splitter = OutputRecordSplitter()
     captured_records: List[str] = []
+    returncode: Optional[int] = None
 
     try:
         if process.stdout is not None:
@@ -418,13 +763,14 @@ def run_streaming_command(
 
         returncode = process.wait()
     finally:
-        progress.finish()
+        progress.finish(success=returncode == 0)
 
     stdout = "\n".join(captured_records)
     if returncode != 0:
         output = stdout.strip() or f"exit code {returncode}"
         raise RuntimeError(f"Command failed ({command[0]}): {output}")
     return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr="")
+
 
 def parse_destination(raw_url: str) -> Destination:
     parts = urlsplit(raw_url)
@@ -739,6 +1085,8 @@ class RcloneBackend:
         source_path: str,
         destination_path: str,
         *,
+        source_total_bytes: int,
+        overall_progress: OverallProgress,
         progress_interval_seconds: int,
         interactive_progress: bool,
     ) -> None:
@@ -747,6 +1095,8 @@ class RcloneBackend:
             "rclone",
             source_path,
             destination_path,
+            source_total_bytes=source_total_bytes,
+            overall_progress=overall_progress,
             interval_seconds=progress_interval_seconds,
             interactive=interactive_progress,
         )
@@ -760,6 +1110,8 @@ class RcloneBackend:
                 "--progress",
                 "--stats",
                 f"{progress_interval_seconds}s",
+                "--transfers",
+                str(MAX_PARALLEL_FILE_UPLOADS),
                 "--log-level",
                 "INFO",
                 "--config",
@@ -856,6 +1208,8 @@ class RsyncBackend:
         source_path: str,
         destination_path: str,
         *,
+        source_total_bytes: int,
+        overall_progress: OverallProgress,
         progress_interval_seconds: int,
         interactive_progress: bool,
     ) -> None:
@@ -866,6 +1220,8 @@ class RsyncBackend:
             "rsync",
             source_path,
             destination_path,
+            source_total_bytes=source_total_bytes,
+            overall_progress=overall_progress,
             interval_seconds=progress_interval_seconds,
             interactive=interactive_progress,
         )
@@ -1018,12 +1374,19 @@ def run_backup() -> int:
         snapshot_name = choose_snapshot_name(existing)
         log(f"Creating snapshot {snapshot_name}")
 
+        log("Measuring backup payload size")
+        source_sizes, total_bytes = measure_backup_payload(sources)
+        log(f"Backup payload size: {format_bytes(total_bytes)}")
+        overall_progress = OverallProgress(total_bytes)
+
         for source_path, destination_path in sources:
             log(f"Syncing {source_path}")
             backend.sync_source(
                 snapshot_name,
                 source_path,
                 destination_path,
+                source_total_bytes=source_sizes[source_path],
+                overall_progress=overall_progress,
                 progress_interval_seconds=progress_interval_seconds,
                 interactive_progress=interactive_progress,
             )
