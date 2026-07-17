@@ -121,6 +121,9 @@ Kerberos requires close time alignment.
    - optional `BACKUP_RETENTION_WEEKLY` (default `2`)
    - optional `BACKUP_RETENTION_MONTHLY` (default `2`)
    - optional `BACKUP_RETENTION_YEARLY` (default `1`)
+   - optional `BACKUP_LOG_FILE` (default `/var/log/backup.log`)
+   - optional `BACKUP_PROGRESS` (`auto`, `always`, or `never`; default `auto`)
+   - optional `BACKUP_PROGRESS_INTERVAL_SECONDS` (default `10`)
 
    Optional:
    - `SAMBA_HOSTNAME` (defaults to `adsambafsrv`)
@@ -198,6 +201,9 @@ Kerberos requires close time alignment.
   - `BACKUP_RETENTION_MONTHLY=2`
   - `BACKUP_RETENTION_WEEKLY=2`
   - `BACKUP_RETENTION_DAILY=3`
+- The backup script writes directly to `BACKUP_LOG_FILE` (default: `/var/log/backup.log`). Cron does not redirect backup output into the logfile.
+- Upload progress is logged per file every `BACKUP_PROGRESS_INTERVAL_SECONDS` seconds and again when a file reaches 100%.
+- `BACKUP_PROGRESS=auto` shows an interactive progress bar only for TTY/manual runs. Use `always` to force it or `never` to suppress the bar. File progress is still logged.
 - Retention logic:
   - daily: newest N snapshots
   - weekly: newest N snapshots created on week start (Monday)
@@ -220,6 +226,9 @@ Kerberos requires close time alignment.
   BACKUP_RETENTION_WEEKLY=2
   BACKUP_RETENTION_MONTHLY=2
   BACKUP_RETENTION_YEARLY=1
+  BACKUP_LOG_FILE=/var/log/backup.log
+  BACKUP_PROGRESS=auto
+  BACKUP_PROGRESS_INTERVAL_SECONDS=10
   ```
 
 ## Useful Commands

@@ -214,6 +214,15 @@ write_runtime_env_file() {
     if [[ -n "${BACKUP_RETENTION_YEARLY:-}" ]]; then
       printf 'export BACKUP_RETENTION_YEARLY=%q\n' "$BACKUP_RETENTION_YEARLY"
     fi
+    if [[ -n "${BACKUP_LOG_FILE:-}" ]]; then
+      printf 'export BACKUP_LOG_FILE=%q\n' "$BACKUP_LOG_FILE"
+    fi
+    if [[ -n "${BACKUP_PROGRESS:-}" ]]; then
+      printf 'export BACKUP_PROGRESS=%q\n' "$BACKUP_PROGRESS"
+    fi
+    if [[ -n "${BACKUP_PROGRESS_INTERVAL_SECONDS:-}" ]]; then
+      printf 'export BACKUP_PROGRESS_INTERVAL_SECONDS=%q\n' "$BACKUP_PROGRESS_INTERVAL_SECONDS"
+    fi
     if [[ -n "${JOIN_USER:-}" ]]; then
       printf 'export JOIN_USER=%q\n' "$JOIN_USER"
     fi
@@ -288,7 +297,7 @@ EOF
 
   if [[ -n "${BACKUP_DESTINATION:-}" ]]; then
     cat >> /etc/cron.d/reconcile-shares <<EOF
-0 ${BACKUP_START_HOUR} * * * root source /app/runtime.env && /usr/bin/python3 /app/backup_to_destination.py >> /var/log/backup.log 2>&1
+0 ${BACKUP_START_HOUR} * * * root source /app/runtime.env && /usr/bin/python3 /app/backup_to_destination.py
 EOF
   fi
 
