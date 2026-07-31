@@ -30,6 +30,11 @@ try:
 except ImportError:  # Container execution uses /app as the import root.
     import reconcile_shares as directory
 
+try:
+    from app.audit_policy import AUDIT_ACTIONS, action_for, skip_user
+except ImportError:  # Container execution uses /app as the import root.
+    from audit_policy import AUDIT_ACTIONS, action_for, skip_user
+
 
 STATE_ROOT = os.getenv("WEB_STATE_DIR", "/state/web")
 AUDIT_ROOT = os.getenv("AUDIT_ARCHIVE_DIR", "/state/audit")
@@ -87,7 +92,10 @@ def base64url(value: bytes) -> str:
 
 
 def base64url_decode(value: str) -> bytes:
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    if not hmac.compare_digest(base64url(decoded), value):
+        raise ValueError("non-canonical base64url")
+    return decoded
 
 
 class TokenManager:
@@ -589,10 +597,20 @@ def query_audit(params: Dict[str, List[str]]) -> Dict[str, object]:
             if not os.path.isfile(path):
                 continue
             for event in iter_audit_file_reverse(path):
-                facets["users"].add(str(event.get("user", "")))
+                user = str(event.get("user", ""))
+                operation = str(event.get("operation", ""))
+                action = action_for(operation)
+                if action is None and not operation:
+                    stored_action = str(event.get("action", "")).casefold()
+                    action = stored_action if stored_action in AUDIT_ACTIONS else None
+                if action is None or skip_user(user):
+                    continue
+                if event.get("action") != action:
+                    event = {**event, "action": action}
+                facets["users"].add(user)
                 facets["shares"].add(str(event.get("share", "")))
-                facets["operations"].add(str(event.get("operation", "")))
-                facets["actions"].add(str(event.get("action", "")))
+                facets["operations"].add(operation)
+                facets["actions"].add(action)
                 failed_filter = filters["result"] == "fail"
                 if failed_filter and bool(event.get("success", False)):
                     continue

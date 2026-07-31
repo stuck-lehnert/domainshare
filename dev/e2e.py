@@ -262,16 +262,42 @@ def main() -> int:
     check(int(users.get("alice", {}).get("fslogixBytes", 0)) > 0, "Alice FSLogix usage missing")
     check(int(storage_payload.get("totals", {}).get("dataBytes", 0)) > 0, "Data total is empty")
 
-    announce("live Samba audit ingestion, filters, facets, and pagination")
+    announce("high-level Samba audit ingestion, suffix exclusions, filters, facets, and pagination")
+    required_actions = {"read", "write", "move", "delete"}
     activity = eventually(
-        "live alice audit records",
-        lambda: http(query_path("/api/activity", {"user": "alice", "limit": "5"}), token=token),
-        lambda response: response.status == 200 and response.json().get("matched", 0) >= 2,
+        "all four live alice audit actions",
+        lambda: http(query_path("/api/activity", {"user": "alice", "limit": "100"}), token=token),
+        lambda response: (
+            response.status == 200
+            and required_actions.issubset(
+                {event.get("action") for event in response.json().get("events", [])}
+            )
+        ),
         timeout=60,
     )
     activity_payload = activity.json()
+    alice_actions = {event.get("action") for event in activity_payload["events"]}
     check(all("alice" in str(event.get("user", "")).casefold() for event in activity_payload["events"]), "activity user filter leaked unrelated events")
+    check(alice_actions == required_actions, f"unexpected alice audit actions: {sorted(alice_actions)}")
+    check(set(activity_payload.get("facets", {}).get("actions", [])) <= required_actions, "low-level activity category leaked into facets")
     check("Data" in activity_payload.get("facets", {}).get("shares", []), "activity share facets missing Data")
+
+    moved = http(query_path("/api/activity", {"user": "alice", "action": "move", "limit": "100"}), token=token).json()
+    check(moved.get("matched", 0) >= 1, "move action filter returned no event")
+    check(all(event.get("action") == "move" for event in moved.get("events", [])), "move action filter leaked another action")
+
+    eventually(
+        "raw service-account SMB audit source",
+        lambda: engine_run(
+            "exec", FILES_CONTAINER, "grep", "-R", "report_svc", "/var/log/samba",
+            check_result=False,
+        ).returncode,
+        lambda returncode: returncode == 0,
+        timeout=30,
+    )
+    service_activity = http(query_path("/api/activity", {"user": "report_svc", "limit": "100"}), token=token).json()
+    check(service_activity.get("matched") == 0, "_svc account was persisted in the activity archive")
+
     one_event = http(query_path("/api/activity", {"limit": "1"}), token=token).json()
     check(len(one_event.get("events", [])) == 1, "activity limit was ignored")
     check(one_event.get("nextCursor") is not None, "activity pagination cursor missing")

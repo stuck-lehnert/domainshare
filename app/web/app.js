@@ -24,7 +24,7 @@ const utcTime = value => {
   const pad = number => String(number).padStart(2, "0");
   return `${pad(date.getUTCDate())}.${pad(date.getUTCMonth() + 1)}.${date.getUTCFullYear()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())} UTC`;
 };
-const actionLabel = value => ({read: "Lesen", write: "Schreiben", list: "Auflisten", metadata: "Metadaten", session: "Sitzung"}[value] || value || "—");
+const actionLabel = value => ({read: "Lesen", write: "Schreiben", move: "Umbenennen/Verschieben", delete: "Löschen"}[value] || value || "—");
 const nodeTypeLabel = value => ({group: "Gruppe", user: "Benutzer", computer: "Computer", unknown: "Unbekannt"}[value] || value);
 const backupStateLabel = value => ({starting: "Startet", running: "Läuft", completed: "Abgeschlossen", failed: "Fehlgeschlagen", waiting: "Wartet", disabled: "Deaktiviert"}[value] || value || "Unbekannt");
 function backupMessage(data) {
@@ -127,7 +127,7 @@ function eventRows(events) {
   return events.map(event => `<tr>
     <td class="timestamp">${esc(utcTime(event.timestamp))}</td>
     <td>${esc(event.user)}</td><td>${esc(event.clientIp)}</td><td>${esc(event.share)}</td>
-    <td>${badge(actionLabel(event.action || event.operation))}<br><span class="muted">${esc(event.operation)}</span></td>
+    <td>${badge(actionLabel(event.action || event.operation))}</td>
     <td class="path">${esc(event.path || "—")}</td>
     <td>${event.success ? badge("Erfolgreich") : badge(event.result || "Fehlgeschlagen", "error")}</td>
   </tr>`).join("");
@@ -230,20 +230,19 @@ async function renderStorage(type) {
 async function renderActivity() {
   const today = new Date();
   const yesterday = new Date(Date.now() - 86400000);
-  content.innerHTML = pageHead("Aktivitätsprotokoll", "Aufgezeichnete Samba-Vorgänge nach Datum, Identität, Freigabe, Aktion, Ergebnis oder Pfad durchsuchen.") + `
+  content.innerHTML = pageHead("Aktivitätsprotokoll", "Lese-, Schreib-, Umbenennungs-/Verschiebe- und Löschvorgänge nach Datum, Identität, Freigabe, Ergebnis oder Pfad durchsuchen.") + `
     <section class="panel">
       <form id="activity-filter" class="filters">
         <label>Von (UTC)<input name="from" type="date" value="${isoDay(yesterday)}" required></label>
         <label>Bis (UTC)<input name="to" type="date" value="${isoDay(today)}" required></label>
         <label>Benutzer<input name="user" list="users-list" placeholder="Alle Benutzer"></label>
         <label>Freigabe<input name="share" list="shares-list" placeholder="Alle Freigaben"></label>
-        <label>Aktion<select name="action"><option value="">Alle Aktionen</option><option value="read">Lesen</option><option value="write">Schreiben</option><option value="list">Auflisten</option><option value="metadata">Metadaten</option><option value="session">Sitzung</option></select></label>
+        <label>Aktion<select name="action"><option value="">Alle Aktionen</option><option value="read">Lesen</option><option value="write">Schreiben</option><option value="move">Umbenennen/Verschieben</option><option value="delete">Löschen</option></select></label>
         <label>Ergebnis<select name="result"><option value="">Alle Ergebnisse</option><option value="OK">Erfolgreich</option><option value="fail">Fehlgeschlagen</option></select></label>
-        <label>Operation<input name="operation" list="operations-list" placeholder="z. B. pread"></label>
         <label class="wide">Pfad enthält<input name="path" placeholder="Ordner oder Dateiname"></label>
         <button type="submit">Filter anwenden</button>
       </form>
-      <datalist id="users-list"></datalist><datalist id="shares-list"></datalist><datalist id="operations-list"></datalist>
+      <datalist id="users-list"></datalist><datalist id="shares-list"></datalist>
       <p id="activity-summary" class="muted"></p>
       <div class="table-wrap"><table><thead><tr><th>Zeit (UTC)</th><th>Benutzer</th><th>Client</th><th>Freigabe</th><th>Aktion</th><th>Pfad</th><th>Ergebnis</th></tr></thead><tbody id="activity-rows"></tbody></table></div>
       <p><button id="load-more" hidden>Weitere laden</button></p>
@@ -262,7 +261,7 @@ async function renderActivity() {
     const more = document.querySelector("#load-more");
     cursor = result.nextCursor || 0;
     more.hidden = !result.nextCursor;
-    for (const [id, values] of [["users-list", result.facets.users], ["shares-list", result.facets.shares], ["operations-list", result.facets.operations]]) {
+    for (const [id, values] of [["users-list", result.facets.users], ["shares-list", result.facets.shares]]) {
       document.querySelector(`#${id}`).innerHTML = values.filter(Boolean).map(value => `<option value="${esc(value)}">`).join("");
     }
   };

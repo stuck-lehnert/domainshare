@@ -12,6 +12,11 @@ import sys
 import time
 from typing import Dict, Iterable, Optional
 
+try:
+    from .audit_policy import action_for, skip_user
+except ImportError:
+    from audit_policy import action_for, skip_user
+
 
 SAMBA_LOG_GLOB = os.getenv("AUDIT_SOURCE_GLOB", "/var/log/samba/log.*")
 ARCHIVE_DIR = os.getenv("AUDIT_ARCHIVE_DIR", "/state/audit")
@@ -69,28 +74,6 @@ def parse_samba_timestamp(raw_line: str, fallback: dt.datetime) -> str:
         return fallback.isoformat(timespec="milliseconds")
 
 
-def action_for(operation: str) -> str:
-    operation = operation.lower()
-    if operation in {
-        "read", "pread", "pread_recv", "pread_send", "recvfile", "sendfile",
-        "offload_read_recv", "offload_read_send",
-    }:
-        return "read"
-    if operation in {
-        "write", "pwrite", "pwrite_recv", "pwrite_send", "ftruncate",
-        "fallocate", "create_file", "mkdirat", "mknodat", "renameat",
-        "unlinkat", "symlinkat", "linkat", "offload_write_recv",
-        "offload_write_send", "fsetxattr", "removexattr", "fremovexattr",
-        "mkdir", "rmdir", "rename", "unlink",
-    }:
-        return "write"
-    if operation in {"opendir", "fdopendir", "readdir", "freaddir_attr", "closedir"}:
-        return "list"
-    if operation in {"connect", "disconnect"}:
-        return "session"
-    return "metadata"
-
-
 def parse_audit_line(raw_line: str, source: str) -> Optional[Dict[str, object]]:
     match = AUDIT_MARKER_RE.search(raw_line)
     if match:
@@ -104,16 +87,20 @@ def parse_audit_line(raw_line: str, source: str) -> Optional[Dict[str, object]]:
         return None
     observed_at = utc_now()
     operation = fields[5].strip()
+    action = action_for(operation)
+    user = fields[1].strip()
+    if action is None or skip_user(user):
+        return None
     result = fields[6].strip()
     return {
         "timestamp": parse_samba_timestamp(raw_line, observed_at),
         "ingestedAt": observed_at.isoformat(timespec="milliseconds"),
-        "user": fields[1].strip(),
+        "user": user,
         "clientIp": fields[2].strip(),
         "client": fields[3].strip(),
         "share": fields[4].strip(),
         "operation": operation,
-        "action": action_for(operation),
+        "action": action,
         "result": result,
         "success": result.upper() == "OK",
         "path": "|".join(fields[7:]).strip(),

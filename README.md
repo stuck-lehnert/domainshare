@@ -22,8 +22,8 @@ This repository provides a production-oriented Samba file server container that 
 - Setup prompts for well-known authorization groups by SID (`DOMAIN_USERS_SID`, `DOMAIN_ADMINS_SID`) to avoid localized group names.
 - `FSLOGIX_GROUP_SID` controls who can access the default FSLogix share (defaults to `DOMAIN_USERS_SID`).
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
-- Share operations are audited with Samba `full_audit` (connect, list, read, write, create, delete, rename).
-- A collector persists every `full_audit` record in daily NDJSON files under `/state/audit`; closed files are gzip-compressed and are never automatically deleted.
+- Samba `full_audit` is restricted to successful and failed reads, writes, renames/moves, and deletions.
+- A collector normalizes those four actions and persists them in daily NDJSON files under `/state/audit`; closed files are gzip-compressed and are never automatically deleted.
 - A read-only HTTPS web console provides group membership trees, storage usage, searchable activity, live backup progress, and system health.
 - Web sign-in validates the submitted username/password with Kerberos, permits only users whose winbind group SID set contains `DOMAIN_ADMINS_SID`, and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
 - HTTPS certificates are requested from a configured local Smallstep CA and renewed automatically. Pre-issued certificate files are also supported.
@@ -121,7 +121,7 @@ The launcher builds the current application and starts an isolated, run-scoped n
 - a real Smallstep CA whose ACME provisioner issues the web UI certificate for `files.localhost`;
 - an authenticated rsync daemon used by the normal backup implementation;
 - the actual file-server image, joined to the dummy domain;
-- a continuous SMB client that reads, writes, and lists files as several domain users.
+- a continuous SMB client that exercises reads, writes, renames/moves, and deletions, including activity from an excluded dummy service account.
 
 The preview starts with group, Private, FSLogix, and historical audit data. The client keeps current-day audit activity moving, while a real backup runs immediately and repeats in the background. Open the URL and use the credentials printed by the launcher. Defaults are:
 
@@ -174,7 +174,7 @@ The E2E suite verifies:
 - domain trust, group-to-folder mapping, nested and transitive group trees;
 - SMB allow/deny behavior and real file operations;
 - Data, Private, and FSLogix usage aggregation;
-- live `full_audit` ingestion, filters, facets, and pagination;
+- high-level `full_audit` ingestion for all four actions, service-account exclusion, filters, facets, and pagination;
 - compression and querying of a closed daily audit log;
 - real rsync transfer progress, completed backup status, log output, and remote snapshot marker;
 - overview and system-health aggregation.
@@ -374,20 +374,22 @@ Useful optional settings:
 | `WEB_MAX_GROUP_NODES` | `10000` | Membership expansion safety limit |
 | `AUDIT_COMPRESS_AFTER_HOURS` | `24` | Minimum idle age before compressing a closed day |
 | `AUDIT_QUERY_MAX_DAYS` | `31` | Largest activity query window |
+| `AUDIT_SKIP_USER_SUFFIXES` | `_svc,_ServiceAcc` | Case-insensitive account suffixes excluded from collection and queries; set empty to disable |
 
 If `WEB_ENABLED` is absent on an upgraded installation and no TLS settings/certificate exist, the web service stays disabled while Samba and audit collection continue. Set `WEB_ENABLED=true` after adding TLS configuration.
 
 ## Audit Archive
 
-Samba already produced `full_audit` messages before this web UI was added. The collector now makes them durable:
+Samba emits only the selected high-level `full_audit` operations, and the collector makes them durable:
 
 - it tails every `/var/log/samba/log.*` source, remembers inode and byte offsets in `/state/audit/collector-state.json`, and follows Samba rotation without duplicating a rotated file;
-- each event records timestamp, user, client address/name, share, VFS operation, read/write/list/session category, result, and path;
+- each event records timestamp, user, client address/name, share, result, path, and one of the actions `read`, `write`, `move`, or `delete`;
+- directory listings, sessions, metadata access, file-open/create noise, and all other VFS operations are discarded; users ending in a configured `AUDIT_SKIP_USER_SUFFIXES` value are also discarded;
 - records are appended to `/state/audit/YYYY-MM-DD.jsonl`;
 - a closed, idle daily file becomes `.jsonl.gz`;
 - no audit retention deletion is performed, so capacity planning for the `state_data` volume is the operator's responsibility.
 
-Collection starts even when the web UI is disabled. Existing Samba log content is imported when the collector first starts, but audit data that Samba rotated away before this version was deployed cannot be recovered.
+Collection starts even when the web UI is disabled. Existing Samba log content is imported when the collector first starts, but the same operation and user-suffix policy is applied during import. Audit data that Samba rotated away before this version was deployed cannot be recovered.
 
 ## Backups
 

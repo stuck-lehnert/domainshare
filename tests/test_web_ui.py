@@ -92,6 +92,44 @@ class AuditParsingTests(unittest.TestCase):
         self.assertEqual(event["path"], "/data/private/alice/notes.txt")
         self.assertTrue(event["success"])
 
+    def test_normalizes_only_high_level_file_actions(self):
+        expected = {
+            "recvfile": "write",
+            "renameat": "move",
+            "unlinkat": "delete",
+        }
+
+        for operation, action in expected.items():
+            with self.subTest(operation=operation):
+                line = f"smbd_audit: x|alice|192.0.2.5|PC01|Data|{operation}|OK|file.txt\n"
+                event = audit_collector.parse_audit_line(line, "/var/log/samba/log.pc01")
+                self.assertEqual(event["action"], action)
+
+        for operation in ("connect", "readdir", "fstat", "create_file", "fsetxattr"):
+            with self.subTest(operation=operation):
+                line = f"smbd_audit: x|alice|192.0.2.5|PC01|Data|{operation}|OK|file.txt\n"
+                self.assertIsNone(
+                    audit_collector.parse_audit_line(line, "/var/log/samba/log.pc01")
+                )
+
+    def test_skips_configured_user_suffixes_case_insensitively(self):
+        with mock.patch.dict(
+            os.environ,
+            {"AUDIT_SKIP_USER_SUFFIXES": "_svc,_ServiceAcc"},
+        ):
+            for user in ("DEV\\backup_SVC", "report_serviceacc@dev.test"):
+                with self.subTest(user=user):
+                    line = f"smbd_audit: x|{user}|192.0.2.5|PC01|Data|pread|OK|file.txt\n"
+                    self.assertIsNone(
+                        audit_collector.parse_audit_line(line, "/var/log/samba/log.pc01")
+                    )
+
+        with mock.patch.dict(os.environ, {"AUDIT_SKIP_USER_SUFFIXES": ""}):
+            line = "smbd_audit: x|DEV\\backup_svc|192.0.2.5|PC01|Data|pread|OK|file.txt\n"
+            self.assertIsNotNone(
+                audit_collector.parse_audit_line(line, "/var/log/samba/log.pc01")
+            )
+
     def test_tracks_rotated_file_by_inode_without_reingesting_it(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             archive = os.path.join(tmpdir, "audit")
@@ -121,8 +159,8 @@ class AuditQueryTests(unittest.TestCase):
             "user": user,
             "clientIp": "192.0.2.5",
             "share": "Data",
-            "operation": "pread" if success else "openat",
-            "action": "read" if success else "metadata",
+            "operation": "pread" if success else "unlinkat",
+            "action": "read" if success else "delete",
             "path": "folder/file.txt",
             "result": "OK" if success else "NT_STATUS_ACCESS_DENIED",
             "success": success,
@@ -138,6 +176,10 @@ class AuditQueryTests(unittest.TestCase):
                 for index in range(3):
                     handle.write(json.dumps(self.make_event(f"{today}T12:00:0{index}+00:00", "alice")) + "\n")
                 handle.write(json.dumps(self.make_event(f"{today}T12:00:04+00:00", "bob", False)) + "\n")
+                ignored = self.make_event(f"{today}T12:00:05+00:00", "metadata-user")
+                ignored.update({"operation": "create_file", "action": "write"})
+                handle.write(json.dumps(ignored) + "\n")
+                handle.write(json.dumps(self.make_event(f"{today}T12:00:06+00:00", "robot_svc")) + "\n")
             with gzip.open(old, "wt", encoding="utf-8") as handle:
                 handle.write(json.dumps(self.make_event(f"{yesterday}T12:00:00+00:00", "alice")) + "\n")
 
@@ -145,11 +187,15 @@ class AuditQueryTests(unittest.TestCase):
                 first = web_ui.query_audit({"from": [yesterday.isoformat()], "to": [today.isoformat()], "user": ["alice"], "limit": ["2"]})
                 failed = web_ui.query_audit({"from": [today.isoformat()], "to": [today.isoformat()], "result": ["fail"]})
                 second = web_ui.query_audit({"from": [yesterday.isoformat()], "to": [today.isoformat()], "user": ["alice"], "limit": ["2"], "cursor": [str(first["nextCursor"])]})
+                visible = web_ui.query_audit({"from": [today.isoformat()], "to": [today.isoformat()], "limit": ["100"]})
 
         self.assertEqual(first["matched"], 4)
         self.assertEqual(len(first["events"]), 2)
         self.assertEqual(len(second["events"]), 2)
         self.assertEqual(failed["events"][0]["user"], "bob")
+        self.assertNotIn("metadata-user", visible["facets"]["users"])
+        self.assertNotIn("robot_svc", visible["facets"]["users"])
+        self.assertEqual(set(visible["facets"]["actions"]), {"read", "delete"})
 
 
 class WebPresentationTests(unittest.TestCase):
@@ -183,6 +229,35 @@ class WebPresentationTests(unittest.TestCase):
         self.assertNotIn("localTime", script)
         self.assertIn('class="timestamp"', script)
         self.assertIn(".timestamp { text-align: left;", css)
+        self.assertIn("Umbenennen/Verschieben", script)
+        self.assertIn("Löschen", script)
+        self.assertNotIn(">Auflisten<", script)
+        self.assertNotIn(">Metadaten<", script)
+        self.assertNotIn(">Sitzung<", script)
+        self.assertNotIn('name="operation"', script)
+
+    def test_samba_audits_only_supported_file_operations(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "etc", "samba", "smb.conf")
+        with open(path, encoding="utf-8") as handle:
+            config = handle.read()
+
+        expected = {
+            "pread", "pread_recv", "read", "sendfile", "offload_read_recv",
+            "pwrite", "pwrite_recv", "write", "recvfile",
+            "offload_write_recv", "renameat", "unlinkat",
+        }
+        success_lines = [
+            line for line in config.splitlines()
+            if line.strip().startswith("full_audit:success =")
+        ]
+        failure_lines = [
+            line for line in config.splitlines()
+            if line.strip().startswith("full_audit:failure =")
+        ]
+        self.assertEqual(len(success_lines), 3)
+        self.assertEqual(len(failure_lines), 3)
+        for line in success_lines + failure_lines:
+            self.assertEqual(set(line.split("=", 1)[1].split()), expected)
 
 
 class TlsSummaryTests(unittest.TestCase):
