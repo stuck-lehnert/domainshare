@@ -223,6 +223,9 @@ write_runtime_env_file() {
     if [[ -n "${BACKUP_PROGRESS_INTERVAL_SECONDS:-}" ]]; then
       printf 'export BACKUP_PROGRESS_INTERVAL_SECONDS=%q\n' "$BACKUP_PROGRESS_INTERVAL_SECONDS"
     fi
+    if [[ -n "${BACKUP_STATUS_FILE:-}" ]]; then
+      printf 'export BACKUP_STATUS_FILE=%q\n' "$BACKUP_STATUS_FILE"
+    fi
     if [[ -n "${JOIN_USER:-}" ]]; then
       printf 'export JOIN_USER=%q\n' "$JOIN_USER"
     fi
@@ -288,6 +291,124 @@ wait_for_winbind() {
   return 0
 }
 
+env_is_true() {
+  case "${1,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+web_should_start() {
+  if [[ -n "${WEB_ENABLED:-}" ]]; then
+    env_is_true "$WEB_ENABLED"
+    return
+  fi
+  if [[ -n "${STEP_CA_URL:-}" ]] || \
+     [[ -s "${WEB_TLS_CERT_FILE:-/state/tls/web.crt}" ]]; then
+    return 0
+  fi
+  log 'WEB_ENABLED is unset and no TLS configuration exists; web UI disabled for upgrade compatibility.'
+  return 1
+}
+
+ensure_web_jwt_secret() {
+  local secret_file="/state/web/jwt-secret"
+  if [[ -n "${WEB_JWT_SECRET:-}" ]]; then
+    export WEB_JWT_SECRET
+    return
+  fi
+
+  mkdir -p /state/web
+  if [[ ! -s "$secret_file" ]]; then
+    umask 077
+    python3 -c 'import secrets; print(secrets.token_urlsafe(48))' > "$secret_file"
+  fi
+  WEB_JWT_SECRET="$(<"$secret_file")"
+  export WEB_JWT_SECRET
+  log 'WEB_JWT_SECRET was not provided; using a persistent generated secret.'
+}
+
+configure_web_tls() {
+  local tls_mode="${WEB_TLS_MODE:-step}"
+  local tls_dir=""
+  local provisioner_password_file=""
+
+  export WEB_HOSTNAME="${WEB_HOSTNAME:-${AD_DNS_NAME}}"
+  export WEB_BIND_PORT="${WEB_BIND_PORT:-8443}"
+  export WEB_TLS_CERT_FILE="${WEB_TLS_CERT_FILE:-/state/tls/web.crt}"
+  export WEB_TLS_KEY_FILE="${WEB_TLS_KEY_FILE:-/state/tls/web.key}"
+  tls_dir="$(dirname "$WEB_TLS_CERT_FILE")"
+  mkdir -p "$tls_dir" "$(dirname "$WEB_TLS_KEY_FILE")"
+
+  if [[ "$tls_mode" == "files" ]]; then
+    if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" ]]; then
+      printf '[init] ERROR: WEB_TLS_MODE=files requires %s and %s\n' "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" >&2
+      return 1
+    fi
+    return
+  fi
+  if [[ "$tls_mode" != "step" ]]; then
+    printf '[init] ERROR: WEB_TLS_MODE must be step or files\n' >&2
+    return 1
+  fi
+
+  export STEPPATH="${STEP_PATH:-/state/step}"
+  if [[ ! -s "$STEPPATH/config/defaults.json" ]] || \
+     env_is_true "${STEP_CA_REBOOTSTRAP:-false}"; then
+    require_env STEP_CA_URL
+    require_env STEP_CA_FINGERPRINT
+    log "Bootstrapping Smallstep trust for ${STEP_CA_URL}"
+    step ca bootstrap --force --ca-url "$STEP_CA_URL" --fingerprint "$STEP_CA_FINGERPRINT"
+  fi
+
+  if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" ]]; then
+    log "Requesting HTTPS certificate for ${WEB_HOSTNAME}"
+    if [[ -n "${STEP_CA_TOKEN:-}" ]]; then
+      step ca certificate "$WEB_HOSTNAME" "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" --token "$STEP_CA_TOKEN" --force
+    else
+      require_env STEP_CA_PROVISIONER
+      if [[ -n "${STEP_CA_PROVISIONER_PASSWORD_FILE:-}" ]]; then
+        provisioner_password_file="$STEP_CA_PROVISIONER_PASSWORD_FILE"
+      elif [[ -n "${STEP_CA_PROVISIONER_PASSWORD:-}" ]]; then
+        provisioner_password_file="/run/step-provisioner-password"
+        umask 077
+        printf '%s\n' "$STEP_CA_PROVISIONER_PASSWORD" > "$provisioner_password_file"
+      else
+        printf '[init] ERROR: STEP_CA_TOKEN, STEP_CA_PROVISIONER_PASSWORD_FILE, or STEP_CA_PROVISIONER_PASSWORD is required for initial TLS setup\n' >&2
+        return 1
+      fi
+      step ca certificate "$WEB_HOSTNAME" "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" \
+        --provisioner "$STEP_CA_PROVISIONER" \
+        --provisioner-password-file "$provisioner_password_file" \
+        --force
+      if [[ "$provisioner_password_file" == "/run/step-provisioner-password" ]]; then
+        rm -f "$provisioner_password_file"
+      fi
+    fi
+  fi
+  chmod 0600 "$WEB_TLS_KEY_FILE"
+  chmod 0644 "$WEB_TLS_CERT_FILE"
+}
+
+start_observability_services() {
+  log 'Starting Samba audit collector'
+  python3 /app/audit_collector.py &
+
+  if web_should_start; then
+    ensure_web_jwt_secret
+    configure_web_tls
+    unset STEP_CA_PROVISIONER_PASSWORD STEP_CA_TOKEN
+    if [[ "${WEB_TLS_MODE:-step}" == "step" ]] && env_is_true "${WEB_TLS_AUTORENEW:-true}"; then
+      log 'Starting Smallstep certificate renewal daemon'
+      step ca renew --daemon --force "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" &
+    fi
+    log "Starting read-only web UI for https://${WEB_HOSTNAME}"
+    python3 /app/web_ui.py &
+  else
+    log 'WEB_ENABLED is false; web UI disabled'
+  fi
+}
+
 install_cron_job() {
   cat > /etc/cron.d/reconcile-shares <<'EOF'
 SHELL=/bin/bash
@@ -323,7 +444,7 @@ if [[ -n "${JOIN_PASSWORD:-}" ]]; then
   export JOIN_PASSWORD
 fi
 
-mkdir -p /data/private /data/fslogix /data/groups/data /data/groups/archive /state /var/log/samba
+mkdir -p /data/private /data/fslogix /data/groups/data /data/groups/archive /state /state/audit /state/web /var/log/samba
 touch /var/log/reconcile.log /var/log/backup.log
 
 append_winbind_to_nss
@@ -348,8 +469,10 @@ write_runtime_env_file
 log 'Running startup reconciliation'
 python3 /app/reconcile_shares.py
 
+start_observability_services
+
 if [[ -n "${BACKUP_DESTINATION:-}" ]]; then
-  log "Backups enabled: daily at ${BACKUP_START_HOUR}:00 (container local time)."
+  log "Backups enabled: daily at ${BACKUP_START_HOUR}:00 UTC."
 else
   log 'BACKUP_DESTINATION is unset; scheduled backup disabled'
 fi

@@ -233,6 +233,7 @@ class BackendProgressCommandTests(unittest.TestCase):
             )
 
         command = run_streaming.call_args.args[0]
+        self.assertIn("--mkpath", command)
         self.assertIn("--progress", command)
         self.assertIn("--outbuf=L", command)
         self.assertEqual(

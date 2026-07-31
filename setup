@@ -135,6 +135,14 @@ write_env_file() {
   local ad_dns_name=""
   local ad_dns_ip_auto="0"
   local service_password=""
+  local web_hostname=""
+  local web_https_port="443"
+  local web_jwt_secret=""
+  local step_ca_url=""
+  local step_ca_fingerprint=""
+  local step_ca_provisioner=""
+  local step_ca_provisioner_password=""
+  local web_hostname_input=""
   local service_account_sam=""
   local fslogix_group_prompt=""
   local samba_hostname_input=""
@@ -204,6 +212,22 @@ write_env_file() {
   read -r -p "BACKUP_RETENTION_YEARLY [1]: " backup_retention_yearly
   backup_retention_yearly="${backup_retention_yearly:-1}"
 
+  web_hostname="$ad_dns_name"
+  read -r -p "WEB_HOSTNAME [${web_hostname}]: " web_hostname_input
+  web_hostname="${web_hostname_input:-$web_hostname}"
+  read -r -p "WEB_HTTPS_PORT [443]: " web_https_port
+  web_https_port="${web_https_port:-443}"
+  prompt_value step_ca_url "STEP_CA_URL (e.g. https://ca.example.com:9000)"
+  prompt_value step_ca_fingerprint "STEP_CA_FINGERPRINT"
+  prompt_value step_ca_provisioner "STEP_CA_PROVISIONER (JWK provisioner name)"
+  prompt_value step_ca_provisioner_password "STEP_CA_PROVISIONER_PASSWORD" true
+
+  web_jwt_secret="$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(48))
+PY
+)"
+
   service_account_sam="$(sanitize_sam_account_name "$SERVICE_ACCOUNT_NAME")"
   if [[ "$service_account_sam" != "$SERVICE_ACCOUNT_NAME" ]]; then
     printf "Using sAMAccountName '%s' (AD limit is 20 chars; requested '%s').\n" "$service_account_sam" "$SERVICE_ACCOUNT_NAME"
@@ -251,6 +275,15 @@ BACKUP_RETENTION_MONTHLY=${backup_retention_monthly}
 BACKUP_RETENTION_YEARLY=${backup_retention_yearly}
 SAMBA_HOSTNAME=${samba_hostname}
 NETBIOS_NAME=${netbios_name}
+WEB_ENABLED=true
+WEB_HOSTNAME=${web_hostname}
+WEB_HTTPS_PORT=${web_https_port}
+WEB_JWT_SECRET=${web_jwt_secret}
+WEB_TLS_MODE=step
+STEP_CA_URL=${step_ca_url}
+STEP_CA_FINGERPRINT=${step_ca_fingerprint}
+STEP_CA_PROVISIONER=${step_ca_provisioner}
+STEP_CA_PROVISIONER_PASSWORD=${step_ca_provisioner_password}
 EOF
 
   cp "$BOOTSTRAP_ENV_FILE" "$ENV_FILE"
@@ -311,6 +344,15 @@ BACKUP_RETENTION_MONTHLY=${backup_retention_monthly}
 BACKUP_RETENTION_YEARLY=${backup_retention_yearly}
 SAMBA_HOSTNAME=${samba_hostname}
 NETBIOS_NAME=${netbios_name}
+WEB_ENABLED=true
+WEB_HOSTNAME=${web_hostname}
+WEB_HTTPS_PORT=${web_https_port}
+WEB_JWT_SECRET=${web_jwt_secret}
+WEB_TLS_MODE=step
+STEP_CA_URL=${step_ca_url}
+STEP_CA_FINGERPRINT=${step_ca_fingerprint}
+STEP_CA_PROVISIONER=${step_ca_provisioner}
+STEP_CA_PROVISIONER_PASSWORD=${step_ca_provisioner_password}
 # Optional overrides:
 # LDAP_URI=ldaps://${domain}
 # LDAP_BASE_DN=DC=example,DC=com
@@ -328,6 +370,14 @@ NETBIOS_NAME=${netbios_name}
 # BACKUP_LOG_FILE=/var/log/backup.log
 # BACKUP_PROGRESS=auto
 # BACKUP_PROGRESS_INTERVAL_SECONDS=10
+# WEB_JWT_TTL_SECONDS=28800
+# WEB_USAGE_SCAN_INTERVAL_SECONDS=900
+# WEB_DIRECTORY_CACHE_SECONDS=300
+# AUDIT_COMPRESS_AFTER_HOURS=24
+# AUDIT_QUERY_MAX_DAYS=31
+# STEP_CA_PROVISIONER_PASSWORD_FILE=/run/secrets/step-ca-provisioner-password
+# WEB_TLS_CERT_FILE=/state/tls/web.crt
+# WEB_TLS_KEY_FILE=/state/tls/web.key
 EOF
 
   chmod 600 "$ENV_FILE"

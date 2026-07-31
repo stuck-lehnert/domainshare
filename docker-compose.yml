@@ -8,10 +8,12 @@ services:
     env_file:
       - .env
     environment:
+      TZ: Etc/UTC
       NETBIOS_NAME: ${NETBIOS_NAME:-ADSAMBAFSRV}
     ports:
       - "445:445"
       - "139:139"
+      - "${WEB_HTTPS_PORT:-443}:${WEB_BIND_PORT:-8443}"
     volumes:
       - private_data:/data/private
       - fslogix_data:/data/fslogix

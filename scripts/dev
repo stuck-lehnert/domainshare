@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+script_path=${BASH_SOURCE[0]}
+case "$script_path" in
+  */*) script_dir=${script_path%/*} ;;
+  *) script_dir=. ;;
+esac
+
+cd "$script_dir/.."
+repo_root=$PWD
+
+if command -v podman >/dev/null 2>&1; then
+  engine=podman
+elif command -v docker >/dev/null 2>&1; then
+  engine=docker
+else
+  die 'podman or docker required'
+fi
+
+run_e2e=${DEV_RUN_E2E:-0}
+case "${1:-}" in
+  --e2e) run_e2e=1 ;;
+  '') ;;
+  *) die "unknown argument: $1" ;;
+esac
+
+dev_realm=${DEV_REALM:-DEV.TEST}
+dev_workgroup=${DEV_WORKGROUP:-DEV}
+dev_dns_domain=${DEV_DNS_DOMAIN:-dev.test}
+dev_base_dn=${DEV_BASE_DN:-DC=dev,DC=test}
+dev_dc_password=${DEV_DC_PASSWORD:-PreviewDc123!}
+dev_user_password=${DEV_USER_PASSWORD:-PreviewUser123!}
+dev_admin_user=${DEV_ADMIN_USER:-previewadmin}
+dev_admin_password=${DEV_ADMIN_PASSWORD:-PreviewAdmin123!}
+dev_backup_user=${DEV_BACKUP_USER:-preview}
+dev_backup_password=${DEV_BACKUP_PASSWORD:-PreviewBackup123!}
+dev_ca_password=${DEV_CA_PASSWORD:-PreviewCa123!}
+dev_ca_provisioner=${DEV_CA_PROVISIONER:-preview}
+dev_https_port=${DEV_HTTPS_PORT:-8443}
+dev_activity_interval=${DEV_ACTIVITY_INTERVAL_SECONDS:-4}
+dev_backup_interval=${DEV_BACKUP_INTERVAL_SECONDS:-120}
+
+server_image=${DEV_SERVER_IMAGE:-ad-ds-simple-file-server-dev:latest}
+ad_image=${DEV_AD_IMAGE:-ad-ds-simple-file-server-ad-dev:latest}
+backup_image=${DEV_BACKUP_IMAGE:-ad-ds-simple-file-server-backup-dev:latest}
+step_ca_image=${DEV_STEP_CA_IMAGE:-docker.io/smallstep/step-ca:latest}
+
+run_id="ad-file-server-dev-$$-$RANDOM"
+network_name="$run_id-net"
+dc_container="$run_id-dc"
+ca_container="$run_id-ca"
+backup_container="$run_id-backup"
+files_container="$run_id-files"
+client_container="$run_id-client"
+
+ca_volume="$run_id-ca-state"
+backup_volume="$run_id-backup-data"
+private_volume="$run_id-private-data"
+fslogix_volume="$run_id-fslogix-data"
+groups_volume="$run_id-group-data"
+state_volume="$run_id-state-data"
+samba_volume="$run_id-samba-lib"
+
+containers=(
+  "$client_container"
+  "$files_container"
+  "$dc_container"
+  "$backup_container"
+  "$ca_container"
+)
+volumes=(
+  "$ca_volume"
+  "$backup_volume"
+  "$private_volume"
+  "$fslogix_volume"
+  "$groups_volume"
+  "$state_volume"
+  "$samba_volume"
+)
+
+network_created=0
+watchdog_pid=
+log_pid=
+backup_driver_pid=
+ca_root_file=
+
+stop_resources() {
+  local container
+  local volume
+  for container in "${containers[@]}"; do
+    "$engine" stop -t 3 "$container" >/dev/null 2>&1 || true
+  done
+  for container in "${containers[@]}"; do
+    "$engine" rm -f "$container" >/dev/null 2>&1 || true
+  done
+  if [[ $network_created == 1 ]]; then
+    "$engine" network rm "$network_name" >/dev/null 2>&1 || true
+  fi
+  for volume in "${volumes[@]}"; do
+    "$engine" volume rm "$volume" >/dev/null 2>&1 || true
+  done
+}
+
+start_watchdog() {
+  local parent_pid=$$
+  (
+    while kill -0 "$parent_pid" >/dev/null 2>&1; do
+      sleep 1
+    done
+    stop_resources
+  ) &
+  watchdog_pid=$!
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM HUP QUIT
+
+  if [[ -n ${backup_driver_pid:-} ]]; then
+    kill "$backup_driver_pid" >/dev/null 2>&1 || true
+    wait "$backup_driver_pid" 2>/dev/null || true
+  fi
+  if [[ -n ${log_pid:-} ]]; then
+    kill "$log_pid" >/dev/null 2>&1 || true
+    wait "$log_pid" 2>/dev/null || true
+  fi
+  if [[ -n ${watchdog_pid:-} ]]; then
+    kill "$watchdog_pid" >/dev/null 2>&1 || true
+    wait "$watchdog_pid" 2>/dev/null || true
+  fi
+
+  stop_resources
+  if [[ -n ${ca_root_file:-} && -f $ca_root_file ]]; then
+    rm -f -- "$ca_root_file"
+  fi
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 131' QUIT
+
+show_logs() {
+  local container
+  for container in "$dc_container" "$ca_container" "$backup_container" "$files_container" "$client_container"; do
+    if "$engine" inspect "$container" >/dev/null 2>&1; then
+      printf '\n===== %s =====\n' "$container" >&2
+      "$engine" logs --tail 160 "$container" >&2 || true
+    fi
+  done
+}
+
+wait_for_exec() {
+  local container=$1
+  local seconds=$2
+  shift 2
+  local elapsed=0
+  while (( elapsed < seconds )); do
+    if "$engine" exec "$container" "$@" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [[ $("$engine" inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true) != true ]]; then
+      return 1
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
+create_network() {
+  local attempt
+  local second
+  local third
+  for attempt in $(seq 0 31); do
+    second=$((20 + ((RANDOM + attempt) % 10)))
+    third=$(((RANDOM + $$ + attempt) % 240 + 8))
+    subnet="172.${second}.${third}.0/24"
+    if "$engine" network create --subnet "$subnet" "$network_name" >/dev/null 2>&1; then
+      network_created=1
+      subnet_prefix="172.${second}.${third}."
+      return 0
+    fi
+  done
+  return 1
+}
+
+start_watchdog
+
+printf 'engine: %s\n' "$engine"
+if [[ ${DEV_SKIP_BUILD:-0} != 1 ]]; then
+  printf 'building file server image: %s\n' "$server_image"
+  "$engine" build -t "$server_image" -f "$repo_root/Dockerfile" "$repo_root"
+  printf 'building AD/client image: %s\n' "$ad_image"
+  "$engine" build -t "$ad_image" -f "$repo_root/dev/ad-dc.Dockerfile" "$repo_root"
+  printf 'building backup image: %s\n' "$backup_image"
+  "$engine" build -t "$backup_image" -f "$repo_root/dev/backup.Dockerfile" "$repo_root"
+fi
+
+printf 'creating isolated network: %s\n' "$network_name"
+create_network || die 'unable to allocate an isolated container subnet'
+dc_ip="${subnet_prefix}10"
+ca_ip="${subnet_prefix}20"
+files_ip="${subnet_prefix}30"
+backup_ip="${subnet_prefix}40"
+
+for volume in "${volumes[@]}"; do
+  "$engine" volume create "$volume" >/dev/null
+done
+
+printf 'starting local CA: %s\n' "$step_ca_image"
+"$engine" run -d \
+  --name "$ca_container" \
+  --hostname "ca.${dev_dns_domain}" \
+  --network "$network_name" \
+  --ip "$ca_ip" \
+  -e "DOCKER_STEPCA_INIT_NAME=AD file server preview CA" \
+  -e "DOCKER_STEPCA_INIT_DNS_NAMES=ca.${dev_dns_domain},localhost,127.0.0.1" \
+  -e "DOCKER_STEPCA_INIT_PROVISIONER_NAME=${dev_ca_provisioner}" \
+  -e "DOCKER_STEPCA_INIT_PASSWORD=${dev_ca_password}" \
+  -v "$ca_volume:/home/step" \
+  "$step_ca_image" >/dev/null
+
+if ! wait_for_exec "$ca_container" 120 step ca health \
+  --ca-url=https://localhost:9000 \
+  --root=/home/step/certs/root_ca.crt; then
+  show_logs
+  die 'local CA did not become healthy'
+fi
+ca_fingerprint=$("$engine" exec "$ca_container" step certificate fingerprint \
+  /home/step/certs/root_ca.crt)
+preview_tmp_root=${TMPDIR:-/tmp}
+ca_root_file="${preview_tmp_root%/}/${run_id}-root-ca.crt"
+"$engine" exec "$ca_container" cat /home/step/certs/root_ca.crt > "$ca_root_file"
+
+printf 'starting disposable rsync backup target\n'
+"$engine" run -d \
+  --name "$backup_container" \
+  --hostname "backup.${dev_dns_domain}" \
+  --network "$network_name" \
+  --ip "$backup_ip" \
+  -e "BACKUP_USERNAME=${dev_backup_user}" \
+  -e "BACKUP_PASSWORD=${dev_backup_password}" \
+  -v "$backup_volume:/backup" \
+  "$backup_image" >/dev/null
+
+printf 'starting disposable Samba AD DC: %s\n' "$dev_realm"
+"$engine" run -d \
+  --name "$dc_container" \
+  --hostname "dc.${dev_dns_domain}" \
+  --cap-add SYS_ADMIN \
+  --network "$network_name" \
+  --ip "$dc_ip" \
+  -e "AD_REALM=${dev_realm}" \
+  -e "AD_DOMAIN=${dev_workgroup}" \
+  -e "AD_DNS_DOMAIN=${dev_dns_domain}" \
+  -e "AD_BASE_DN=${dev_base_dn}" \
+  -e "AD_ADMIN_PASSWORD=${dev_dc_password}" \
+  -e "AD_USER_PASSWORD=${dev_user_password}" \
+  -e "AD_WEB_ADMIN_USER=${dev_admin_user}" \
+  -e "AD_WEB_ADMIN_PASSWORD=${dev_admin_password}" \
+  -e "DEV_CA_IP=${ca_ip}" \
+  -e "DEV_BACKUP_IP=${backup_ip}" \
+  -e "DEV_FILESERVER_IP=${files_ip}" \
+  "$ad_image" >/dev/null
+
+if ! wait_for_exec "$dc_container" 150 test -f /run/preview-ready; then
+  show_logs
+  die 'dummy AD domain did not become ready'
+fi
+domain_sid=$("$engine" exec "$dc_container" cat /run/domain-sid)
+
+printf 'seeding preview files and an old audit archive\n'
+"$engine" run --rm \
+  --network "$network_name" \
+  -e "DEV_SEED_MB=${DEV_SEED_MB:-8}" \
+  -v "$private_volume:/data/private" \
+  -v "$fslogix_volume:/data/fslogix" \
+  -v "$groups_volume:/data/groups" \
+  -v "$state_volume:/state" \
+  --entrypoint /usr/local/bin/preview-seed-files \
+  "$ad_image"
+
+printf 'starting actual file server and HTTPS web UI\n'
+"$engine" run -d \
+  --name "$files_container" \
+  --hostname files \
+  --network "$network_name" \
+  --ip "$files_ip" \
+  --dns "$dc_ip" \
+  --dns-search "$dev_dns_domain" \
+  -p "127.0.0.1:${dev_https_port}:8443" \
+  -e "REALM=${dev_realm}" \
+  -e "WORKGROUP=${dev_workgroup}" \
+  -e "DOMAIN=dc.${dev_dns_domain}" \
+  -e "LDAP_URI=ldap://dc.${dev_dns_domain}" \
+  -e "LDAP_BASE_DN=${dev_base_dn}" \
+  -e "JOIN_USER=Administrator" \
+  -e "JOIN_PASSWORD=${dev_dc_password}" \
+  -e "DOMAIN_USERS_SID=${domain_sid}-513" \
+  -e "DOMAIN_ADMINS_SID=${domain_sid}-512" \
+  -e "FSLOGIX_GROUP_SID=${domain_sid}-513" \
+  -e "SAMBA_HOSTNAME=files" \
+  -e "NETBIOS_NAME=FILES" \
+  -e "AD_DNS_NAME=files.${dev_dns_domain}" \
+  -e "WEB_ENABLED=true" \
+  -e "WEB_HOSTNAME=localhost" \
+  -e "WEB_BIND_PORT=8443" \
+  -e "WEB_JWT_SECRET=preview-only-jwt-secret-with-at-least-32-bytes" \
+  -e "WEB_TLS_MODE=step" \
+  -e "STEP_CA_URL=https://ca.${dev_dns_domain}:9000" \
+  -e "STEP_CA_FINGERPRINT=${ca_fingerprint}" \
+  -e "STEP_CA_PROVISIONER=${dev_ca_provisioner}" \
+  -e "STEP_CA_PROVISIONER_PASSWORD=${dev_ca_password}" \
+  -e "WEB_USAGE_SCAN_INTERVAL_SECONDS=60" \
+  -e "WEB_DIRECTORY_CACHE_SECONDS=30" \
+  -e "AUDIT_POLL_SECONDS=0.25" \
+  -e "AUDIT_COMPRESS_AFTER_HOURS=1" \
+  -e "BACKUP_DESTINATION=rsync://${dev_backup_user}:${dev_backup_password}@backup.${dev_dns_domain}/backups/fileserver" \
+  -e "BACKUP_PROGRESS=never" \
+  -e "BACKUP_PROGRESS_INTERVAL_SECONDS=1" \
+  -e "BACKUP_RETENTION_DAILY=3" \
+  -e "BACKUP_RETENTION_WEEKLY=2" \
+  -e "BACKUP_RETENTION_MONTHLY=1" \
+  -e "BACKUP_RETENTION_YEARLY=1" \
+  -v "$private_volume:/data/private" \
+  -v "$fslogix_volume:/data/fslogix" \
+  -v "$groups_volume:/data/groups" \
+  -v "$state_volume:/state" \
+  -v "$samba_volume:/var/lib/samba" \
+  "$server_image" >/dev/null
+
+if ! wait_for_exec "$files_container" 240 python3 -c \
+  'import ssl,urllib.request; print(urllib.request.urlopen("https://127.0.0.1:8443/healthz", context=ssl._create_unverified_context(), timeout=3).status)'; then
+  show_logs
+  die 'file server web UI did not become healthy'
+fi
+
+printf 'starting continuous authenticated SMB activity client\n'
+"$engine" run -d \
+  --name "$client_container" \
+  --hostname preview-client \
+  --network "$network_name" \
+  --dns "$dc_ip" \
+  --dns-search "$dev_dns_domain" \
+  --add-host "files.${dev_dns_domain}:${files_ip}" \
+  -e "AD_DOMAIN=${dev_workgroup}" \
+  -e "AD_USER_PASSWORD=${dev_user_password}" \
+  -e "FILESERVER_HOST=files.${dev_dns_domain}" \
+  -e "DEV_ACTIVITY_INTERVAL_SECONDS=${dev_activity_interval}" \
+  "$ad_image" /usr/local/bin/preview-client >/dev/null
+
+if ! wait_for_exec "$client_container" 120 test -f /run/preview-client-ready; then
+  show_logs
+  die 'preview SMB client did not complete its initial activity'
+fi
+
+run_backup_loop() {
+  local elapsed
+  while "$engine" inspect "$files_container" >/dev/null 2>&1; do
+    "$engine" exec "$files_container" /bin/bash -lc \
+      'source /app/runtime.env && exec /usr/bin/python3 /app/backup_to_destination.py' || true
+    elapsed=0
+    while (( elapsed < dev_backup_interval )); do
+      "$engine" inspect "$files_container" >/dev/null 2>&1 || return 0
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+  done
+}
+run_backup_loop &
+backup_driver_pid=$!
+
+if [[ $run_e2e == 1 ]]; then
+  printf 'running end-to-end assertions\n'
+  if ! PREVIEW_ENGINE="$engine" \
+    PREVIEW_FILES_CONTAINER="$files_container" \
+    PREVIEW_CLIENT_CONTAINER="$client_container" \
+    PREVIEW_BACKUP_CONTAINER="$backup_container" \
+    PREVIEW_CA_ROOT="$ca_root_file" \
+    PREVIEW_HTTPS_PORT="$dev_https_port" \
+    PREVIEW_REALM="$dev_realm" \
+    PREVIEW_WORKGROUP="$dev_workgroup" \
+    PREVIEW_DNS_DOMAIN="$dev_dns_domain" \
+    PREVIEW_DOMAIN_SID="$domain_sid" \
+    PREVIEW_ADMIN_USER="$dev_admin_user" \
+    PREVIEW_ADMIN_PASSWORD="$dev_admin_password" \
+    PREVIEW_USER_PASSWORD="$dev_user_password" \
+    python3 "$repo_root/dev/e2e.py"; then
+    show_logs
+    exit 1
+  fi
+  exit 0
+fi
+
+printf '\nPreview ready\n'
+printf '  URL:      https://localhost:%s\n' "$dev_https_port"
+printf '  Username: %s\\%s\n' "$dev_workgroup" "$dev_admin_user"
+printf '  Password: %s\n' "$dev_admin_password"
+printf '  CA root:  %s\n' "$ca_root_file"
+printf '\nThe CA is disposable, so import the displayed root only as temporary trust.\n'
+printf 'SMB activity and backups repeat in the background. Press Ctrl-C to remove everything.\n\n'
+
+"$engine" logs -f "$files_container" &
+log_pid=$!
+file_status=$("$engine" wait "$files_container" 2>/dev/null || printf '1')
+case "$file_status" in
+  ''|*[!0-9]*) exit 1 ;;
+  *) exit "$file_status" ;;
+esac

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Dateiserver-Verwaltung</title>
+  <link rel="icon" href="/favicon.svg">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <section id="login-view" class="login-view" hidden>
+    <main class="login-card">
+      <h1>Dateiserver-Verwaltung</h1>
+      <p>Anmeldung nur für Domänenadministratoren. Ohne Domänenangabe wird automatisch die konfigurierte NetBIOS-Domäne verwendet.</p>
+      <form id="login-form" class="stack">
+        <label>Benutzername<input name="username" autocomplete="username" required autofocus placeholder="benutzername"></label>
+        <label>Passwort<input name="password" type="password" autocomplete="current-password" required></label>
+        <p id="login-error" class="error" role="alert" hidden></p>
+        <button type="submit">Anmelden</button>
+      </form>
+    </main>
+  </section>
+
+  <div id="app-view" class="shell" hidden>
+    <aside class="sidebar">
+      <div class="brand">Dateiserver</div>
+      <nav id="navigation" aria-label="Hauptnavigation">
+        <a href="/overview" data-route="overview">Übersicht</a>
+        <a href="/shares" data-route="shares">Dateifreigaben</a>
+        <a href="/storage/data" data-route="storage-data">Datenbelegung</a>
+        <a href="/storage/users" data-route="storage-users">Benutzerbelegung</a>
+        <a href="/activity" data-route="activity">Aktivitätsprotokoll</a>
+        <a href="/backup" data-route="backup">Sicherungen</a>
+        <a href="/system" data-route="system">System</a>
+      </nav>
+      <div class="sidebar-footer"><span id="session-user"></span><button id="logout" class="link-button">Abmelden</button></div>
+    </aside>
+    <header class="mobile-header"><button id="menu-toggle" aria-label="Navigation ein- oder ausblenden">Menü</button><strong>Dateiserver</strong></header>
+    <main id="content" class="content" tabindex="-1"></main>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

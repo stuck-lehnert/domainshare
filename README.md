@@ -22,14 +22,18 @@ This repository provides a production-oriented Samba file server container that 
 - Setup prompts for well-known authorization groups by SID (`DOMAIN_USERS_SID`, `DOMAIN_ADMINS_SID`) to avoid localized group names.
 - `FSLOGIX_GROUP_SID` controls who can access the default FSLogix share (defaults to `DOMAIN_USERS_SID`).
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
-- Share operations are audited with Samba `full_audit` (connect, list, read, write, create, delete, rename) and written to Samba log files.
+- Share operations are audited with Samba `full_audit` (connect, list, read, write, create, delete, rename).
+- A collector persists every `full_audit` record in daily NDJSON files under `/state/audit`; closed files are gzip-compressed and are never automatically deleted.
+- A read-only HTTPS web console provides group membership trees, storage usage, searchable activity, live backup progress, and system health.
+- Web sign-in validates the submitted username/password with Kerberos, permits only users whose winbind group SID set contains `DOMAIN_ADMINS_SID`, and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
+- HTTPS certificates are requested from a configured local Smallstep CA and renewed automatically. Pre-issued certificate files are also supported.
 - Optional remote backups run when `BACKUP_DESTINATION` is configured.
 - Private home creation skips well-known/service accounts by default (including `krbtgt`, `msol_*`, `FileShare_ServiceAcc`).
 - Reconciliation is executed:
   - once on startup
   - every 5 minutes via cron
 - Backup is executed:
-  - daily at `BACKUP_START_HOUR` (default: `2`, i.e. 02:00)
+  - daily at `BACKUP_START_HOUR` in UTC (default: `2`, i.e. 02:00 UTC)
 
 ## Data Folder Lifecycle
 
@@ -95,7 +99,86 @@ Kerberos requires close time alignment.
 - `app/init.sh`
 - `app/reconcile_shares.py`
 - `app/backup_to_destination.py`
+- `app/audit_collector.py`
+- `app/web_ui.py`
+- `app/web/`
 - `etc/samba/smb.conf`
+- `dev/` (disposable AD DC, backup target, SMB client, seed data, and E2E assertions)
+- `scripts/dev`
+- `scripts/test-e2e`
+
+## Local Preview
+
+Run a complete disposable environment with Docker or Podman:
+
+```bash
+./scripts/dev
+```
+
+The launcher builds the current application and starts an isolated, run-scoped network containing:
+
+- a real Samba AD DC for `DEV.TEST`, seeded with users, nested groups, and three `FS_*` groups;
+- a real Smallstep CA that issues the web UI certificate for `localhost`;
+- an authenticated rsync daemon used by the normal backup implementation;
+- the actual file-server image, joined to the dummy domain;
+- a continuous SMB client that reads, writes, and lists files as several domain users.
+
+The preview starts with group, Private, FSLogix, and historical audit data. The client keeps current-day audit activity moving, while a real backup runs immediately and repeats in the background. Open the URL and use the credentials printed by the launcher. Defaults are:
+
+```text
+URL:      https://localhost:8443
+Username: DEV\previewadmin
+Password: PreviewAdmin123!
+```
+
+The generated CA is intentionally disposable. `scripts/dev` prints the temporary root certificate path so it can be trusted only for the duration of that run. Ctrl-C stops and removes all run-scoped containers, volumes, the network, and the temporary root. A watchdog performs the same cleanup if the parent script is killed.
+
+The dummy DC alone receives `SYS_ADMIN`, which Samba needs to write Windows ACL xattrs while provisioning `SYSVOL`; the application container receives no extra capability.
+
+Useful overrides:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DEV_HTTPS_PORT` | `8443` | HTTPS port bound to host loopback |
+| `DEV_SKIP_BUILD` | `0` | Set to `1` to reuse already-built local images |
+| `DEV_STEP_CA_IMAGE` | `docker.io/smallstep/step-ca:latest` | CA image; pin a tag or digest for reproducible CI |
+| `DEV_SERVER_IMAGE` | `ad-ds-simple-file-server-dev:latest` | Local file-server image name |
+| `DEV_AD_IMAGE` | `ad-ds-simple-file-server-ad-dev:latest` | Local AD/client image name |
+| `DEV_BACKUP_IMAGE` | `ad-ds-simple-file-server-backup-dev:latest` | Local rsync target image name |
+| `DEV_REALM` | `DEV.TEST` | Dummy Kerberos realm |
+| `DEV_WORKGROUP` | `DEV` | Dummy NetBIOS domain |
+| `DEV_DNS_DOMAIN` | `dev.test` | Dummy AD DNS zone |
+| `DEV_BASE_DN` | `DC=dev,DC=test` | Dummy directory base DN |
+| `DEV_ADMIN_USER` | `previewadmin` | Seeded Domain Admin login |
+| `DEV_ADMIN_PASSWORD` | `PreviewAdmin123!` | Seeded Domain Admin password |
+| `DEV_USER_PASSWORD` | `PreviewUser123!` | Shared password for seeded non-admin users |
+| `DEV_SEED_MB` | `8` | MiB per large seed file |
+| `DEV_ACTIVITY_INTERVAL_SECONDS` | `4` | Delay between SMB activity batches |
+| `DEV_BACKUP_INTERVAL_SECONDS` | `120` | Delay between completed preview backups |
+
+`DEV_REALM`, `DEV_DNS_DOMAIN`, and `DEV_BASE_DN` describe the same domain and must be changed together.
+
+## End-to-End Tests
+
+Run the same disposable stack headlessly with extensive assertions:
+
+```bash
+./scripts/test-e2e
+```
+
+The E2E suite verifies:
+
+- CA-issued TLS, hostname validation, HSTS, and CSP;
+- anonymous rejection, bad credentials, valid non-admin rejection, real Domain Admin login, JWT claims, bearer use, cookie flags, tamper rejection, and logout;
+- domain trust, group-to-folder mapping, nested and transitive group trees;
+- SMB allow/deny behavior and real file operations;
+- Data, Private, and FSLogix usage aggregation;
+- live `full_audit` ingestion, filters, facets, and pagination;
+- compression and querying of a closed daily audit log;
+- real rsync transfer progress, completed backup status, log output, and remote snapshot marker;
+- overview and system-health aggregation.
+
+The runner returns non-zero on the first failed assertion, prints bounded logs from every run-scoped service, and always removes its containers, volumes, network, and temporary CA root. Set `DEV_SKIP_BUILD=1` for a fast rerun against existing local images.
 
 ## Setup
 
@@ -124,6 +207,14 @@ Kerberos requires close time alignment.
    - optional `BACKUP_LOG_FILE` (default `/var/log/backup.log`)
    - optional `BACKUP_PROGRESS` (`auto`, `always`, or `never`; default `auto`)
    - optional `BACKUP_PROGRESS_INTERVAL_SECONDS` (default `10`)
+   - `WEB_HOSTNAME` (the DNS name in the HTTPS certificate)
+   - optional `WEB_HTTPS_PORT` (host port, default `443`)
+   - `STEP_CA_URL`
+   - `STEP_CA_FINGERPRINT`
+   - `STEP_CA_PROVISIONER`
+   - `STEP_CA_PROVISIONER_PASSWORD`
+
+   Setup generates a random `WEB_JWT_SECRET`. A one-time `STEP_CA_TOKEN` or a provisioner password file can be configured manually instead of keeping a provisioner password in `.env`.
 
    Optional:
    - `SAMBA_HOSTNAME` (defaults to `adsambafsrv`)
@@ -185,11 +276,90 @@ Kerberos requires close time alignment.
 - Semantics intentionally differ from `Data`: only the share root is reconciled (`03770` + ACL defaults), while user-created profile container folders/files are not recursively normalized.
 - Samba masks are profile-container oriented (`create mask = 0600`, `directory mask = 0700`) so profile payload stays user-private by default.
 
+## Read-only Web Console
+
+Open `https://<WEB_HOSTNAME>/` after setup. Only members of the group identified by `DOMAIN_ADMINS_SID` can sign in. The form accepts `DOMAIN\username`, `username@realm`, or an unqualified username (which is qualified with `WORKGROUP`).
+
+The console is intentionally operational and plain:
+
+- **Overview**: current capacity totals, active group count, recent activity, and backup state.
+- **File shares**: one selectable tree per active `FS_*` group/folder with recursively expanded user and nested-group membership, cycle markers, and a live filter.
+- **Storage / Data groups**: cached recursive size of every top-level `/Data` group folder.
+- **Storage / Users**: per-user `/Private + /FSLogix` totals with component sizes.
+- **Activity logs**: dynamic date, user, share, action, operation, result, and path filters with pagination.
+- **Backups**: read-only live progress, active transfer rows, snapshot name, and recent backup output.
+- **System**: domain trust, Samba configuration, TLS certificate, scanner, and audit archive health.
+
+The web API has no mutation endpoint other than session login/logout. Files, groups, ACLs, backup schedules, and retention cannot be changed from the console.
+
+### Authentication and sessions
+
+- Credentials are submitted only over HTTPS. The password is passed to `kinit` through stdin, is never placed in a process argument, and the temporary Kerberos credential cache is immediately removed.
+- After Kerberos succeeds, the service resolves the account SID and its complete group SID set through winbind. Login succeeds only when that set contains `DOMAIN_ADMINS_SID`.
+- Authentication is form-based; the browser never performs NTLM, SPNEGO, or Kerberos negotiation.
+- JWTs use HMAC-SHA256, default to eight hours, and are accepted from the protected cookie or an `Authorization: Bearer` header.
+- Login attempts are rate-limited per client address.
+- Responses set HSTS, a restrictive Content Security Policy, clickjacking protection, MIME sniffing protection, and no-store caching.
+
+### TLS with a local Smallstep CA
+
+Default enrollment uses `WEB_TLS_MODE=step`:
+
+```env
+WEB_ENABLED=true
+WEB_HOSTNAME=files.example.com
+WEB_HTTPS_PORT=443
+WEB_JWT_SECRET=<at-least-32-random-bytes>
+WEB_TLS_MODE=step
+STEP_CA_URL=https://ca.example.com:9000
+STEP_CA_FINGERPRINT=<root-certificate-fingerprint>
+STEP_CA_PROVISIONER=fileserver
+STEP_CA_PROVISIONER_PASSWORD=<provisioner-password>
+```
+
+At first startup the container bootstraps the CA root, requests a certificate for `WEB_HOSTNAME`, and stores its certificate, key, and Step client state on the persistent `state_data` volume. The `step ca renew --daemon` process renews the certificate; the HTTPS listener notices the certificate file change and reloads it.
+
+For secret-file based enrollment, set `STEP_CA_PROVISIONER_PASSWORD_FILE` to a mounted file. A single-use `STEP_CA_TOKEN` is also supported. To use externally managed files instead:
+
+```env
+WEB_TLS_MODE=files
+WEB_TLS_CERT_FILE=/state/tls/web.crt
+WEB_TLS_KEY_FILE=/state/tls/web.key
+```
+
+Smallstep trust configuration is reused from the state volume on normal restarts, so a temporary CA outage does not stop Samba or an already-certificate-equipped web service. Set `STEP_CA_REBOOTSTRAP=true` only when intentionally replacing the configured CA trust.
+
+Useful optional settings:
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `WEB_JWT_TTL_SECONDS` | `28800` | Session lifetime, 5 minutes to 7 days |
+| `WEB_LOGIN_ATTEMPTS_PER_5_MIN` | `10` | Per-address login attempt limit |
+| `WEB_USAGE_SCAN_INTERVAL_SECONDS` | `900` | Recursive storage scan interval |
+| `WEB_DIRECTORY_CACHE_SECONDS` | `300` | AD membership tree cache time |
+| `WEB_MAX_GROUP_NODES` | `10000` | Membership expansion safety limit |
+| `AUDIT_COMPRESS_AFTER_HOURS` | `24` | Minimum idle age before compressing a closed day |
+| `AUDIT_QUERY_MAX_DAYS` | `31` | Largest activity query window |
+
+If `WEB_ENABLED` is absent on an upgraded installation and no TLS settings/certificate exist, the web service stays disabled while Samba and audit collection continue. Set `WEB_ENABLED=true` after adding TLS configuration.
+
+## Audit Archive
+
+Samba already produced `full_audit` messages before this web UI was added. The collector now makes them durable:
+
+- it tails every `/var/log/samba/log.*` source, remembers inode and byte offsets in `/state/audit/collector-state.json`, and follows Samba rotation without duplicating a rotated file;
+- each event records timestamp, user, client address/name, share, VFS operation, read/write/list/session category, result, and path;
+- records are appended to `/state/audit/YYYY-MM-DD.jsonl`;
+- a closed, idle daily file becomes `.jsonl.gz`;
+- no audit retention deletion is performed, so capacity planning for the `state_data` volume is the operator's responsibility.
+
+Collection starts even when the web UI is disabled. Existing Samba log content is imported when the collector first starts, but audit data that Samba rotated away before this version was deployed cannot be recovered.
+
 ## Backups
 
 - Backups are enabled only if `BACKUP_DESTINATION` is non-empty.
 - Each run creates a timestamped snapshot under `snapshots/YYYYMMDDTHHMMSSZ` at the destination.
-- Backup job is scheduled daily at `BACKUP_START_HOUR` in container local time.
+- Backup job is scheduled daily at `BACKUP_START_HOUR` in UTC. The container and Compose service force `TZ=Etc/UTC`.
 - Sources synced to destination on each run:
   - `/data/private` -> `data/private`
   - `/data/groups` -> `data/groups`
@@ -205,6 +375,7 @@ Kerberos requires close time alignment.
 - Before uploading, the backup script measures all source files so it can report total upload progress.
 - Upload progress is logged per file every `BACKUP_PROGRESS_INTERVAL_SECONDS` seconds and again when a file reaches 100%, including percentage and transferred/remaining bytes with auto-scaled units.
 - `BACKUP_PROGRESS=auto` shows an interactive multi-line progress view only for TTY/manual runs. Current file uploads are shown as separate rows, capped at 12 rows, with the total progress row at the bottom. Use `always` to force it or `never` to suppress the bar. File and total progress are still logged.
+- Every run atomically updates `BACKUP_STATUS_FILE` (default `/state/backup-status.json`) with its state, current source, active files, byte totals, percentage, snapshot, and final result for the live web view.
 - Rclone-backed destinations cap concurrent file transfers at 12. Rsync remains single-streamed by rsync itself.
 - Retention logic:
   - daily: newest N snapshots
@@ -237,11 +408,14 @@ Kerberos requires close time alignment.
 
 ```bash
 docker compose logs -f samba
+docker compose logs -f samba | grep -E '\\[web\\]|\\[audit\\]'
 docker compose exec samba python3 /app/reconcile_shares.py
 docker compose exec samba sqlite3 /state/shares.db 'SELECT * FROM shares;'
 docker compose exec samba testparm -s
 docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
 docker compose exec samba sh -lc 'tail -n 200 /var/log/backup.log'
+docker compose exec samba sh -lc 'ls -lh /state/audit'
+docker compose exec samba python3 -m json.tool /state/backup-status.json
 ```
 
 ## Troubleshooting

@@ -2,6 +2,7 @@
 
 import datetime as dt
 import fcntl
+import json
 import os
 import re
 import subprocess
@@ -15,6 +16,7 @@ from urllib.parse import SplitResult, unquote, urlsplit
 
 LOCK_PATH = "/state/backup.lock"
 DEFAULT_BACKUP_LOG_FILE = "/var/log/backup.log"
+DEFAULT_BACKUP_STATUS_FILE = "/state/backup-status.json"
 DEFAULT_PROGRESS_MODE = "auto"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 10
 PROGRESS_BAR_WIDTH = 28
@@ -150,6 +152,102 @@ class BackupLogger:
 
 
 LOGGER = BackupLogger()
+
+
+class BackupStatus:
+    """Atomic machine-readable status consumed by the read-only web UI."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.value: Dict[str, object] = {
+            "enabled": True,
+            "state": "starting",
+            "percent": 0.0,
+            "transferredBytes": 0,
+            "totalBytes": 0,
+            "activeFiles": [],
+        }
+
+    def write(self, **changes: object) -> None:
+        self.value.update(changes)
+        self.value["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        try:
+            status_dir = os.path.dirname(self.path)
+            if status_dir:
+                os.makedirs(status_dir, exist_ok=True)
+            temp_path = f"{self.path}.tmp"
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(self.value, handle, separators=(",", ":"), sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+        except OSError as exc:
+            print(
+                f"[backup] WARNING: unable to update status file {self.path}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def begin(self, destination: str) -> None:
+        self.write(
+            state="starting",
+            startedAt=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            finishedAt=None,
+            destination=destination,
+            snapshot=None,
+            currentSource=None,
+            percent=0.0,
+            transferredBytes=0,
+            totalBytes=0,
+            activeFiles=[],
+            message="Starting backup",
+        )
+
+    def progress(self, reporter: "SyncProgressReporter") -> None:
+        active = []
+        for entry in reporter._visible_active_files():  # pylint: disable=protected-access
+            active.append(
+                {
+                    "path": entry.file_path,
+                    "percent": entry.percent,
+                    "transferredBytes": entry.transferred_bytes,
+                    "totalBytes": entry.total_bytes,
+                    "detail": entry.detail,
+                }
+            )
+        self.write(
+            state="running",
+            currentSource=reporter.source_path,
+            percent=round(reporter.overall_progress.percent, 2),
+            transferredBytes=reporter.overall_progress.transferred_bytes,
+            totalBytes=reporter.overall_progress.total_bytes,
+            activeFiles=active,
+            message=f"Syncing {reporter.source_path}",
+        )
+
+    def complete(self, message: str) -> None:
+        self.write(
+            state="completed",
+            finishedAt=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            percent=100.0,
+            transferredBytes=self.value.get("totalBytes", 0),
+            activeFiles=[],
+            currentSource=None,
+            message=message,
+        )
+
+    def fail(self, message: str) -> None:
+        self.write(
+            state="failed",
+            finishedAt=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            activeFiles=[],
+            message=message,
+        )
+
+
+BACKUP_STATUS: Optional[BackupStatus] = None
 
 
 def configure_logging() -> None:
@@ -541,12 +639,16 @@ class SyncProgressReporter:
         if progress.percent >= 100.0:
             self._complete_file(progress)
             self._sync_total_progress()
+        if BACKUP_STATUS is not None:
+            BACKUP_STATUS.progress(self)
 
     def finish(self, *, success: bool) -> None:
         if success:
             self.overall_progress.complete_source()
             self._render_dashboard()
             self._log_total_progress(self.now(), force=True)
+        if BACKUP_STATUS is not None:
+            BACKUP_STATUS.progress(self)
         self._clear_dashboard()
 
     def _known_file_size(self, file_path: Optional[str]) -> Optional[int]:
@@ -1230,6 +1332,7 @@ class RsyncBackend:
                 "rsync",
                 "-a",
                 "--delete",
+                "--mkpath",
                 "--progress",
                 "--outbuf=L",
                 f"{source_path}/",
@@ -1345,6 +1448,7 @@ def parse_snapshot_inventory(snapshot_names: List[str]) -> List[Snapshot]:
 
 
 def run_backup() -> int:
+    global BACKUP_STATUS
     destination_url = os.getenv("BACKUP_DESTINATION", "").strip()
     if not destination_url:
         log("BACKUP_DESTINATION is unset, skipping backup")
@@ -1366,6 +1470,10 @@ def run_backup() -> int:
     interactive_progress = should_show_progress_bar(progress_mode)
 
     destination = parse_destination(destination_url)
+    BACKUP_STATUS = BackupStatus(
+        os.getenv("BACKUP_STATUS_FILE", DEFAULT_BACKUP_STATUS_FILE).strip()
+    )
+    BACKUP_STATUS.begin(redact_destination(destination.raw_url))
     backend = build_backend(destination)
     try:
         log(f"Starting backup to {redact_destination(destination.raw_url)}")
@@ -1373,11 +1481,17 @@ def run_backup() -> int:
         existing = set(backend.list_snapshots())
         snapshot_name = choose_snapshot_name(existing)
         log(f"Creating snapshot {snapshot_name}")
+        BACKUP_STATUS.write(snapshot=snapshot_name, message="Measuring backup payload")
 
         log("Measuring backup payload size")
         source_sizes, total_bytes = measure_backup_payload(sources)
         log(f"Backup payload size: {format_bytes(total_bytes)}")
         overall_progress = OverallProgress(total_bytes)
+        BACKUP_STATUS.write(
+            state="running",
+            totalBytes=total_bytes,
+            message=f"Backup payload: {format_bytes(total_bytes)}",
+        )
 
         for source_path, destination_path in sources:
             log(f"Syncing {source_path}")
@@ -1407,6 +1521,9 @@ def run_backup() -> int:
 
         log(
             f"Backup completed (snapshots total={len(snapshots)}, retained={len(retained)}, pruned={deleted_count})"
+        )
+        BACKUP_STATUS.complete(
+            f"Backup completed; {len(retained)} snapshot(s) retained"
         )
         return 0
     finally:
@@ -1442,6 +1559,8 @@ def main() -> int:
             return with_lock()
         except Exception as exc:  # pylint: disable=broad-except
             log(f"ERROR: {exc}")
+            if BACKUP_STATUS is not None:
+                BACKUP_STATUS.fail(str(exc))
             return 1
     finally:
         close_logging()
