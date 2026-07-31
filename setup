@@ -141,6 +141,9 @@ write_env_file() {
   local acme_ca_server=""
   local acme_ca_certificates_source=""
   local acme_ca_certificates_source_dir=""
+  local acme_ca_certificates_url=""
+  local acme_ca_certificates_insecure_download="false"
+  local acme_ca_certificates_insecure_input=""
   local acme_http_port="80"
   local acme_http_port_input=""
   local web_hostname_input=""
@@ -219,13 +222,29 @@ write_env_file() {
   read -r -p "WEB_HTTPS_PORT [443]: " web_https_port
   web_https_port="${web_https_port:-443}"
   prompt_value acme_ca_server "ACME_CA_SERVER (e.g. https://ca.internal/acme/acme/directory)"
-  prompt_value acme_ca_certificates_source "ACME CA root bundle (PEM file on this host)"
-  if [[ ! -s "$acme_ca_certificates_source" ]]; then
-    printf "ACME CA root bundle is not a readable file: %s\n" "$acme_ca_certificates_source" >&2
-    return 1
+  read -r -p "ACME_CA_CERTIFICATES_URL (optional one-time download; Enter to import a local PEM file): " acme_ca_certificates_url
+  if [[ -n "$acme_ca_certificates_url" ]]; then
+    case "$acme_ca_certificates_url" in
+      https://*) ;;
+      *)
+        printf "ACME_CA_CERTIFICATES_URL must use https://\n" >&2
+        return 1
+        ;;
+    esac
+    read -r -p "Allow untrusted TLS for this one-time root download? [y/N]: " acme_ca_certificates_insecure_input
+    case "$acme_ca_certificates_insecure_input" in
+      y|Y|yes|YES) acme_ca_certificates_insecure_download=true ;;
+      *) acme_ca_certificates_insecure_download=false ;;
+    esac
+  else
+    prompt_value acme_ca_certificates_source "ACME CA root bundle (PEM file on this host)"
+    if [[ ! -s "$acme_ca_certificates_source" ]]; then
+      printf "ACME CA root bundle is not a readable file: %s\n" "$acme_ca_certificates_source" >&2
+      return 1
+    fi
+    acme_ca_certificates_source_dir="$(cd "$(dirname "$acme_ca_certificates_source")" && pwd)"
+    acme_ca_certificates_source="${acme_ca_certificates_source_dir}/$(basename "$acme_ca_certificates_source")"
   fi
-  acme_ca_certificates_source_dir="$(cd "$(dirname "$acme_ca_certificates_source")" && pwd)"
-  acme_ca_certificates_source="${acme_ca_certificates_source_dir}/$(basename "$acme_ca_certificates_source")"
   read -r -p "ACME_HTTP_PORT (HTTP-01 host port) [80]: " acme_http_port_input
   acme_http_port="${acme_http_port_input:-80}"
 
@@ -289,6 +308,8 @@ WEB_JWT_SECRET=${web_jwt_secret}
 WEB_TLS_MODE=acme
 ACME_CA_SERVER=${acme_ca_server}
 ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem
+ACME_CA_CERTIFICATES_URL=${acme_ca_certificates_url}
+ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=${acme_ca_certificates_insecure_download}
 ACME_HTTP_LISTEN=:80
 ACME_HTTP_PORT=${acme_http_port}
 EOF
@@ -300,11 +321,13 @@ EOF
   printf "Building image...\n"
   docker compose build samba
 
-  printf "Importing ACME CA root bundle...\n"
-  docker compose run --rm --no-deps -T \
-    --entrypoint /bin/bash samba -lc \
-    'install -d -m 0755 "$(dirname "$ACME_CA_CERTIFICATES")" && dd of="$ACME_CA_CERTIFICATES" status=none && chmod 0644 "$ACME_CA_CERTIFICATES"' \
-    < "$acme_ca_certificates_source"
+  if [[ -n "$acme_ca_certificates_source" ]]; then
+    printf "Importing ACME CA root bundle...\n"
+    docker compose run --rm --no-deps -T \
+      --entrypoint /bin/bash samba -lc \
+      'install -d -m 0755 "$(dirname "$ACME_CA_CERTIFICATES")" && dd of="$ACME_CA_CERTIFICATES" status=none && chmod 0644 "$ACME_CA_CERTIFICATES"' \
+      < "$acme_ca_certificates_source"
+  fi
 
   printf "Provisioning service account %s...\n" "$SERVICE_ACCOUNT_NAME"
   docker compose run --rm --entrypoint /bin/bash samba -lc '
@@ -364,6 +387,8 @@ WEB_JWT_SECRET=${web_jwt_secret}
 WEB_TLS_MODE=acme
 ACME_CA_SERVER=${acme_ca_server}
 ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem
+ACME_CA_CERTIFICATES_URL=${acme_ca_certificates_url}
+ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=${acme_ca_certificates_insecure_download}
 ACME_HTTP_LISTEN=:80
 ACME_HTTP_PORT=${acme_http_port}
 # Optional overrides:

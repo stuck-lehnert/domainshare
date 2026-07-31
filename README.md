@@ -211,10 +211,10 @@ The runner returns non-zero on the first failed assertion, prints bounded logs f
    - `WEB_HOSTNAME` (the DNS name in the HTTPS certificate)
    - optional `WEB_HTTPS_PORT` (host port, default `443`)
    - `ACME_CA_SERVER` (ACME directory URL)
-   - ACME CA root bundle (a host PEM file imported into the persistent state volume)
+   - either an ACME CA root bundle on the host or an `ACME_CA_CERTIFICATES_URL` for one-time retrieval
    - optional `ACME_HTTP_PORT` (HTTP-01 host port, default `80`)
 
-   Setup generates a random `WEB_JWT_SECRET`, stores only the generic ACME settings, and imports the public CA root as `/state/tls/acme-ca-certificates.pem`.
+   Setup generates a random `WEB_JWT_SECRET` and either imports the selected public CA root or configures its one-time download to `/state/tls/acme-ca-certificates.pem`.
 
    Optional:
    - `SAMBA_HOSTNAME` (defaults to `adsambafsrv`)
@@ -313,11 +313,17 @@ WEB_JWT_SECRET=<at-least-32-random-bytes>
 WEB_TLS_MODE=acme
 ACME_CA_SERVER=https://ca.internal/acme/acme/directory
 ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem
+ACME_CA_CERTIFICATES_URL=https://ca.internal/roots.pem
+ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=true
 ACME_HTTP_LISTEN=:80
 ACME_HTTP_PORT=80
 ```
 
-`ACME_CA_CERTIFICATES` is a path inside the file-server container. The setup script imports the selected host PEM bundle at the path above; manual deployments must copy or mount the bundle there. The CA must be able to resolve `WEB_HOSTNAME` and reach `http://WEB_HOSTNAME/.well-known/acme-challenge/...` on port 80. `ACME_HTTP_LISTEN` controls the in-container standalone challenge listener and `ACME_HTTP_PORT` controls the Compose host-port mapping.
+`ACME_CA_CERTIFICATES` is the persistent destination inside the file-server container. If that path does not exist and `ACME_CA_CERTIFICATES_URL` is set, the service downloads at most 4 MiB over HTTPS, validates that the result contains readable certificate data, and atomically installs it. Once the destination exists, it is never downloaded or overwritten again—not even when it is empty or invalid. Removing the file is therefore an explicit operator action that permits a new bootstrap download.
+
+HTTPS verification is enabled by default. `ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=true` explicitly enables a one-time trust-on-first-use bootstrap equivalent to `curl -k`; it is useful when the server certificate is signed by the very root being fetched. This protects subsequent starts but cannot protect the first download from a man-in-the-middle attack, so compare the downloaded root fingerprint through an independent channel when possible. Instead of downloading, setup can import a local PEM bundle into the same destination.
+
+The CA must be able to resolve `WEB_HOSTNAME` and reach `http://WEB_HOSTNAME/.well-known/acme-challenge/...` on port 80. `ACME_HTTP_LISTEN` controls the in-container standalone challenge listener and `ACME_HTTP_PORT` controls the Compose host-port mapping.
 
 The equivalent Traefik settings translate as follows:
 
@@ -326,7 +332,8 @@ The equivalent Traefik settings translate as follows:
 | `acme.httpchallenge=true` | `WEB_TLS_MODE=acme` |
 | `acme.httpchallenge.entrypoint=http` | `ACME_HTTP_LISTEN=:80` and `ACME_HTTP_PORT=80` |
 | `acme.caserver=https://ca.internal/acme/acme/directory` | `ACME_CA_SERVER=https://ca.internal/acme/acme/directory` |
-| `acme.cacertificates=/traefik/stepca/roots.pem` | `ACME_CA_CERTIFICATES=<the mounted PEM path inside this container>` |
+| `acme.cacertificates=/traefik/stepca/roots.pem` | `ACME_CA_CERTIFICATES=<persistent PEM destination inside this container>` |
+| one-time equivalent of `curl https://ca.internal/roots.pem -k` | `ACME_CA_CERTIFICATES_URL=https://ca.internal/roots.pem` and `ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=true` |
 
 The client uses [`step ca certificate --acme --root --standalone`](https://smallstep.com/docs/step-cli/reference/ca/certificate/) and periodically checks whether the certificate needs renewal. Renewal is a fresh ACME order, so this mode is not coupled to a proprietary renewal endpoint. The HTTPS listener reloads the replaced certificate files.
 
@@ -356,6 +363,8 @@ Useful optional settings:
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
+| `ACME_CA_CERTIFICATES_URL` | unset | HTTPS URL used only when the persistent root bundle does not exist |
+| `ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD` | `false` | Disable TLS verification only for that initial root download |
 | `WEB_TLS_AUTORENEW` | `true` | Renew managed certificates automatically |
 | `ACME_RENEW_CHECK_SECONDS` | `900` | Interval for ACME renewal checks; minimum 60 seconds |
 | `WEB_JWT_TTL_SECONDS` | `28800` | Session lifetime, 5 minutes to 7 days |

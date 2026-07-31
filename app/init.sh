@@ -343,6 +343,77 @@ selected_tls_mode() {
   esac
 }
 
+ensure_acme_ca_certificates() {
+  local target="$ACME_CA_CERTIFICATES"
+  local download_url="${ACME_CA_CERTIFICATES_URL:-}"
+  local download_tmp="${target}.download.tmp"
+  local insecure=false
+
+  if [[ ! -e "$target" ]]; then
+    if [[ -z "$download_url" ]]; then
+      printf '[init] ERROR: ACME_CA_CERTIFICATES does not exist and ACME_CA_CERTIFICATES_URL is unset: %s\n' "$target" >&2
+      return 1
+    fi
+    case "$download_url" in
+      https://*) ;;
+      *)
+        printf '[init] ERROR: ACME_CA_CERTIFICATES_URL must use https://\n' >&2
+        return 1
+        ;;
+    esac
+    if env_is_true "${ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD:-false}"; then
+      insecure=true
+      log 'WARNING: downloading the initial ACME CA certificate bundle without TLS verification (one-time TOFU bootstrap).'
+    else
+      log 'Downloading the initial ACME CA certificate bundle with TLS verification.'
+    fi
+
+    mkdir -p "$(dirname "$target")"
+    rm -f "$download_tmp"
+    if ! python3 - "$download_url" "$download_tmp" "$insecure" <<'PY'
+import ssl
+import sys
+import urllib.parse
+import urllib.request
+
+url, output, insecure_value = sys.argv[1:]
+context = ssl.create_default_context()
+if insecure_value == "true":
+    context = ssl._create_unverified_context()  # noqa: SLF001
+request = urllib.request.Request(url, headers={"User-Agent": "ad-file-server-ca-bootstrap/1"})
+with urllib.request.urlopen(request, context=context, timeout=30) as response:
+    if urllib.parse.urlsplit(response.geturl()).scheme != "https":
+        raise RuntimeError("CA certificate download redirected away from HTTPS")
+    payload = response.read(4 * 1024 * 1024 + 1)
+if not payload or len(payload) > 4 * 1024 * 1024:
+    raise RuntimeError("CA certificate download is empty or exceeds 4 MiB")
+with open(output, "xb") as handle:
+    handle.write(payload)
+PY
+    then
+      rm -f "$download_tmp"
+      return 1
+    fi
+    if ! step certificate inspect "$download_tmp" >/dev/null 2>&1; then
+      printf '[init] ERROR: downloaded ACME CA certificate bundle is not valid PEM certificate data\n' >&2
+      rm -f "$download_tmp"
+      return 1
+    fi
+    chmod 0644 "$download_tmp"
+    mv -f "$download_tmp" "$target"
+    log "Stored the initial ACME CA certificate bundle at ${target}; it will not be downloaded again while this file exists."
+  fi
+
+  if [[ ! -s "$target" ]]; then
+    printf '[init] ERROR: ACME_CA_CERTIFICATES exists but is empty: %s\n' "$target" >&2
+    return 1
+  fi
+  if ! step certificate inspect "$target" >/dev/null 2>&1; then
+    printf '[init] ERROR: ACME_CA_CERTIFICATES is not valid PEM certificate data: %s\n' "$target" >&2
+    return 1
+  fi
+}
+
 request_acme_certificate() {
   local cert_tmp="${WEB_TLS_CERT_FILE}.acme.tmp"
   local key_tmp="${WEB_TLS_KEY_FILE}.acme.tmp"
@@ -392,10 +463,7 @@ configure_web_tls() {
   if [[ "$tls_mode" == "acme" ]]; then
     require_env ACME_CA_SERVER
     require_env ACME_CA_CERTIFICATES
-    if [[ ! -s "$ACME_CA_CERTIFICATES" ]]; then
-      printf '[init] ERROR: ACME_CA_CERTIFICATES is not a readable PEM bundle: %s\n' "$ACME_CA_CERTIFICATES" >&2
-      return 1
-    fi
+    ensure_acme_ca_certificates
     if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" ]]; then
       request_acme_certificate
     fi

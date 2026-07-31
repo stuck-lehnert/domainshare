@@ -241,12 +241,6 @@ fi
 preview_tmp_root=${TMPDIR:-/tmp}
 ca_root_file="${preview_tmp_root%/}/${run_id}-root-ca.crt"
 "$engine" exec "$ca_container" cat /home/step/certs/root_ca.crt > "$ca_root_file"
-"$engine" run --rm -i \
-  -v "$state_volume:/state" \
-  --entrypoint /bin/bash \
-  "$server_image" -lc \
-  'install -d -m 0755 /state/tls && dd of=/state/tls/acme-ca-certificates.pem status=none && chmod 0644 /state/tls/acme-ca-certificates.pem' \
-  < "$ca_root_file"
 
 printf 'starting disposable rsync backup target\n'
 "$engine" run -d \
@@ -325,6 +319,8 @@ printf 'starting actual file server and HTTPS web UI\n'
   -e "WEB_TLS_MODE=acme" \
   -e "ACME_CA_SERVER=https://ca.${dev_dns_domain}:9000/acme/acme/directory" \
   -e "ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem" \
+  -e "ACME_CA_CERTIFICATES_URL=https://ca.${dev_dns_domain}:9000/roots.pem" \
+  -e "ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=true" \
   -e "ACME_HTTP_LISTEN=:80" \
   -e "WEB_USAGE_SCAN_INTERVAL_SECONDS=60" \
   -e "WEB_DIRECTORY_CACHE_SECONDS=30" \
@@ -348,6 +344,27 @@ if ! wait_for_exec "$files_container" 240 python3 -c \
   'import ssl,urllib.request; print(urllib.request.urlopen("https://127.0.0.1:8443/healthz", context=ssl._create_unverified_context(), timeout=3).status)'; then
   show_logs
   die 'file server web UI did not become healthy'
+fi
+
+if [[ $run_e2e == 1 ]]; then
+  printf 'validating one-time untrusted CA root retrieval across a restart\n'
+  initial_ca_bundle_stat=$("$engine" exec "$files_container" stat -c '%i:%s:%Y' /state/tls/acme-ca-certificates.pem)
+  "$engine" restart "$files_container" >/dev/null
+  if ! wait_for_exec "$files_container" 240 python3 -c \
+    'import ssl,urllib.request; print(urllib.request.urlopen("https://127.0.0.1:8443/healthz", context=ssl._create_unverified_context(), timeout=3).status)'; then
+    show_logs
+    die 'file server web UI did not become healthy after the one-time CA download restart check'
+  fi
+  restarted_ca_bundle_stat=$("$engine" exec "$files_container" stat -c '%i:%s:%Y' /state/tls/acme-ca-certificates.pem)
+  if [[ "$initial_ca_bundle_stat" != "$restarted_ca_bundle_stat" ]]; then
+    show_logs
+    die 'persisted ACME CA certificate bundle changed during restart'
+  fi
+  ca_bundle_download_count=$("$engine" logs "$files_container" 2>&1 | awk '/Stored the initial ACME CA certificate bundle/ { count++ } END { print count + 0 }')
+  if [[ "$ca_bundle_download_count" != 1 ]]; then
+    show_logs
+    die "expected exactly one ACME CA certificate download, got ${ca_bundle_download_count}"
+  fi
 fi
 
 printf 'starting continuous authenticated SMB activity client\n'
