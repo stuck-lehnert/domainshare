@@ -138,10 +138,11 @@ write_env_file() {
   local web_hostname=""
   local web_https_port="443"
   local web_jwt_secret=""
-  local step_ca_url=""
-  local step_ca_fingerprint=""
-  local step_ca_provisioner=""
-  local step_ca_provisioner_password=""
+  local acme_ca_server=""
+  local acme_ca_certificates_source=""
+  local acme_ca_certificates_source_dir=""
+  local acme_http_port="80"
+  local acme_http_port_input=""
   local web_hostname_input=""
   local service_account_sam=""
   local fslogix_group_prompt=""
@@ -217,10 +218,16 @@ write_env_file() {
   web_hostname="${web_hostname_input:-$web_hostname}"
   read -r -p "WEB_HTTPS_PORT [443]: " web_https_port
   web_https_port="${web_https_port:-443}"
-  prompt_value step_ca_url "STEP_CA_URL (e.g. https://ca.example.com:9000)"
-  prompt_value step_ca_fingerprint "STEP_CA_FINGERPRINT"
-  prompt_value step_ca_provisioner "STEP_CA_PROVISIONER (JWK provisioner name)"
-  prompt_value step_ca_provisioner_password "STEP_CA_PROVISIONER_PASSWORD" true
+  prompt_value acme_ca_server "ACME_CA_SERVER (e.g. https://ca.internal/acme/acme/directory)"
+  prompt_value acme_ca_certificates_source "ACME CA root bundle (PEM file on this host)"
+  if [[ ! -s "$acme_ca_certificates_source" ]]; then
+    printf "ACME CA root bundle is not a readable file: %s\n" "$acme_ca_certificates_source" >&2
+    return 1
+  fi
+  acme_ca_certificates_source_dir="$(cd "$(dirname "$acme_ca_certificates_source")" && pwd)"
+  acme_ca_certificates_source="${acme_ca_certificates_source_dir}/$(basename "$acme_ca_certificates_source")"
+  read -r -p "ACME_HTTP_PORT (HTTP-01 host port) [80]: " acme_http_port_input
+  acme_http_port="${acme_http_port_input:-80}"
 
   web_jwt_secret="$(python3 - <<'PY'
 import secrets
@@ -279,11 +286,11 @@ WEB_ENABLED=true
 WEB_HOSTNAME=${web_hostname}
 WEB_HTTPS_PORT=${web_https_port}
 WEB_JWT_SECRET=${web_jwt_secret}
-WEB_TLS_MODE=step
-STEP_CA_URL=${step_ca_url}
-STEP_CA_FINGERPRINT=${step_ca_fingerprint}
-STEP_CA_PROVISIONER=${step_ca_provisioner}
-STEP_CA_PROVISIONER_PASSWORD=${step_ca_provisioner_password}
+WEB_TLS_MODE=acme
+ACME_CA_SERVER=${acme_ca_server}
+ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem
+ACME_HTTP_LISTEN=:80
+ACME_HTTP_PORT=${acme_http_port}
 EOF
 
   cp "$BOOTSTRAP_ENV_FILE" "$ENV_FILE"
@@ -292,6 +299,12 @@ EOF
 
   printf "Building image...\n"
   docker compose build samba
+
+  printf "Importing ACME CA root bundle...\n"
+  docker compose run --rm --no-deps -T \
+    --entrypoint /bin/bash samba -lc \
+    'install -d -m 0755 "$(dirname "$ACME_CA_CERTIFICATES")" && dd of="$ACME_CA_CERTIFICATES" status=none && chmod 0644 "$ACME_CA_CERTIFICATES"' \
+    < "$acme_ca_certificates_source"
 
   printf "Provisioning service account %s...\n" "$SERVICE_ACCOUNT_NAME"
   docker compose run --rm --entrypoint /bin/bash samba -lc '
@@ -348,11 +361,11 @@ WEB_ENABLED=true
 WEB_HOSTNAME=${web_hostname}
 WEB_HTTPS_PORT=${web_https_port}
 WEB_JWT_SECRET=${web_jwt_secret}
-WEB_TLS_MODE=step
-STEP_CA_URL=${step_ca_url}
-STEP_CA_FINGERPRINT=${step_ca_fingerprint}
-STEP_CA_PROVISIONER=${step_ca_provisioner}
-STEP_CA_PROVISIONER_PASSWORD=${step_ca_provisioner_password}
+WEB_TLS_MODE=acme
+ACME_CA_SERVER=${acme_ca_server}
+ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem
+ACME_HTTP_LISTEN=:80
+ACME_HTTP_PORT=${acme_http_port}
 # Optional overrides:
 # LDAP_URI=ldaps://${domain}
 # LDAP_BASE_DN=DC=example,DC=com
@@ -375,7 +388,7 @@ STEP_CA_PROVISIONER_PASSWORD=${step_ca_provisioner_password}
 # WEB_DIRECTORY_CACHE_SECONDS=300
 # AUDIT_COMPRESS_AFTER_HOURS=24
 # AUDIT_QUERY_MAX_DAYS=31
-# STEP_CA_PROVISIONER_PASSWORD_FILE=/run/secrets/step-ca-provisioner-password
+# ACME_RENEW_CHECK_SECONDS=900
 # WEB_TLS_CERT_FILE=/state/tls/web.crt
 # WEB_TLS_KEY_FILE=/state/tls/web.key
 EOF

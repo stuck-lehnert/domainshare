@@ -118,7 +118,7 @@ Run a complete disposable environment with Docker or Podman:
 The launcher builds the current application and starts an isolated, run-scoped network containing:
 
 - a real Samba AD DC for `DEV.TEST`, seeded with users, nested groups, and three `FS_*` groups;
-- a real Smallstep CA that issues the web UI certificate for `localhost`;
+- a real Smallstep CA whose ACME provisioner issues the web UI certificate for `files.localhost`;
 - an authenticated rsync daemon used by the normal backup implementation;
 - the actual file-server image, joined to the dummy domain;
 - a continuous SMB client that reads, writes, and lists files as several domain users.
@@ -126,7 +126,7 @@ The launcher builds the current application and starts an isolated, run-scoped n
 The preview starts with group, Private, FSLogix, and historical audit data. The client keeps current-day audit activity moving, while a real backup runs immediately and repeats in the background. Open the URL and use the credentials printed by the launcher. Defaults are:
 
 ```text
-URL:      https://localhost:8443
+URL:      https://files.localhost:8443
 Username: DEV\previewadmin
 Password: PreviewAdmin123!
 ```
@@ -140,8 +140,9 @@ Useful overrides:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DEV_HTTPS_PORT` | `8443` | HTTPS port bound to host loopback |
+| `DEV_WEB_HOSTNAME` | `files.localhost` | HTTPS name validated by the disposable ACME CA |
 | `DEV_SKIP_BUILD` | `0` | Set to `1` to reuse already-built local images |
-| `DEV_STEP_CA_IMAGE` | `docker.io/smallstep/step-ca:latest` | CA image; pin a tag or digest for reproducible CI |
+| `DEV_CA_IMAGE` | `docker.io/smallstep/step-ca:latest` | CA image; pin a tag or digest for reproducible CI |
 | `DEV_SERVER_IMAGE` | `ad-ds-simple-file-server-dev:latest` | Local file-server image name |
 | `DEV_AD_IMAGE` | `ad-ds-simple-file-server-ad-dev:latest` | Local AD/client image name |
 | `DEV_BACKUP_IMAGE` | `ad-ds-simple-file-server-backup-dev:latest` | Local rsync target image name |
@@ -209,12 +210,11 @@ The runner returns non-zero on the first failed assertion, prints bounded logs f
    - optional `BACKUP_PROGRESS_INTERVAL_SECONDS` (default `10`)
    - `WEB_HOSTNAME` (the DNS name in the HTTPS certificate)
    - optional `WEB_HTTPS_PORT` (host port, default `443`)
-   - `STEP_CA_URL`
-   - `STEP_CA_FINGERPRINT`
-   - `STEP_CA_PROVISIONER`
-   - `STEP_CA_PROVISIONER_PASSWORD`
+   - `ACME_CA_SERVER` (ACME directory URL)
+   - ACME CA root bundle (a host PEM file imported into the persistent state volume)
+   - optional `ACME_HTTP_PORT` (HTTP-01 host port, default `80`)
 
-   Setup generates a random `WEB_JWT_SECRET`. A one-time `STEP_CA_TOKEN` or a provisioner password file can be configured manually instead of keeping a provisioner password in `.env`.
+   Setup generates a random `WEB_JWT_SECRET`, stores only the generic ACME settings, and imports the public CA root as `/state/tls/acme-ca-certificates.pem`.
 
    Optional:
    - `SAMBA_HOSTNAME` (defaults to `adsambafsrv`)
@@ -301,25 +301,50 @@ The web API has no mutation endpoint other than session login/logout. Files, gro
 - Login attempts are rate-limited per client address.
 - Responses set HSTS, a restrictive Content Security Policy, clickjacking protection, MIME sniffing protection, and no-store caching.
 
-### TLS with a local Smallstep CA
+### TLS with an internal ACME CA
 
-Default enrollment uses `WEB_TLS_MODE=step`:
+The default uses standard ACME HTTP-01 enrollment. The names deliberately describe the protocol and inputs rather than a particular CA product:
 
 ```env
 WEB_ENABLED=true
 WEB_HOSTNAME=files.example.com
 WEB_HTTPS_PORT=443
 WEB_JWT_SECRET=<at-least-32-random-bytes>
-WEB_TLS_MODE=step
-STEP_CA_URL=https://ca.example.com:9000
-STEP_CA_FINGERPRINT=<root-certificate-fingerprint>
-STEP_CA_PROVISIONER=fileserver
-STEP_CA_PROVISIONER_PASSWORD=<provisioner-password>
+WEB_TLS_MODE=acme
+ACME_CA_SERVER=https://ca.internal/acme/acme/directory
+ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem
+ACME_HTTP_LISTEN=:80
+ACME_HTTP_PORT=80
 ```
 
-At first startup the container bootstraps the CA root, requests a certificate for `WEB_HOSTNAME`, and stores its certificate, key, and Step client state on the persistent `state_data` volume. The `step ca renew --daemon` process renews the certificate; the HTTPS listener notices the certificate file change and reloads it.
+`ACME_CA_CERTIFICATES` is a path inside the file-server container. The setup script imports the selected host PEM bundle at the path above; manual deployments must copy or mount the bundle there. The CA must be able to resolve `WEB_HOSTNAME` and reach `http://WEB_HOSTNAME/.well-known/acme-challenge/...` on port 80. `ACME_HTTP_LISTEN` controls the in-container standalone challenge listener and `ACME_HTTP_PORT` controls the Compose host-port mapping.
 
-For secret-file based enrollment, set `STEP_CA_PROVISIONER_PASSWORD_FILE` to a mounted file. A single-use `STEP_CA_TOKEN` is also supported. To use externally managed files instead:
+The equivalent Traefik settings translate as follows:
+
+| Traefik setting | File-server setting |
+| --- | --- |
+| `acme.httpchallenge=true` | `WEB_TLS_MODE=acme` |
+| `acme.httpchallenge.entrypoint=http` | `ACME_HTTP_LISTEN=:80` and `ACME_HTTP_PORT=80` |
+| `acme.caserver=https://ca.internal/acme/acme/directory` | `ACME_CA_SERVER=https://ca.internal/acme/acme/directory` |
+| `acme.cacertificates=/traefik/stepca/roots.pem` | `ACME_CA_CERTIFICATES=<the mounted PEM path inside this container>` |
+
+The client uses [`step ca certificate --acme --root --standalone`](https://smallstep.com/docs/step-cli/reference/ca/certificate/) and periodically checks whether the certificate needs renewal. Renewal is a fresh ACME order, so this mode is not coupled to a proprietary renewal endpoint. The HTTPS listener reloads the replaced certificate files.
+
+A generic direct-CA/JWK or token enrollment mode remains available when ACME HTTP-01 cannot be routed:
+
+```env
+WEB_TLS_MODE=ca
+TLS_CA_URL=https://ca.internal:9000
+TLS_CA_FINGERPRINT=<root-certificate-fingerprint>
+TLS_CA_PROVISIONER=fileserver
+TLS_CA_PROVISIONER_PASSWORD=<provisioner-password>
+# TLS_CA_PROVISIONER_PASSWORD_FILE=/run/secrets/ca-provisioner-password
+# TLS_CA_TOKEN=<single-use-bootstrap-token>
+# TLS_CA_REBOOTSTRAP=false
+# TLS_CA_STATE_DIR=/state/tls-client
+```
+
+Externally managed certificate files can be used instead:
 
 ```env
 WEB_TLS_MODE=files
@@ -327,12 +352,12 @@ WEB_TLS_CERT_FILE=/state/tls/web.crt
 WEB_TLS_KEY_FILE=/state/tls/web.key
 ```
 
-Smallstep trust configuration is reused from the state volume on normal restarts, so a temporary CA outage does not stop Samba or an already-certificate-equipped web service. Set `STEP_CA_REBOOTSTRAP=true` only when intentionally replacing the configured CA trust.
-
 Useful optional settings:
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
+| `WEB_TLS_AUTORENEW` | `true` | Renew managed certificates automatically |
+| `ACME_RENEW_CHECK_SECONDS` | `900` | Interval for ACME renewal checks; minimum 60 seconds |
 | `WEB_JWT_TTL_SECONDS` | `28800` | Session lifetime, 5 minutes to 7 days |
 | `WEB_LOGIN_ATTEMPTS_PER_5_MIN` | `10` | Per-address login attempt limit |
 | `WEB_USAGE_SCAN_INTERVAL_SECONDS` | `900` | Recursive storage scan interval |

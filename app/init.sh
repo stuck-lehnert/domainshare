@@ -303,7 +303,8 @@ web_should_start() {
     env_is_true "$WEB_ENABLED"
     return
   fi
-  if [[ -n "${STEP_CA_URL:-}" ]] || \
+  if [[ -n "${ACME_CA_SERVER:-}" ]] || \
+     [[ -n "${TLS_CA_URL:-}" ]] || \
      [[ -s "${WEB_TLS_CERT_FILE:-/state/tls/web.crt}" ]]; then
     return 0
   fi
@@ -328,17 +329,57 @@ ensure_web_jwt_secret() {
   log 'WEB_JWT_SECRET was not provided; using a persistent generated secret.'
 }
 
+selected_tls_mode() {
+  case "${WEB_TLS_MODE:-}" in
+    '')
+      if [[ -n "${ACME_CA_SERVER:-}" ]]; then
+        printf 'acme'
+      else
+        printf 'ca'
+      fi
+      ;;
+    acme|ca|files) printf '%s' "$WEB_TLS_MODE" ;;
+    *) return 1 ;;
+  esac
+}
+
+request_acme_certificate() {
+  local cert_tmp="${WEB_TLS_CERT_FILE}.acme.tmp"
+  local key_tmp="${WEB_TLS_KEY_FILE}.acme.tmp"
+
+  rm -f "$cert_tmp" "$key_tmp"
+  log "Requesting ACME HTTPS certificate for ${WEB_HOSTNAME}"
+  if ! step ca certificate "$WEB_HOSTNAME" "$cert_tmp" "$key_tmp" \
+    --acme "$ACME_CA_SERVER" \
+    --root "$ACME_CA_CERTIFICATES" \
+    --standalone \
+    --http-listen "${ACME_HTTP_LISTEN:-:80}" \
+    --force; then
+    rm -f "$cert_tmp" "$key_tmp"
+    return 1
+  fi
+
+  chmod 0600 "$key_tmp"
+  chmod 0644 "$cert_tmp"
+  mv -f "$key_tmp" "$WEB_TLS_KEY_FILE"
+  mv -f "$cert_tmp" "$WEB_TLS_CERT_FILE"
+}
+
 configure_web_tls() {
-  local tls_mode="${WEB_TLS_MODE:-step}"
-  local tls_dir=""
+  local tls_mode=""
   local provisioner_password_file=""
 
+  if ! tls_mode="$(selected_tls_mode)"; then
+    printf '[init] ERROR: WEB_TLS_MODE must be acme, ca, or files\n' >&2
+    return 1
+  fi
+  export ACTIVE_WEB_TLS_MODE="$tls_mode"
   export WEB_HOSTNAME="${WEB_HOSTNAME:-${AD_DNS_NAME}}"
   export WEB_BIND_PORT="${WEB_BIND_PORT:-8443}"
   export WEB_TLS_CERT_FILE="${WEB_TLS_CERT_FILE:-/state/tls/web.crt}"
   export WEB_TLS_KEY_FILE="${WEB_TLS_KEY_FILE:-/state/tls/web.key}"
-  tls_dir="$(dirname "$WEB_TLS_CERT_FILE")"
-  mkdir -p "$tls_dir" "$(dirname "$WEB_TLS_KEY_FILE")"
+  export STEPPATH="${TLS_CA_STATE_DIR:-/state/tls-client}"
+  mkdir -p "$(dirname "$WEB_TLS_CERT_FILE")" "$(dirname "$WEB_TLS_KEY_FILE")" "$STEPPATH"
 
   if [[ "$tls_mode" == "files" ]]; then
     if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" ]]; then
@@ -347,47 +388,73 @@ configure_web_tls() {
     fi
     return
   fi
-  if [[ "$tls_mode" != "step" ]]; then
-    printf '[init] ERROR: WEB_TLS_MODE must be step or files\n' >&2
-    return 1
+
+  if [[ "$tls_mode" == "acme" ]]; then
+    require_env ACME_CA_SERVER
+    require_env ACME_CA_CERTIFICATES
+    if [[ ! -s "$ACME_CA_CERTIFICATES" ]]; then
+      printf '[init] ERROR: ACME_CA_CERTIFICATES is not a readable PEM bundle: %s\n' "$ACME_CA_CERTIFICATES" >&2
+      return 1
+    fi
+    if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" ]]; then
+      request_acme_certificate
+    fi
+    return
   fi
 
-  export STEPPATH="${STEP_PATH:-/state/step}"
   if [[ ! -s "$STEPPATH/config/defaults.json" ]] || \
-     env_is_true "${STEP_CA_REBOOTSTRAP:-false}"; then
-    require_env STEP_CA_URL
-    require_env STEP_CA_FINGERPRINT
-    log "Bootstrapping Smallstep trust for ${STEP_CA_URL}"
-    step ca bootstrap --force --ca-url "$STEP_CA_URL" --fingerprint "$STEP_CA_FINGERPRINT"
+     env_is_true "${TLS_CA_REBOOTSTRAP:-false}"; then
+    require_env TLS_CA_URL
+    require_env TLS_CA_FINGERPRINT
+    log "Bootstrapping CA trust for ${TLS_CA_URL}"
+    step ca bootstrap --force --ca-url "$TLS_CA_URL" --fingerprint "$TLS_CA_FINGERPRINT"
   fi
 
   if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" ]]; then
     log "Requesting HTTPS certificate for ${WEB_HOSTNAME}"
-    if [[ -n "${STEP_CA_TOKEN:-}" ]]; then
-      step ca certificate "$WEB_HOSTNAME" "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" --token "$STEP_CA_TOKEN" --force
+    if [[ -n "${TLS_CA_TOKEN:-}" ]]; then
+      step ca certificate "$WEB_HOSTNAME" "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" --token "$TLS_CA_TOKEN" --force
     else
-      require_env STEP_CA_PROVISIONER
-      if [[ -n "${STEP_CA_PROVISIONER_PASSWORD_FILE:-}" ]]; then
-        provisioner_password_file="$STEP_CA_PROVISIONER_PASSWORD_FILE"
-      elif [[ -n "${STEP_CA_PROVISIONER_PASSWORD:-}" ]]; then
-        provisioner_password_file="/run/step-provisioner-password"
+      require_env TLS_CA_PROVISIONER
+      if [[ -n "${TLS_CA_PROVISIONER_PASSWORD_FILE:-}" ]]; then
+        provisioner_password_file="$TLS_CA_PROVISIONER_PASSWORD_FILE"
+      elif [[ -n "${TLS_CA_PROVISIONER_PASSWORD:-}" ]]; then
+        provisioner_password_file="/run/tls-ca-provisioner-password"
         umask 077
-        printf '%s\n' "$STEP_CA_PROVISIONER_PASSWORD" > "$provisioner_password_file"
+        printf '%s\n' "$TLS_CA_PROVISIONER_PASSWORD" > "$provisioner_password_file"
       else
-        printf '[init] ERROR: STEP_CA_TOKEN, STEP_CA_PROVISIONER_PASSWORD_FILE, or STEP_CA_PROVISIONER_PASSWORD is required for initial TLS setup\n' >&2
+        printf '[init] ERROR: TLS_CA_TOKEN, TLS_CA_PROVISIONER_PASSWORD_FILE, or TLS_CA_PROVISIONER_PASSWORD is required for initial TLS setup\n' >&2
         return 1
       fi
       step ca certificate "$WEB_HOSTNAME" "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" \
-        --provisioner "$STEP_CA_PROVISIONER" \
+        --provisioner "$TLS_CA_PROVISIONER" \
         --provisioner-password-file "$provisioner_password_file" \
         --force
-      if [[ "$provisioner_password_file" == "/run/step-provisioner-password" ]]; then
+      if [[ "$provisioner_password_file" == "/run/tls-ca-provisioner-password" ]]; then
         rm -f "$provisioner_password_file"
       fi
     fi
   fi
   chmod 0600 "$WEB_TLS_KEY_FILE"
   chmod 0644 "$WEB_TLS_CERT_FILE"
+}
+
+start_acme_renewal_daemon() {
+  local interval="${ACME_RENEW_CHECK_SECONDS:-900}"
+  if [[ ! "$interval" =~ ^[0-9]+$ ]] || (( interval < 60 )); then
+    log "Invalid ACME_RENEW_CHECK_SECONDS=${interval}; using 900"
+    interval=900
+  fi
+
+  log "Starting ACME certificate renewal check every ${interval} seconds"
+  (
+    while true; do
+      sleep "$interval"
+      if step certificate needs-renewal "$WEB_TLS_CERT_FILE" >/dev/null 2>&1; then
+        request_acme_certificate || log 'ACME certificate renewal failed; retrying at the next interval.'
+      fi
+    done
+  ) &
 }
 
 start_observability_services() {
@@ -397,10 +464,15 @@ start_observability_services() {
   if web_should_start; then
     ensure_web_jwt_secret
     configure_web_tls
-    unset STEP_CA_PROVISIONER_PASSWORD STEP_CA_TOKEN
-    if [[ "${WEB_TLS_MODE:-step}" == "step" ]] && env_is_true "${WEB_TLS_AUTORENEW:-true}"; then
-      log 'Starting Smallstep certificate renewal daemon'
-      step ca renew --daemon --force "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" &
+    unset TLS_CA_PROVISIONER_PASSWORD TLS_CA_TOKEN
+    if env_is_true "${WEB_TLS_AUTORENEW:-true}"; then
+      case "$ACTIVE_WEB_TLS_MODE" in
+        acme) start_acme_renewal_daemon ;;
+        ca)
+          log 'Starting CA certificate renewal daemon'
+          step ca renew --daemon --force "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" &
+          ;;
+      esac
     fi
     log "Starting read-only web UI for https://${WEB_HOSTNAME}"
     python3 /app/web_ui.py &

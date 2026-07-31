@@ -30,8 +30,23 @@ DOMAIN_SID = os.environ["PREVIEW_DOMAIN_SID"]
 ADMIN_USER = os.environ["PREVIEW_ADMIN_USER"]
 ADMIN_PASSWORD = os.environ["PREVIEW_ADMIN_PASSWORD"]
 USER_PASSWORD = os.environ["PREVIEW_USER_PASSWORD"]
-BASE_URL = f"https://localhost:{HTTPS_PORT}"
+HTTPS_HOST = os.environ["PREVIEW_HTTPS_HOST"]
+BASE_URL = f"https://{HTTPS_HOST}:{HTTPS_PORT}"
+_ORIGINAL_GETADDRINFO = socket.getaddrinfo
+
+
+def preview_getaddrinfo(host, port, *args, **kwargs):
+    if host == HTTPS_HOST:
+        host = "127.0.0.1"
+    return _ORIGINAL_GETADDRINFO(host, port, *args, **kwargs)
+
+
+socket.getaddrinfo = preview_getaddrinfo
 TLS_CONTEXT = ssl.create_default_context(cafile=CA_ROOT)
+HTTP_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    urllib.request.HTTPSHandler(context=TLS_CONTEXT),
+)
 
 
 @dataclass
@@ -85,9 +100,7 @@ def http(
         f"{BASE_URL}{path}", data=body, headers=headers, method=method
     )
     try:
-        with urllib.request.urlopen(
-            request, context=TLS_CONTEXT, timeout=30
-        ) as response:
+        with HTTP_OPENER.open(request, timeout=30) as response:
             return Response(response.status, response.headers, response.read())
     except urllib.error.HTTPError as exc:
         return Response(exc.code, exc.headers, exc.read())
@@ -152,10 +165,10 @@ def main() -> int:
     check("max-age=" in index.headers.get("Strict-Transport-Security", ""), "HSTS missing")
     check("default-src 'self'" in index.headers.get("Content-Security-Policy", ""), "CSP missing")
     with socket.create_connection(("localhost", HTTPS_PORT), timeout=10) as raw:
-        with TLS_CONTEXT.wrap_socket(raw, server_hostname="localhost") as secured:
+        with TLS_CONTEXT.wrap_socket(raw, server_hostname=HTTPS_HOST) as secured:
             certificate = secured.getpeercert()
     sans = {value for kind, value in certificate.get("subjectAltName", ()) if kind == "DNS"}
-    check("localhost" in sans, "issued certificate does not cover localhost")
+    check(HTTPS_HOST in sans, f"issued certificate does not cover {HTTPS_HOST}")
     check(certificate.get("issuer") != certificate.get("subject"), "web certificate is self-signed instead of CA-issued")
 
     announce("JWT boundary, real Kerberos credentials, and Domain Admin authorization")

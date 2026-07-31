@@ -34,6 +34,7 @@ dev_realm=${DEV_REALM:-DEV.TEST}
 dev_workgroup=${DEV_WORKGROUP:-DEV}
 dev_dns_domain=${DEV_DNS_DOMAIN:-dev.test}
 dev_base_dn=${DEV_BASE_DN:-DC=dev,DC=test}
+dev_web_hostname=${DEV_WEB_HOSTNAME:-files.localhost}
 dev_dc_password=${DEV_DC_PASSWORD:-PreviewDc123!}
 dev_user_password=${DEV_USER_PASSWORD:-PreviewUser123!}
 dev_admin_user=${DEV_ADMIN_USER:-previewadmin}
@@ -49,7 +50,7 @@ dev_backup_interval=${DEV_BACKUP_INTERVAL_SECONDS:-120}
 server_image=${DEV_SERVER_IMAGE:-ad-ds-simple-file-server-dev:latest}
 ad_image=${DEV_AD_IMAGE:-ad-ds-simple-file-server-ad-dev:latest}
 backup_image=${DEV_BACKUP_IMAGE:-ad-ds-simple-file-server-backup-dev:latest}
-step_ca_image=${DEV_STEP_CA_IMAGE:-docker.io/smallstep/step-ca:latest}
+ca_image=${DEV_CA_IMAGE:-docker.io/smallstep/step-ca:latest}
 
 run_id="ad-file-server-dev-$$-$RANDOM"
 network_name="$run_id-net"
@@ -216,18 +217,20 @@ for volume in "${volumes[@]}"; do
   "$engine" volume create "$volume" >/dev/null
 done
 
-printf 'starting local CA: %s\n' "$step_ca_image"
+printf 'starting local CA: %s\n' "$ca_image"
 "$engine" run -d \
   --name "$ca_container" \
   --hostname "ca.${dev_dns_domain}" \
   --network "$network_name" \
   --ip "$ca_ip" \
+  --add-host "${dev_web_hostname}:${files_ip}" \
   -e "DOCKER_STEPCA_INIT_NAME=AD file server preview CA" \
   -e "DOCKER_STEPCA_INIT_DNS_NAMES=ca.${dev_dns_domain},localhost,127.0.0.1" \
   -e "DOCKER_STEPCA_INIT_PROVISIONER_NAME=${dev_ca_provisioner}" \
   -e "DOCKER_STEPCA_INIT_PASSWORD=${dev_ca_password}" \
+  -e "DOCKER_STEPCA_INIT_ACME=true" \
   -v "$ca_volume:/home/step" \
-  "$step_ca_image" >/dev/null
+  "$ca_image" >/dev/null
 
 if ! wait_for_exec "$ca_container" 120 step ca health \
   --ca-url=https://localhost:9000 \
@@ -235,11 +238,15 @@ if ! wait_for_exec "$ca_container" 120 step ca health \
   show_logs
   die 'local CA did not become healthy'
 fi
-ca_fingerprint=$("$engine" exec "$ca_container" step certificate fingerprint \
-  /home/step/certs/root_ca.crt)
 preview_tmp_root=${TMPDIR:-/tmp}
 ca_root_file="${preview_tmp_root%/}/${run_id}-root-ca.crt"
 "$engine" exec "$ca_container" cat /home/step/certs/root_ca.crt > "$ca_root_file"
+"$engine" run --rm -i \
+  -v "$state_volume:/state" \
+  --entrypoint /bin/bash \
+  "$server_image" -lc \
+  'install -d -m 0755 /state/tls && dd of=/state/tls/acme-ca-certificates.pem status=none && chmod 0644 /state/tls/acme-ca-certificates.pem' \
+  < "$ca_root_file"
 
 printf 'starting disposable rsync backup target\n'
 "$engine" run -d \
@@ -312,14 +319,13 @@ printf 'starting actual file server and HTTPS web UI\n'
   -e "NETBIOS_NAME=FILES" \
   -e "AD_DNS_NAME=files.${dev_dns_domain}" \
   -e "WEB_ENABLED=true" \
-  -e "WEB_HOSTNAME=localhost" \
+  -e "WEB_HOSTNAME=${dev_web_hostname}" \
   -e "WEB_BIND_PORT=8443" \
   -e "WEB_JWT_SECRET=preview-only-jwt-secret-with-at-least-32-bytes" \
-  -e "WEB_TLS_MODE=step" \
-  -e "STEP_CA_URL=https://ca.${dev_dns_domain}:9000" \
-  -e "STEP_CA_FINGERPRINT=${ca_fingerprint}" \
-  -e "STEP_CA_PROVISIONER=${dev_ca_provisioner}" \
-  -e "STEP_CA_PROVISIONER_PASSWORD=${dev_ca_password}" \
+  -e "WEB_TLS_MODE=acme" \
+  -e "ACME_CA_SERVER=https://ca.${dev_dns_domain}:9000/acme/acme/directory" \
+  -e "ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem" \
+  -e "ACME_HTTP_LISTEN=:80" \
   -e "WEB_USAGE_SCAN_INTERVAL_SECONDS=60" \
   -e "WEB_DIRECTORY_CACHE_SECONDS=30" \
   -e "AUDIT_POLL_SECONDS=0.25" \
@@ -387,6 +393,7 @@ if [[ $run_e2e == 1 ]]; then
     PREVIEW_BACKUP_CONTAINER="$backup_container" \
     PREVIEW_CA_ROOT="$ca_root_file" \
     PREVIEW_HTTPS_PORT="$dev_https_port" \
+    PREVIEW_HTTPS_HOST="$dev_web_hostname" \
     PREVIEW_REALM="$dev_realm" \
     PREVIEW_WORKGROUP="$dev_workgroup" \
     PREVIEW_DNS_DOMAIN="$dev_dns_domain" \
@@ -402,7 +409,7 @@ if [[ $run_e2e == 1 ]]; then
 fi
 
 printf '\nPreview ready\n'
-printf '  URL:      https://localhost:%s\n' "$dev_https_port"
+printf '  URL:      https://%s:%s\n' "$dev_web_hostname" "$dev_https_port"
 printf '  Username: %s\\%s\n' "$dev_workgroup" "$dev_admin_user"
 printf '  Password: %s\n' "$dev_admin_password"
 printf '  CA root:  %s\n' "$ca_root_file"

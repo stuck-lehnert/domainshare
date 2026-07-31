@@ -13,6 +13,7 @@ services:
     ports:
       - "445:445"
       - "139:139"
+      - "${ACME_HTTP_PORT:-80}:80"
       - "${WEB_HTTPS_PORT:-443}:${WEB_BIND_PORT:-8443}"
     volumes:
       - private_data:/data/private
