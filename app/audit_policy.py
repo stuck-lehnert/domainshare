@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Shared policy for the small set of user-facing audit events."""
 
+import datetime as dt
 import os
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple
 
 
 AUDIT_ACTIONS = frozenset({"read", "write", "move", "delete"})
@@ -51,3 +52,35 @@ def account_name(user: str) -> str:
 def skip_user(user: str) -> bool:
     account = account_name(user).casefold()
     return any(account.endswith(suffix) for suffix in skipped_user_suffixes())
+
+
+ReadEventKey = Tuple[str, ...]
+
+
+def read_deduplication_key(event: Mapping[str, object]) -> Optional[ReadEventKey]:
+    if str(event.get("action", "")).casefold() != "read":
+        return None
+    try:
+        timestamp = dt.datetime.fromisoformat(
+            str(event.get("timestamp", "")).replace("Z", "+00:00")
+        )
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+        second = (
+            timestamp.astimezone(dt.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+        )
+    except ValueError:
+        second = str(event.get("timestamp", ""))
+
+    success = bool(event.get("success", False))
+    return (
+        second,
+        str(event.get("user", "")),
+        str(event.get("clientIp", "")),
+        str(event.get("share", "")),
+        str(event.get("path", "")),
+        "success" if success else "failure",
+        "" if success else str(event.get("result", "")),
+    )

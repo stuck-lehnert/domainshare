@@ -15,8 +15,13 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
+try:
+    from .state_db import STATE_DB_PATH, connect_state_db
+except ImportError:
+    from state_db import STATE_DB_PATH, connect_state_db
 
-DB_PATH = "/state/shares.db"
+
+DB_PATH = STATE_DB_PATH
 LOCK_PATH = "/state/reconcile.lock"
 GROUP_ROOT = "/data/groups/data"
 GROUP_ARCHIVE_ROOT = "/data/groups/archive"
@@ -720,9 +725,7 @@ def ensure_share_db_schema(conn: sqlite3.Connection) -> None:
 
 
 def open_db() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = connect_state_db(DB_PATH)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS shares (

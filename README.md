@@ -11,7 +11,7 @@ This repository provides a production-oriented Samba file server container that 
   - `\\server\FSLogix` -> `/data/fslogix`
 - FS_* groups are projected as folders inside the Data share (`/data/groups/data/<groupName>`).
 - Data folder ACLs expand nested AD group membership recursively and detect group cycles.
-- Group records are persisted in SQLite at `/state/shares.db`.
+- Group records, normalized activity events, collector offsets, and web caches share one SQLite database at `/state/shares.db`.
 - Group folders are name-based while active and moved to archive on deactivation:
   - active: `/data/groups/data/<groupName>`
   - inactive/deleted groups: `/data/groups/archive/<groupName>`
@@ -23,7 +23,7 @@ This repository provides a production-oriented Samba file server container that 
 - `FSLOGIX_GROUP_SID` controls who can access the default FSLogix share (defaults to `DOMAIN_USERS_SID`).
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
 - Samba `full_audit` is restricted to successful and failed reads, writes, renames/moves, and deletions.
-- A collector normalizes those four actions and persists them in daily NDJSON files under `/state/audit`; closed files are gzip-compressed and are never automatically deleted.
+- A collector normalizes those four actions and persists them in indexed SQLite tables; activity is never automatically deleted.
 - A read-only HTTPS web console provides group membership trees, storage usage, searchable activity, live backup progress, and system health.
 - Web sign-in validates the submitted username/password with Kerberos, permits only users whose winbind group SID set contains `DOMAIN_ADMINS_SID`, and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
 - HTTPS certificates are requested from a configured local Smallstep CA and renewed automatically. Pre-issued certificate files are also supported.
@@ -44,23 +44,20 @@ The reconciliation script (`/app/reconcile_shares.py`) enforces these rules:
 3. Group removed or no longer matching `FS_*` -> set `isActive=0` and move folder to `/data/groups/archive/...`.
 4. Previously inactive group returns -> set `isActive=1`, move back into `/data/groups/data/...`.
 
-## SQLite State Database
+## Shared SQLite State Database
 
-Database path: `/state/shares.db`
+The default database path is `/state/shares.db`; `STATE_DB_PATH` can override it. `SHARE_DB_PATH` remains a backward-compatible fallback.
 
-Table schema:
+The database contains:
 
-```sql
-CREATE TABLE shares (
-  objectGUID TEXT PRIMARY KEY,
-  samAccountName TEXT NOT NULL,
-  shareName TEXT NOT NULL,
-  path TEXT NOT NULL,
-  createdAt TIMESTAMP NOT NULL,
-  lastSeenAt TIMESTAMP NOT NULL,
-  isActive INTEGER NOT NULL
-);
-```
+- `shares`: AD group-to-folder lifecycle and ACL reconciliation state;
+- `audit_events`: normalized read, write, move, and delete events;
+- `audit_sources`: Samba log inode/offset checkpoints;
+- `web_cache`: cached storage scan results.
+
+Activity lookup uses UTC epoch seconds, keyset pagination, and multi-column indexes for time, user, share, action, and result. WAL mode allows the collector, reconciler, scanner, and read-only web requests to operate concurrently.
+
+Standard SQLite does not provide transparent general-purpose compression, so this project deliberately does not depend on a non-core compression VFS. Structured columns avoid repeated JSON field names and make indexed queries much cheaper; the state volume still needs capacity for retained activity.
 
 ## AD Requirements
 
@@ -100,6 +97,8 @@ Kerberos requires close time alignment.
 - `app/reconcile_shares.py`
 - `app/backup_to_destination.py`
 - `app/audit_collector.py`
+- `app/audit_store.py`
+- `app/state_db.py`
 - `app/web_ui.py`
 - `app/web/`
 - `etc/samba/smb.conf`
@@ -123,7 +122,7 @@ The launcher builds the current application and starts an isolated, run-scoped n
 - the actual file-server image, joined to the dummy domain;
 - a continuous SMB client that exercises reads, writes, renames/moves, and deletions, including activity from an excluded dummy service account.
 
-The preview starts with group, Private, FSLogix, and historical audit data. The client keeps current-day audit activity moving, while a real backup runs immediately and repeats in the background. Open the URL and use the credentials printed by the launcher. Defaults are:
+The preview starts with group, Private, and FSLogix data. The client keeps current activity moving, while a real backup runs immediately and repeats in the background. Open the URL and use the credentials printed by the launcher. Defaults are:
 
 ```text
 URL:      https://files.localhost:8443
@@ -175,7 +174,7 @@ The E2E suite verifies:
 - SMB allow/deny behavior and real file operations;
 - Data, Private, and FSLogix usage aggregation;
 - high-level `full_audit` ingestion for all four actions, service-account exclusion, filters, facets, and pagination;
-- compression and querying of a closed daily audit log;
+- shared SQLite schema, integrity, indexes, legacy-log removal, and ordered read deduplication;
 - real rsync transfer progress, completed backup status, log output, and remote snapshot marker;
 - overview and system-health aggregation.
 
@@ -284,11 +283,11 @@ The console is intentionally operational and plain:
 
 - **Overview**: current capacity totals, active group count, recent activity, and backup state.
 - **File shares**: one selectable tree per active `FS_*` group/folder with recursively expanded user and nested-group membership, cycle markers, and a live filter.
-- **Storage / Data groups**: cached recursive size of every top-level `/Data` group folder.
-- **Storage / Users**: per-user `/Private + /FSLogix` totals with component sizes.
-- **Activity logs**: dynamic date, user, share, action, operation, result, and path filters with pagination.
+- **Data usage**: cached recursive size of every top-level `/Data` group folder.
+- **User usage**: per-user `/Private + /FSLogix` totals with component sizes.
+- **Activity**: dynamic date, user, share, action, result, and path filters with pagination.
 - **Backups**: read-only live progress, active transfer rows, snapshot name, and recent backup output.
-- **System**: domain trust, Samba configuration, TLS certificate, scanner, and audit archive health.
+- **System**: domain trust, Samba configuration, TLS certificate, scanner, and activity database health.
 
 The web API has no mutation endpoint other than session login/logout. Files, groups, ACLs, backup schedules, and retention cannot be changed from the console.
 
@@ -372,24 +371,25 @@ Useful optional settings:
 | `WEB_USAGE_SCAN_INTERVAL_SECONDS` | `900` | Recursive storage scan interval |
 | `WEB_DIRECTORY_CACHE_SECONDS` | `300` | AD membership tree cache time |
 | `WEB_MAX_GROUP_NODES` | `10000` | Membership expansion safety limit |
-| `AUDIT_COMPRESS_AFTER_HOURS` | `24` | Minimum idle age before compressing a closed day |
+| `STATE_DB_PATH` | `/state/shares.db` | Shared SQLite database for shares, activity, collector offsets, and caches |
 | `AUDIT_QUERY_MAX_DAYS` | `31` | Largest activity query window |
 | `AUDIT_SKIP_USER_SUFFIXES` | `_svc,_ServiceAcc` | Case-insensitive account suffixes excluded from collection and queries; set empty to disable |
 
 If `WEB_ENABLED` is absent on an upgraded installation and no TLS settings/certificate exist, the web service stays disabled while Samba and audit collection continue. Set `WEB_ENABLED=true` after adding TLS configuration.
 
-## Audit Archive
+## Activity Database
 
-Samba emits only the selected high-level `full_audit` operations, and the collector makes them durable:
+Samba emits only the selected high-level `full_audit` operations, and the collector stores them durably:
 
-- it tails every `/var/log/samba/log.*` source, remembers inode and byte offsets in `/state/audit/collector-state.json`, and follows Samba rotation without duplicating a rotated file;
-- each event records timestamp, user, client address/name, share, result, path, and one of the actions `read`, `write`, `move`, or `delete`;
+- it tails every `/var/log/samba/log.*` source and stores inode/byte offsets transactionally in `audit_sources`, so source progress and inserted events commit together;
+- each event records a UTC timestamp, user, client address/name, share, result, path, and one of `read`, `write`, `move`, or `delete`;
 - directory listings, sessions, metadata access, file-open/create noise, and all other VFS operations are discarded; users ending in a configured `AUDIT_SKIP_USER_SUFFIXES` value are also discarded;
-- records are appended to `/state/audit/YYYY-MM-DD.jsonl`;
-- a closed, idle daily file becomes `.jsonl.gz`;
-- no audit retention deletion is performed, so capacity planning for the `state_data` volume is the operator's responsibility.
+- immediately consecutive identical reads within the same UTC second are collapsed into one event, including across collector polling cycles; a different event interrupts the sequence and preserves later reads;
+- activity queries run directly against indexed SQLite columns and use a stable time/id cursor;
+- no activity retention deletion is performed.
 
-Collection starts even when the web UI is disabled. Existing Samba log content is imported when the collector first starts, but the same operation and user-suffix policy is applied during import. Audit data that Samba rotated away before this version was deployed cannot be recovered.
+Collection starts even when the web UI is disabled. On the first collector start after this migration, recognized legacy daily `.jsonl`/`.jsonl.gz` files and the old collector state file under `/state/audit` are deleted without import. Existing raw Samba log content is then processed using the current action, suffix, and deduplication policy.
+
 
 ## Backups
 
@@ -400,7 +400,7 @@ Collection starts even when the web UI is disabled. Existing Samba log content i
   - `/data/private` -> `data/private`
   - `/data/groups` -> `data/groups`
   - `/data/fslogix` -> `data/fslogix`
-  - `/state` -> `state`
+  - `/state` -> `state` (the live WAL database is replaced by a consistent SQLite online snapshot)
   - `/var/lib/samba/private` -> `samba/private`
 - Retention policy env vars (defaults):
   - `BACKUP_RETENTION_YEARLY=1`
@@ -408,7 +408,7 @@ Collection starts even when the web UI is disabled. Existing Samba log content i
   - `BACKUP_RETENTION_WEEKLY=2`
   - `BACKUP_RETENTION_DAILY=3`
 - The backup script writes directly to `BACKUP_LOG_FILE` (default: `/var/log/backup.log`). Cron does not redirect backup output into the logfile.
-- Before uploading, the backup script measures all source files so it can report total upload progress.
+- Before uploading, the backup script creates a temporary, integrity-checked SQLite online snapshot of the shared state database, then measures all source files so it can report total upload progress.
 - Upload progress is logged per file every `BACKUP_PROGRESS_INTERVAL_SECONDS` seconds and again when a file reaches 100%, including percentage and transferred/remaining bytes with auto-scaled units.
 - `BACKUP_PROGRESS=auto` shows an interactive multi-line progress view only for TTY/manual runs. Current file uploads are shown as separate rows, capped at 12 rows, with the total progress row at the bottom. Use `always` to force it or `never` to suppress the bar. File and total progress are still logged.
 - Every run atomically updates `BACKUP_STATUS_FILE` (default `/state/backup-status.json`) with its state, current source, active files, byte totals, percentage, snapshot, and final result for the live web view.
@@ -446,11 +446,11 @@ Collection starts even when the web UI is disabled. Existing Samba log content i
 docker compose logs -f samba
 docker compose logs -f samba | grep -E '\\[web\\]|\\[audit\\]'
 docker compose exec samba python3 /app/reconcile_shares.py
-docker compose exec samba sqlite3 /state/shares.db 'SELECT * FROM shares;'
+docker compose exec samba sqlite3 /state/shares.db 'PRAGMA quick_check;'
+docker compose exec samba sqlite3 /state/shares.db 'SELECT action, count(*) FROM audit_events GROUP BY action;'
 docker compose exec samba testparm -s
 docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
 docker compose exec samba sh -lc 'tail -n 200 /var/log/backup.log'
-docker compose exec samba sh -lc 'ls -lh /state/audit'
 docker compose exec samba python3 -m json.tool /state/backup-status.json
 ```
 

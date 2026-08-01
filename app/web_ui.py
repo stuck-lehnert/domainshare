@@ -3,7 +3,6 @@
 
 import base64
 import datetime as dt
-import gzip
 import hashlib
 import hmac
 import http.cookies
@@ -23,7 +22,7 @@ import urllib.parse
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:
     from app import reconcile_shares as directory
@@ -31,20 +30,37 @@ except ImportError:  # Container execution uses /app as the import root.
     import reconcile_shares as directory
 
 try:
-    from app.audit_policy import AUDIT_ACTIONS, action_for, skip_user
+    from app.audit_store import (
+        audit_summary as sqlite_audit_summary,
+        ensure_audit_schema,
+        query_activity,
+    )
+    from app.state_db import (
+        STATE_DB_PATH,
+        connect_state_db,
+        drop_legacy_web_cache,
+        ensure_web_cache_schema,
+    )
 except ImportError:  # Container execution uses /app as the import root.
-    from audit_policy import AUDIT_ACTIONS, action_for, skip_user
+    from audit_store import (
+        audit_summary as sqlite_audit_summary,
+        ensure_audit_schema,
+        query_activity,
+    )
+    from state_db import (
+        STATE_DB_PATH,
+        connect_state_db,
+        drop_legacy_web_cache,
+        ensure_web_cache_schema,
+    )
 
 
-STATE_ROOT = os.getenv("WEB_STATE_DIR", "/state/web")
-AUDIT_ROOT = os.getenv("AUDIT_ARCHIVE_DIR", "/state/audit")
 STATIC_ROOT = os.getenv("WEB_STATIC_DIR", "/app/web")
-SHARE_DB = os.getenv("SHARE_DB_PATH", "/state/shares.db")
+STATE_DB = STATE_DB_PATH
 BACKUP_STATUS_FILE = os.getenv("BACKUP_STATUS_FILE", "/state/backup-status.json")
 BACKUP_LOG_FILE = os.getenv("BACKUP_LOG_FILE", "/var/log/backup.log")
 TLS_CERT_FILE = os.getenv("WEB_TLS_CERT_FILE", "/state/tls/web.crt")
 TLS_KEY_FILE = os.getenv("WEB_TLS_KEY_FILE", "/state/tls/web.key")
-USAGE_CACHE_FILE = os.path.join(STATE_ROOT, "usage.json")
 JWT_COOKIE = "adfs_session"
 JWT_ISSUER = "ad-file-server-web"
 JWT_AUDIENCE = "domain-admins"
@@ -67,16 +83,6 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
         return max(minimum, min(maximum, int(os.getenv(name, str(default)))))
     except ValueError:
         return default
-
-
-def atomic_json(path: str, value: object) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    temp = f"{path}.tmp"
-    with open(temp, "w", encoding="utf-8") as handle:
-        json.dump(value, handle, separators=(",", ":"), sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp, path)
 
 
 def read_json(path: str, default):
@@ -316,11 +322,49 @@ def scan_children(root: str) -> List[Dict[str, object]]:
     return rows
 
 
+def load_usage_cache() -> Dict[str, object]:
+    try:
+        conn = connect_state_db(STATE_DB)
+        try:
+            ensure_web_cache_schema(conn)
+            row = conn.execute(
+                "SELECT value FROM web_cache WHERE key = 'usage'"
+            ).fetchone()
+            value = json.loads(str(row[0])) if row is not None else {}
+            return value if isinstance(value, dict) else {}
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        return {}
+
+
+def store_usage_cache(value: Dict[str, object]) -> None:
+    conn = connect_state_db(STATE_DB)
+    try:
+        ensure_web_cache_schema(conn)
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO web_cache (key, value, updated_at)
+                VALUES ('usage', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    json.dumps(value, separators=(",", ":"), sort_keys=True),
+                    now_utc().isoformat(timespec="seconds"),
+                ),
+            )
+    finally:
+        conn.close()
+
+
 class UsageScanner:
     def __init__(self):
         self.interval = env_int("WEB_USAGE_SCAN_INTERVAL_SECONDS", 900, 60, 86400)
         self.lock = threading.Lock()
-        self.data = read_json(USAGE_CACHE_FILE, {})
+        self.data = load_usage_cache()
         self.stop = threading.Event()
 
     def snapshot(self) -> Dict[str, object]:
@@ -368,7 +412,7 @@ class UsageScanner:
                 "fslogixBytes": sum(int(row["fslogixBytes"]) for row in user_rows),
             },
         }
-        atomic_json(USAGE_CACHE_FILE, value)
+        store_usage_cache(value)
         with self.lock:
             self.data = value
         return value
@@ -445,7 +489,7 @@ class DirectoryCache:
 
         folder_map = {}
         try:
-            conn = sqlite3.connect(f"file:{SHARE_DB}?mode=ro", uri=True)
+            conn = connect_state_db(STATE_DB, read_only=True)
             try:
                 folder_map = {
                     row[0]: {"folder": os.path.basename(row[1]), "active": bool(row[2])}
@@ -515,60 +559,6 @@ class DirectoryCache:
         }
 
 
-def iter_audit_file(path: str) -> Iterable[Dict[str, object]]:
-    opener = gzip.open if path.endswith(".gz") else open
-    try:
-        with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                try:
-                    value = json.loads(line)
-                    if isinstance(value, dict):
-                        yield value
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        return
-
-
-def iter_audit_file_reverse(path: str) -> Iterable[Dict[str, object]]:
-    if path.endswith(".gz"):
-        yield from reversed(list(iter_audit_file(path)))
-        return
-    try:
-        with open(path, "rb") as handle:
-            position = handle.seek(0, os.SEEK_END)
-            remainder = b""
-            while position > 0:
-                size = min(1024 * 1024, position)
-                position -= size
-                handle.seek(position)
-                parts = (handle.read(size) + remainder).split(b"\n")
-                remainder = parts[0]
-                for line in reversed(parts[1:]):
-                    if not line:
-                        continue
-                    try:
-                        value = json.loads(line.decode("utf-8", errors="replace"))
-                        if isinstance(value, dict):
-                            yield value
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-            if remainder:
-                try:
-                    value = json.loads(remainder.decode("utf-8", errors="replace"))
-                    if isinstance(value, dict):
-                        yield value
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
-    except OSError:
-        return
-
-
-def date_range(start: dt.date, end: dt.date):
-    day = start
-    while day <= end:
-        yield day.isoformat()
-        day += dt.timedelta(days=1)
 
 
 def query_audit(params: Dict[str, List[str]]) -> Dict[str, object]:
@@ -582,62 +572,11 @@ def query_audit(params: Dict[str, List[str]]) -> Dict[str, object]:
     max_days = env_int("AUDIT_QUERY_MAX_DAYS", 31, 1, 366)
     if end < start or (end - start).days >= max_days:
         raise ValueError(f"Der Datumsbereich darf höchstens {max_days} Tage umfassen")
-    limit = min(500, max(1, int(params.get("limit", ["100"])[0])))
-    offset = max(0, int(params.get("cursor", ["0"])[0]))
-    filters = {
-        key: params.get(key, [""])[0].casefold().strip()
-        for key in ("user", "share", "operation", "action", "path", "result")
-    }
-    page = []
-    matched = 0
-    facets = {"users": set(), "shares": set(), "operations": set(), "actions": set()}
-    for day in reversed(list(date_range(start, end))):
-        candidates = [os.path.join(AUDIT_ROOT, f"{day}.jsonl"), os.path.join(AUDIT_ROOT, f"{day}.jsonl.gz")]
-        for path in candidates:
-            if not os.path.isfile(path):
-                continue
-            for event in iter_audit_file_reverse(path):
-                user = str(event.get("user", ""))
-                operation = str(event.get("operation", ""))
-                action = action_for(operation)
-                if action is None and not operation:
-                    stored_action = str(event.get("action", "")).casefold()
-                    action = stored_action if stored_action in AUDIT_ACTIONS else None
-                if action is None or skip_user(user):
-                    continue
-                if event.get("action") != action:
-                    event = {**event, "action": action}
-                facets["users"].add(user)
-                facets["shares"].add(str(event.get("share", "")))
-                facets["operations"].add(operation)
-                facets["actions"].add(action)
-                failed_filter = filters["result"] == "fail"
-                if failed_filter and bool(event.get("success", False)):
-                    continue
-                if (
-                    filters["result"]
-                    and not failed_filter
-                    and filters["result"]
-                    not in str(event.get("result", "")).casefold()
-                ):
-                    continue
-                if any(
-                    value and value not in str(event.get(key, "")).casefold()
-                    for key, value in filters.items()
-                    if key != "result"
-                ):
-                    continue
-                if matched >= offset and len(page) < limit:
-                    page.append(event)
-                matched += 1
-    page.sort(key=lambda event: str(event.get("timestamp", "")), reverse=True)
-    next_cursor = offset + limit if offset + limit < matched else None
-    return {
-        "events": page,
-        "nextCursor": next_cursor,
-        "matched": matched,
-        "facets": {key: sorted(value, key=str.casefold) for key, value in facets.items()},
-    }
+    conn = connect_state_db(STATE_DB, read_only=True)
+    try:
+        return query_activity(conn, start, end, params)
+    finally:
+        conn.close()
 
 
 def tail_lines(path: str, count: int) -> List[str]:
@@ -666,7 +605,7 @@ def backup_payload() -> Dict[str, object]:
 
 def share_count() -> int:
     try:
-        conn = sqlite3.connect(f"file:{SHARE_DB}?mode=ro", uri=True)
+        conn = connect_state_db(STATE_DB, read_only=True)
         try:
             return int(conn.execute("SELECT count(*) FROM shares WHERE isActive = 1").fetchone()[0])
         finally:
@@ -676,21 +615,14 @@ def share_count() -> int:
 
 
 def audit_archive_summary() -> Dict[str, object]:
-    files = []
-    total_bytes = 0
     try:
-        names = os.listdir(AUDIT_ROOT)
-    except OSError:
-        names = []
-    for name in names:
-        if re.match(r"^\d{4}-\d{2}-\d{2}\.jsonl(?:\.gz)?$", name):
-            path = os.path.join(AUDIT_ROOT, name)
-            try:
-                total_bytes += os.path.getsize(path)
-                files.append(name)
-            except OSError:
-                continue
-    return {"days": len(files), "bytes": total_bytes, "oldest": min(files)[:10] if files else None, "newest": max(files)[:10] if files else None}
+        conn = connect_state_db(STATE_DB, read_only=True)
+        try:
+            return sqlite_audit_summary(conn, STATE_DB)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {"days": 0, "bytes": 0, "oldest": None, "newest": None}
 
 
 def tls_summary() -> Dict[str, object]:
@@ -711,7 +643,16 @@ class App:
     def __init__(self):
         secret = os.environ.get("WEB_JWT_SECRET", "")
         self.tokens = TokenManager(secret, env_int("WEB_JWT_TTL_SECONDS", 28800, 300, 604800))
+        removed = drop_legacy_web_cache()
+        if removed:
+            log(f"Dropped {removed} legacy web cache file(s)")
         self.usage = UsageScanner()
+        conn = connect_state_db(STATE_DB)
+        try:
+            ensure_audit_schema(conn)
+            ensure_web_cache_schema(conn)
+        finally:
+            conn.close()
         self.directory = DirectoryCache()
         threading.Thread(target=self.usage.run, name="usage-scanner", daemon=True).start()
 
@@ -916,7 +857,6 @@ def serve_https() -> None:
 
 def main() -> int:
     global APP
-    os.makedirs(STATE_ROOT, mode=0o750, exist_ok=True)
     if not os.path.isfile(TLS_CERT_FILE) or not os.path.isfile(TLS_KEY_FILE):
         raise RuntimeError("TLS certificate or key is missing")
     APP = App()

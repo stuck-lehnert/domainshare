@@ -584,7 +584,7 @@ if [[ -n "${JOIN_PASSWORD:-}" ]]; then
   export JOIN_PASSWORD
 fi
 
-mkdir -p /data/private /data/fslogix /data/groups/data /data/groups/archive /state /state/audit /state/web /var/log/samba
+mkdir -p /data/private /data/fslogix /data/groups/data /data/groups/archive /state /var/log/samba
 touch /var/log/reconcile.log /var/log/backup.log
 
 append_winbind_to_nss

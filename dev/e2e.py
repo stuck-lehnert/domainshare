@@ -2,7 +2,6 @@
 """End-to-end checks for the disposable preview domain and file server."""
 
 import base64
-import datetime as dt
 import json
 import os
 import socket
@@ -302,25 +301,64 @@ def main() -> int:
     check(len(one_event.get("events", [])) == 1, "activity limit was ignored")
     check(one_event.get("nextCursor") is not None, "activity pagination cursor missing")
 
-    announce("closed daily log compression and querying gzip history")
-    old_day = (dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=2)).isoformat()
-    eventually(
-        "historical audit gzip",
-        lambda: engine_run(
-            "exec", FILES_CONTAINER, "test", "-f", f"/state/audit/{old_day}.jsonl.gz",
-            check_result=False,
-        ).returncode,
-        lambda returncode: returncode == 0,
-        timeout=30,
+    announce("shared SQLite state, indexes, integrity, and ordered read deduplication")
+    integrity = engine_run(
+        "exec", FILES_CONTAINER, "sqlite3", "/state/shares.db", "PRAGMA quick_check;"
     )
-    archived = http(
-        query_path(
-            "/api/activity",
-            {"from": old_day, "to": old_day, "user": "archived-user", "limit": "10"},
-        ),
-        token=token,
+    check(integrity.stdout.strip() == "ok", "shared SQLite database failed quick_check")
+    tables = set(
+        engine_run(
+            "exec",
+            FILES_CONTAINER,
+            "sqlite3",
+            "/state/shares.db",
+            "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;",
+        ).stdout.splitlines()
     )
-    check(archived.status == 200 and archived.json().get("matched") == 1, "compressed audit history is not searchable")
+    check(
+        {"shares", "audit_events", "audit_sources", "web_cache"}.issubset(tables),
+        f"shared SQLite tables are incomplete: {sorted(tables)}",
+    )
+    indexes = set(
+        engine_run(
+            "exec",
+            FILES_CONTAINER,
+            "sqlite3",
+            "/state/shares.db",
+            "SELECT name FROM sqlite_schema WHERE type='index' AND name LIKE 'audit_events_%';",
+        ).stdout.splitlines()
+    )
+    check(
+        {"audit_events_time", "audit_events_user_time", "audit_events_action_time"}.issubset(indexes),
+        f"audit indexes are incomplete: {sorted(indexes)}",
+    )
+    duplicate_reads = engine_run(
+        "exec",
+        FILES_CONTAINER,
+        "sqlite3",
+        "/state/shares.db",
+        """SELECT count(*) FROM (
+            SELECT action, occurred_second, user, client_ip, share, path, success, result,
+                   lag(action) OVER (ORDER BY id) AS previous_action,
+                   lag(occurred_second) OVER (ORDER BY id) AS previous_second,
+                   lag(user) OVER (ORDER BY id) AS previous_user,
+                   lag(client_ip) OVER (ORDER BY id) AS previous_client_ip,
+                   lag(share) OVER (ORDER BY id) AS previous_share,
+                   lag(path) OVER (ORDER BY id) AS previous_path,
+                   lag(success) OVER (ORDER BY id) AS previous_success,
+                   lag(result) OVER (ORDER BY id) AS previous_result
+            FROM audit_events
+        ) WHERE action='read' AND previous_action='read'
+          AND occurred_second=previous_second AND user=previous_user
+          AND client_ip=previous_client_ip AND share=previous_share
+          AND path=previous_path AND success=previous_success
+          AND (success=1 OR result=previous_result);""",
+    )
+    check(duplicate_reads.stdout.strip() == "0", "uninterrupted duplicate reads remain")
+    legacy_archive = engine_run(
+        "exec", FILES_CONTAINER, "test", "!", "-e", "/state/audit", check_result=False
+    )
+    check(legacy_archive.returncode == 0, "legacy JSONL audit archive still exists")
 
     announce("real rsync backup, status API, log tail, and remote completion marker")
     backup = eventually(
@@ -350,7 +388,7 @@ def main() -> int:
     check(system_payload.get("checks", {}).get("domainTrust") is True, "system reports broken AD trust")
     check(system_payload.get("checks", {}).get("sambaConfig") is True, "system reports invalid Samba config")
     check(system_payload.get("tls", {}).get("sans"), "system TLS summary is empty")
-    check(system_payload.get("audit", {}).get("days", 0) >= 2, "system audit archive summary is incomplete")
+    check(system_payload.get("audit", {}).get("days", 0) >= 1, "system activity database summary is incomplete")
 
     logout = http("/api/logout", method="POST", value={}, token=token)
     check(logout.status == 200 and "Max-Age=0" in logout.headers.get("Set-Cookie", ""), "logout did not clear session cookie")

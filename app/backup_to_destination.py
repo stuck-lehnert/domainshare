@@ -5,6 +5,8 @@ import fcntl
 import json
 import os
 import re
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,7 +16,12 @@ from typing import Callable, Dict, List, Optional, Set, TextIO, Tuple
 from urllib.parse import SplitResult, unquote, urlsplit
 
 
-LOCK_PATH = "/state/backup.lock"
+STATE_ROOT = os.getenv("STATE_ROOT", "/state")
+STATE_DB_PATH = os.getenv(
+    "STATE_DB_PATH",
+    os.getenv("SHARE_DB_PATH", os.path.join(STATE_ROOT, "shares.db")),
+)
+LOCK_PATH = os.path.join(STATE_ROOT, "backup.lock")
 DEFAULT_BACKUP_LOG_FILE = "/var/log/backup.log"
 DEFAULT_BACKUP_STATUS_FILE = "/state/backup-status.json"
 DEFAULT_PROGRESS_MODE = "auto"
@@ -43,7 +50,7 @@ BACKUP_SOURCES: List[Tuple[str, str]] = [
     ("/data/private", "data/private"),
     ("/data/groups", "data/groups"),
     ("/data/fslogix", "data/fslogix"),
-    ("/state", "state"),
+    (STATE_ROOT, "state"),
     ("/var/lib/samba/private", "samba/private"),
 ]
 
@@ -917,11 +924,75 @@ def redact_destination(raw_url: str) -> str:
     return f"{parts.scheme}://{netloc}{parts.path}"
 
 
-def available_sources() -> List[Tuple[str, str]]:
+def prepare_state_snapshot(
+    state_root: str = STATE_ROOT,
+    database_path: str = STATE_DB_PATH,
+) -> Tuple[str, str]:
+    """Copy state and replace the live WAL database with an online snapshot."""
+    state_root = os.path.abspath(state_root)
+    database_path = os.path.abspath(database_path)
+    database_relative = os.path.relpath(database_path, state_root)
+    if database_relative == ".." or database_relative.startswith(f"..{os.sep}"):
+        raise RuntimeError("STATE_DB_PATH must be located below STATE_ROOT")
+
+    temporary_root = tempfile.mkdtemp(prefix="backup-state-")
+    staged_state = os.path.join(temporary_root, "state")
+    excluded = {
+        database_relative,
+        f"{database_relative}-wal",
+        f"{database_relative}-shm",
+    }
+
+    def ignore_live_database(directory: str, names: List[str]) -> Set[str]:
+        relative_directory = os.path.relpath(directory, state_root)
+        return {
+            name
+            for name in names
+            if os.path.normpath(os.path.join(relative_directory, name)) in excluded
+        }
+
+    try:
+        shutil.copytree(
+            state_root,
+            staged_state,
+            symlinks=True,
+            ignore=ignore_live_database,
+        )
+        if os.path.isfile(database_path):
+            staged_database = os.path.join(staged_state, database_relative)
+            os.makedirs(os.path.dirname(staged_database), exist_ok=True)
+            source = sqlite3.connect(
+                f"file:{database_path}?mode=ro",
+                uri=True,
+                timeout=30,
+            )
+            destination = sqlite3.connect(staged_database, timeout=30)
+            try:
+                source.execute("PRAGMA busy_timeout = 30000")
+                source.backup(destination)
+                if destination.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise RuntimeError("SQLite state snapshot failed its integrity check")
+            finally:
+                destination.close()
+                source.close()
+        return temporary_root, staged_state
+    except Exception:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+        raise
+
+
+def available_sources(
+    state_snapshot: Optional[str] = None,
+) -> List[Tuple[str, str]]:
     sources: List[Tuple[str, str]] = []
     for source_path, destination_path in BACKUP_SOURCES:
-        if os.path.isdir(source_path):
-            sources.append((source_path, destination_path))
+        effective_source = (
+            state_snapshot
+            if destination_path == "state" and state_snapshot is not None
+            else source_path
+        )
+        if os.path.isdir(effective_source):
+            sources.append((effective_source, destination_path))
         else:
             log(f"Skipping missing source: {source_path}")
     return sources
@@ -1455,11 +1526,6 @@ def run_backup() -> int:
         return 0
 
     policy = parse_retention_policy()
-    sources = available_sources()
-    if not sources:
-        log("No backup sources are available, skipping backup")
-        return 0
-
     progress_interval_seconds = parse_int_env(
         "BACKUP_PROGRESS_INTERVAL_SECONDS",
         DEFAULT_PROGRESS_INTERVAL_SECONDS,
@@ -1474,8 +1540,19 @@ def run_backup() -> int:
         os.getenv("BACKUP_STATUS_FILE", DEFAULT_BACKUP_STATUS_FILE).strip()
     )
     BACKUP_STATUS.begin(redact_destination(destination.raw_url))
-    backend = build_backend(destination)
+    backend = None
+    state_snapshot_root = None
     try:
+        state_snapshot = None
+        if os.path.isdir(STATE_ROOT):
+            BACKUP_STATUS.write(message="Creating consistent state database snapshot")
+            state_snapshot_root, state_snapshot = prepare_state_snapshot()
+        sources = available_sources(state_snapshot)
+        if not sources:
+            log("No backup sources are available, skipping backup")
+            return 0
+
+        backend = build_backend(destination)
         log(f"Starting backup to {redact_destination(destination.raw_url)}")
 
         existing = set(backend.list_snapshots())
@@ -1494,7 +1571,7 @@ def run_backup() -> int:
         )
 
         for source_path, destination_path in sources:
-            log(f"Syncing {source_path}")
+            log(f"Syncing {destination_path}")
             backend.sync_source(
                 snapshot_name,
                 source_path,
@@ -1527,7 +1604,10 @@ def run_backup() -> int:
         )
         return 0
     finally:
-        backend.close()
+        if backend is not None:
+            backend.close()
+        if state_snapshot_root is not None:
+            shutil.rmtree(state_snapshot_root, ignore_errors=True)
 
 
 def with_lock() -> int:

@@ -29,6 +29,8 @@ COPY --from=step-cli /usr/local/bin/step /usr/local/bin/step
 COPY app/reconcile_shares.py /app/reconcile_shares.py
 COPY app/backup_to_destination.py /app/backup_to_destination.py
 COPY app/audit_policy.py /app/audit_policy.py
+COPY app/state_db.py /app/state_db.py
+COPY app/audit_store.py /app/audit_store.py
 COPY app/audit_collector.py /app/audit_collector.py
 COPY app/web_ui.py /app/web_ui.py
 COPY app/web /app/web

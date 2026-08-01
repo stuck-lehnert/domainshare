@@ -1,13 +1,14 @@
 import datetime as dt
-import gzip
-import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
 
 from app import audit_collector
+from app import audit_store
 from app import web_ui
+from app import state_db
 
 
 class TokenManagerTests(unittest.TestCase):
@@ -132,9 +133,8 @@ class AuditParsingTests(unittest.TestCase):
 
     def test_tracks_rotated_file_by_inode_without_reingesting_it(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            archive = os.path.join(tmpdir, "audit")
-            os.mkdir(archive)
             active = os.path.join(tmpdir, "log.pc01")
+            database = os.path.join(tmpdir, "state.db")
             line = (
                 "[2026/07/31 12:34:56.000000, 1] smbd_audit: "
                 "x|alice|192.0.2.5|PC01|Data|pread|OK|a.txt\n"
@@ -142,60 +142,251 @@ class AuditParsingTests(unittest.TestCase):
             with open(active, "w", encoding="utf-8") as handle:
                 handle.write(line)
 
-            with mock.patch.object(audit_collector, "SAMBA_LOG_GLOB", os.path.join(tmpdir, "log.*")), mock.patch.object(audit_collector, "ARCHIVE_DIR", archive), mock.patch.object(audit_collector, "STATE_FILE", os.path.join(archive, "state.json")):
-                state = {}
-                self.assertEqual(audit_collector.collect_once(state), 1)
-                rotated = f"{active}.old"
-                os.rename(active, rotated)
-                with open(active, "w", encoding="utf-8") as handle:
-                    handle.write(line.replace("a.txt", "b.txt"))
-                self.assertEqual(audit_collector.collect_once(state), 1)
+            store = audit_store.AuditStore(database)
+            try:
+                with mock.patch.object(
+                    audit_collector,
+                    "SAMBA_LOG_GLOB",
+                    os.path.join(tmpdir, "log.*"),
+                ):
+                    self.assertEqual(audit_collector.collect_once(store), 1)
+                    rotated = f"{active}.old"
+                    os.rename(active, rotated)
+                    with open(active, "w", encoding="utf-8") as handle:
+                        handle.write(line.replace("a.txt", "b.txt"))
+                    self.assertEqual(audit_collector.collect_once(store), 1)
+                paths = [
+                    row[0]
+                    for row in store.conn.execute(
+                        "SELECT path FROM audit_events ORDER BY id"
+                    )
+                ]
+                self.assertEqual(paths, ["a.txt", "b.txt"])
+            finally:
+                store.close()
+
+    def test_processes_known_rotated_inode_before_new_active_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            active = os.path.join(tmpdir, "log.pc01")
+            database = os.path.join(tmpdir, "state.db")
+            read = (
+                "[2026/07/31 12:34:56.000000, 1] smbd_audit: "
+                "x|alice|192.0.2.5|PC01|Data|pread|OK|a.txt\n"
+            )
+            write = read.replace("pread|OK|a.txt", "pwrite|OK|changed.txt")
+            with open(active, "w", encoding="utf-8") as handle:
+                handle.write(read)
+
+            store = audit_store.AuditStore(database)
+            try:
+                with mock.patch.object(
+                    audit_collector,
+                    "SAMBA_LOG_GLOB",
+                    os.path.join(tmpdir, "log.*"),
+                ):
+                    self.assertEqual(audit_collector.collect_once(store), 1)
+                    with open(active, "a", encoding="utf-8") as handle:
+                        handle.write(read)
+                    os.rename(active, f"{active}.old")
+                    with open(active, "w", encoding="utf-8") as handle:
+                        handle.write(write)
+                    self.assertEqual(audit_collector.collect_once(store), 1)
+
+                rows = store.conn.execute(
+                    "SELECT action, path FROM audit_events ORDER BY id"
+                ).fetchall()
+                self.assertEqual(
+                    [(row["action"], row["path"]) for row in rows],
+                    [("read", "a.txt"), ("write", "changed.txt")],
+                )
+            finally:
+                store.close()
+
+    def test_deduplicates_only_uninterrupted_identical_reads_in_one_second(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            active = os.path.join(tmpdir, "log.pc01")
+            database = os.path.join(tmpdir, "state.db")
+
+            def line(operation, path, second="12:34:56"):
+                return (
+                    f"[2026/07/31 {second}.000000, 1] smbd_audit: "
+                    f"x|alice|192.0.2.5|PC01|Data|{operation}|OK|{path}\n"
+                )
+
+            with open(active, "w", encoding="utf-8") as handle:
+                handle.writelines(
+                    [
+                        line("pread", "a.txt"),
+                        line("pread", "a.txt"),
+                        line("pread", "b.txt"),
+                        line("pread", "a.txt"),
+                        line("pread", "a.txt"),
+                    ]
+                )
+
+            store = audit_store.AuditStore(database)
+            try:
+                with mock.patch.object(
+                    audit_collector,
+                    "SAMBA_LOG_GLOB",
+                    os.path.join(tmpdir, "log.*"),
+                ):
+                    self.assertEqual(audit_collector.collect_once(store), 3)
+                    with open(active, "a", encoding="utf-8") as handle:
+                        handle.write(line("pread", "a.txt"))
+                    self.assertEqual(audit_collector.collect_once(store), 0)
+                    with open(active, "a", encoding="utf-8") as handle:
+                        handle.write(line("pwrite", "changed.txt"))
+                        handle.write(line("pread", "a.txt"))
+                    self.assertEqual(audit_collector.collect_once(store), 2)
+                    with open(active, "a", encoding="utf-8") as handle:
+                        handle.write(line("pread", "a.txt", "12:34:57"))
+                    self.assertEqual(audit_collector.collect_once(store), 1)
+
+                rows = store.conn.execute(
+                    "SELECT action, path, occurred_at FROM audit_events ORDER BY id"
+                ).fetchall()
+                self.assertEqual(
+                    [(row["action"], row["path"]) for row in rows],
+                    [
+                        ("read", "a.txt"),
+                        ("read", "b.txt"),
+                        ("read", "a.txt"),
+                        ("write", "changed.txt"),
+                        ("read", "a.txt"),
+                        ("read", "a.txt"),
+                    ],
+                )
+                self.assertTrue(rows[-1]["occurred_at"].endswith("12:34:57+00:00"))
+            finally:
+                store.close()
 
 
 class AuditQueryTests(unittest.TestCase):
     def make_event(self, timestamp, user, success=True):
         return {
             "timestamp": timestamp,
+            "ingestedAt": timestamp,
             "user": user,
             "clientIp": "192.0.2.5",
+            "client": "PC01",
             "share": "Data",
             "operation": "pread" if success else "unlinkat",
             "action": "read" if success else "delete",
             "path": "folder/file.txt",
             "result": "OK" if success else "NT_STATUS_ACCESS_DENIED",
             "success": success,
+            "source": "log.pc01",
         }
 
-    def test_queries_plain_and_compressed_days_with_filters_and_cursor(self):
+    def test_queries_indexed_events_with_filters_and_keyset_cursor(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             today = dt.datetime.now(dt.timezone.utc).date()
             yesterday = today - dt.timedelta(days=1)
-            current = os.path.join(tmpdir, f"{today.isoformat()}.jsonl")
-            old = os.path.join(tmpdir, f"{yesterday.isoformat()}.jsonl.gz")
-            with open(current, "w", encoding="utf-8") as handle:
-                for index in range(3):
-                    handle.write(json.dumps(self.make_event(f"{today}T12:00:0{index}+00:00", "alice")) + "\n")
-                handle.write(json.dumps(self.make_event(f"{today}T12:00:04+00:00", "bob", False)) + "\n")
-                ignored = self.make_event(f"{today}T12:00:05+00:00", "metadata-user")
-                ignored.update({"operation": "create_file", "action": "write"})
-                handle.write(json.dumps(ignored) + "\n")
-                handle.write(json.dumps(self.make_event(f"{today}T12:00:06+00:00", "robot_svc")) + "\n")
-            with gzip.open(old, "wt", encoding="utf-8") as handle:
-                handle.write(json.dumps(self.make_event(f"{yesterday}T12:00:00+00:00", "alice")) + "\n")
+            database = os.path.join(tmpdir, "state.db")
+            store = audit_store.AuditStore(database)
+            events = [
+                self.make_event(f"{today}T12:00:0{index}+00:00", "alice")
+                for index in range(3)
+            ]
+            events.extend(
+                [
+                    self.make_event(f"{today}T12:00:04+00:00", "bob", False),
+                    self.make_event(f"{today}T12:00:06+00:00", "robot_svc"),
+                    self.make_event(f"{yesterday}T12:00:00+00:00", "alice"),
+                ]
+            )
+            store.append_batch(events, {}, set())
+            store.close()
 
-            with mock.patch.object(web_ui, "AUDIT_ROOT", tmpdir):
-                first = web_ui.query_audit({"from": [yesterday.isoformat()], "to": [today.isoformat()], "user": ["alice"], "limit": ["2"]})
-                failed = web_ui.query_audit({"from": [today.isoformat()], "to": [today.isoformat()], "result": ["fail"]})
-                second = web_ui.query_audit({"from": [yesterday.isoformat()], "to": [today.isoformat()], "user": ["alice"], "limit": ["2"], "cursor": [str(first["nextCursor"])]})
-                visible = web_ui.query_audit({"from": [today.isoformat()], "to": [today.isoformat()], "limit": ["100"]})
+            with mock.patch.object(web_ui, "STATE_DB", database):
+                first = web_ui.query_audit(
+                    {
+                        "from": [yesterday.isoformat()],
+                        "to": [today.isoformat()],
+                        "user": ["alice"],
+                        "limit": ["2"],
+                    }
+                )
+                failed = web_ui.query_audit(
+                    {
+                        "from": [today.isoformat()],
+                        "to": [today.isoformat()],
+                        "result": ["fail"],
+                    }
+                )
+                second = web_ui.query_audit(
+                    {
+                        "from": [yesterday.isoformat()],
+                        "to": [today.isoformat()],
+                        "user": ["alice"],
+                        "limit": ["2"],
+                        "cursor": [str(first["nextCursor"])],
+                    }
+                )
+                visible = web_ui.query_audit(
+                    {
+                        "from": [today.isoformat()],
+                        "to": [today.isoformat()],
+                        "limit": ["100"],
+                    }
+                )
 
         self.assertEqual(first["matched"], 4)
         self.assertEqual(len(first["events"]), 2)
         self.assertEqual(len(second["events"]), 2)
         self.assertEqual(failed["events"][0]["user"], "bob")
-        self.assertNotIn("metadata-user", visible["facets"]["users"])
         self.assertNotIn("robot_svc", visible["facets"]["users"])
         self.assertEqual(set(visible["facets"]["actions"]), {"read", "delete"})
+
+    def test_schema_has_filter_and_time_indexes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = audit_store.AuditStore(os.path.join(tmpdir, "state.db"))
+            try:
+                indexes = {
+                    row[0]
+                    for row in store.conn.execute(
+                        "SELECT name FROM sqlite_schema WHERE type = 'index'"
+                    )
+                }
+            finally:
+                store.close()
+        self.assertTrue(
+            {
+                "audit_events_time",
+                "audit_events_action_time",
+                "audit_events_success_time",
+                "audit_events_user_time",
+                "audit_events_account_time",
+                "audit_events_share_time",
+                "audit_events_result_time",
+            }.issubset(indexes)
+        )
+
+    def test_drops_only_known_legacy_audit_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for name in (
+                "2026-07-30.jsonl",
+                "2026-07-29.jsonl.gz",
+                "collector-state.json",
+                "keep.txt",
+            ):
+                with open(os.path.join(tmpdir, name), "w", encoding="utf-8"):
+                    pass
+
+            self.assertEqual(audit_store.drop_legacy_audit_files(tmpdir), 3)
+            self.assertEqual(os.listdir(tmpdir), ["keep.txt"])
+
+
+class StateDatabaseMigrationTests(unittest.TestCase):
+    def test_drops_only_known_recomputable_web_cache_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for name in ("usage.json", "usage.json.tmp", "keep.txt"):
+                with open(os.path.join(tmpdir, name), "w", encoding="utf-8"):
+                    pass
+
+            self.assertEqual(state_db.drop_legacy_web_cache(tmpdir), 2)
+            self.assertEqual(os.listdir(tmpdir), ["keep.txt"])
 
 
 class WebPresentationTests(unittest.TestCase):
@@ -283,16 +474,26 @@ class UsageScannerTests(unittest.TestCase):
                 handle.write(b"b" * 3)
             with open(os.path.join(fslogix_root, "alice_S-1-5-21-1-2-3-1001", "c"), "wb") as handle:
                 handle.write(b"c" * 5)
-            cache = os.path.join(tmpdir, "usage.json")
+            database = os.path.join(tmpdir, "state.db")
 
             env = {"GROUP_ROOT": group_root, "PRIVATE_ROOT": private_root, "FSLOGIX_ROOT": fslogix_root}
-            with mock.patch.dict(os.environ, env), mock.patch.object(web_ui, "USAGE_CACHE_FILE", cache), mock.patch.object(web_ui, "fslogix_username", return_value="alice"):
+            with mock.patch.dict(os.environ, env), mock.patch.object(web_ui, "STATE_DB", database), mock.patch.object(web_ui, "fslogix_username", return_value="alice"):
                 value = web_ui.UsageScanner().scan()
 
-        self.assertEqual(value["totals"]["dataBytes"], 7)
-        self.assertEqual(value["users"][0]["privateBytes"], 3)
-        self.assertEqual(value["users"][0]["fslogixBytes"], 5)
-        self.assertEqual(value["users"][0]["totalBytes"], 8)
+            self.assertEqual(value["totals"]["dataBytes"], 7)
+            self.assertEqual(value["users"][0]["privateBytes"], 3)
+            self.assertEqual(value["users"][0]["fslogixBytes"], 5)
+            self.assertEqual(value["users"][0]["totalBytes"], 8)
+            conn = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT count(*) FROM web_cache WHERE key = 'usage'"
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":

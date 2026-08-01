@@ -1,5 +1,7 @@
 import io
 import os
+import shutil
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -184,6 +186,56 @@ class ProgressParsingTests(unittest.TestCase):
 
         self.assertEqual(sizes[tmpdir], 8)
         self.assertEqual(total, 8)
+
+
+class StateSnapshotTests(unittest.TestCase):
+    def test_online_snapshot_includes_wal_commits_and_other_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_root = os.path.join(tmpdir, "state")
+            os.mkdir(state_root)
+            database = os.path.join(state_root, "shares.db")
+            with open(os.path.join(state_root, "backup-status.json"), "w", encoding="utf-8") as handle:
+                handle.write("status")
+
+            writer = sqlite3.connect(database)
+            writer.execute("PRAGMA journal_mode = WAL")
+            writer.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, value TEXT)")
+            writer.execute("INSERT INTO events (value) VALUES ('committed-in-wal')")
+            writer.commit()
+            snapshot_root = None
+            try:
+                snapshot_root, staged_state = backup.prepare_state_snapshot(
+                    state_root,
+                    database,
+                )
+                staged_database = os.path.join(staged_state, "shares.db")
+                reader = sqlite3.connect(staged_database)
+                try:
+                    self.assertEqual(
+                        reader.execute("SELECT value FROM events").fetchone()[0],
+                        "committed-in-wal",
+                    )
+                    self.assertEqual(reader.execute("PRAGMA quick_check").fetchone()[0], "ok")
+                finally:
+                    reader.close()
+                with open(os.path.join(staged_state, "backup-status.json"), encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "status")
+                self.assertFalse(os.path.exists(f"{staged_database}-wal"))
+                self.assertFalse(os.path.exists(f"{staged_database}-shm"))
+            finally:
+                writer.close()
+                if snapshot_root is not None:
+                    shutil.rmtree(snapshot_root, ignore_errors=True)
+
+    def test_state_database_must_be_inside_state_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_root = os.path.join(tmpdir, "state")
+            os.mkdir(state_root)
+            database = os.path.join(tmpdir, "outside.db")
+            sqlite3.connect(database).close()
+
+            with self.assertRaisesRegex(RuntimeError, "below STATE_ROOT"):
+                backup.prepare_state_snapshot(state_root, database)
 
 
 class BackendProgressCommandTests(unittest.TestCase):

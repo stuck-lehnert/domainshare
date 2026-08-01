@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
-"""Persist Samba full_audit records as immutable daily NDJSON archives."""
+"""Persist selected Samba full_audit records in indexed SQLite tables."""
 
 import datetime as dt
 import glob
-import gzip
-import json
 import os
 import re
 import signal
 import sys
 import time
-from typing import Dict, Iterable, Optional
+from typing import Dict, Optional
 
 try:
     from .audit_policy import action_for, skip_user
+    from .audit_store import AuditStore, drop_legacy_audit_files
 except ImportError:
     from audit_policy import action_for, skip_user
+    from audit_store import AuditStore, drop_legacy_audit_files
 
 
 SAMBA_LOG_GLOB = os.getenv("AUDIT_SOURCE_GLOB", "/var/log/samba/log.*")
-ARCHIVE_DIR = os.getenv("AUDIT_ARCHIVE_DIR", "/state/audit")
-STATE_FILE = os.path.join(ARCHIVE_DIR, "collector-state.json")
+LEGACY_AUDIT_DIR = os.getenv("AUDIT_ARCHIVE_DIR", "/state/audit")
 POLL_SECONDS = max(0.2, float(os.getenv("AUDIT_POLL_SECONDS", "1")))
-COMPRESS_AFTER_HOURS = max(
-    1, int(os.getenv("AUDIT_COMPRESS_AFTER_HOURS", "24"))
-)
 AUDIT_MARKER_RE = re.compile(r"smbd_audit:\s*(.*)$")
 AUDIT_PAYLOAD_RE = re.compile(
     r"^\s*\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\|"
@@ -41,26 +37,6 @@ def log(message: str) -> None:
 
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
-
-
-def atomic_json(path: str, value: object) -> None:
-    temp_path = f"{path}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as handle:
-        json.dump(value, handle, separators=(",", ":"), sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp_path, path)
-
-
-def load_state() -> Dict[str, Dict[str, object]]:
-    try:
-        with open(STATE_FILE, encoding="utf-8") as handle:
-            value = json.load(handle)
-        if isinstance(value, dict):
-            return value
-    except (OSError, ValueError):
-        pass
-    return {}
 
 
 def parse_samba_timestamp(raw_line: str, fallback: dt.datetime) -> str:
@@ -108,29 +84,6 @@ def parse_audit_line(raw_line: str, source: str) -> Optional[Dict[str, object]]:
     }
 
 
-def archive_events(events: Iterable[Dict[str, object]]) -> int:
-    handles: Dict[str, object] = {}
-    count = 0
-    try:
-        for event in events:
-            day = str(event["ingestedAt"])[:10]
-            path = os.path.join(ARCHIVE_DIR, f"{day}.jsonl")
-            handle = handles.get(path)
-            if handle is None:
-                handle = open(path, "a", encoding="utf-8")
-                handles[path] = handle
-            handle.write(json.dumps(event, separators=(",", ":"), sort_keys=True))
-            handle.write("\n")
-            count += 1
-        for handle in handles.values():
-            handle.flush()
-            os.fsync(handle.fileno())
-    finally:
-        for handle in handles.values():
-            handle.close()
-    return count
-
-
 def read_new_events(path: str, entry: Dict[str, object]):
     stat = os.stat(path)
     inode = int(stat.st_ino)
@@ -157,60 +110,40 @@ def read_new_events(path: str, entry: Dict[str, object]):
     return events, {"inode": inode, "offset": new_offset}
 
 
-def compress_old_archives() -> None:
-    cutoff = utc_now() - dt.timedelta(hours=COMPRESS_AFTER_HOURS)
-    today = utc_now().date().isoformat()
-    for path in glob.glob(os.path.join(ARCHIVE_DIR, "????-??-??.jsonl")):
-        day = os.path.basename(path)[:10]
-        if day == today:
-            continue
-        try:
-            modified = dt.datetime.fromtimestamp(os.path.getmtime(path), dt.timezone.utc)
-            if modified > cutoff:
-                continue
-            target = f"{path}.gz"
-            temp_target = f"{target}.tmp"
-            with open(path, "rb") as source, gzip.open(temp_target, "wb", compresslevel=6) as output:
-                while True:
-                    chunk = source.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    output.write(chunk)
-            os.replace(temp_target, target)
-            os.remove(path)
-            log(f"Compressed {os.path.basename(path)}")
-        except OSError as exc:
-            log(f"Unable to compress {path}: {exc}")
-
-
-def collect_once(state: Dict[str, Dict[str, object]]) -> int:
-    total = 0
+def collect_once(store: AuditStore) -> int:
+    state = store.source_entries()
+    all_events = []
+    source_updates = {}
     seen = set()
     initial_by_inode = {
         int(entry.get("inode", -1)): entry
         for entry in state.values()
-        if isinstance(entry, dict) and int(entry.get("inode", -1)) >= 0
+        if int(entry.get("inode", -1)) >= 0
     }
-    for path in sorted(glob.glob(SAMBA_LOG_GLOB)):
+    candidates = []
+    for path in glob.glob(SAMBA_LOG_GLOB):
         if not os.path.isfile(path):
             continue
+        try:
+            stat = os.stat(path)
+        except OSError as exc:
+            log(f"Unable to inspect {path}: {exc}")
+            continue
+        known_inode = int(stat.st_ino) in initial_by_inode
+        candidates.append((not known_inode, stat.st_mtime_ns, path, int(stat.st_ino)))
+
+    for _is_new, _mtime_ns, path, current_inode in sorted(candidates):
         seen.add(path)
         try:
             path_entry = state.get(path, {})
-            current_inode = os.stat(path).st_ino
             if int(path_entry.get("inode", -1)) != current_inode:
                 path_entry = initial_by_inode.get(current_inode, {})
             events, new_entry = read_new_events(path, path_entry)
-            if events:
-                total += archive_events(events)
-            state[path] = new_entry
+            all_events.extend(events)
+            source_updates[path] = new_entry
         except OSError as exc:
             log(f"Unable to read {path}: {exc}")
-    for stale_path in list(state):
-        if stale_path not in seen:
-            state.pop(stale_path, None)
-    atomic_json(STATE_FILE, state)
-    return total
+    return store.append_batch(all_events, source_updates, seen)
 
 
 def stop(_signum, _frame) -> None:
@@ -219,23 +152,24 @@ def stop(_signum, _frame) -> None:
 
 
 def main() -> int:
-    os.makedirs(ARCHIVE_DIR, mode=0o750, exist_ok=True)
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    state = load_state()
-    last_compress = 0.0
-    log(f"Watching {SAMBA_LOG_GLOB}")
-    while not STOP:
-        try:
-            count = collect_once(state)
-            if count:
-                log(f"Archived {count} event(s)")
-            if time.monotonic() - last_compress >= 3600:
-                compress_old_archives()
-                last_compress = time.monotonic()
-        except Exception as exc:  # pylint: disable=broad-except
-            log(f"Collector cycle failed: {exc}")
-        time.sleep(POLL_SECONDS)
+    store = AuditStore()
+    removed = drop_legacy_audit_files(LEGACY_AUDIT_DIR)
+    if removed:
+        log(f"Dropped {removed} legacy audit archive file(s)")
+    log(f"Watching {SAMBA_LOG_GLOB}; storing events in SQLite")
+    try:
+        while not STOP:
+            try:
+                count = collect_once(store)
+                if count:
+                    log(f"Stored {count} event(s)")
+            except Exception as exc:  # pylint: disable=broad-except
+                log(f"Collector cycle failed: {exc}")
+            time.sleep(POLL_SECONDS)
+    finally:
+        store.close()
     return 0
 
 

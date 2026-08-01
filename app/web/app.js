@@ -306,12 +306,12 @@ async function renderSystem() {
     <section class="panel"><div class="panel-head"><h2>Dienstprüfungen</h2><span>${esc(data.hostname)}</span></div><div class="check-list">
       <div class="check"><span>Domänenvertrauen</span>${data.checks.domainTrust ? badge("In Ordnung") : badge("Fehlgeschlagen", "error")}</div>
       <div class="check"><span>Samba-Konfiguration</span>${data.checks.sambaConfig ? badge("Gültig") : badge("Fehlgeschlagen", "error")}</div>
-      <div class="check"><span>Aktivitätsarchiv</span><strong>${data.audit.days} Tage · ${bytes(data.audit.bytes)}</strong></div>
+      <div class="check"><span>Aktivitätsdatenbank</span><strong>${data.audit.days} Tage · ${bytes(data.audit.bytes)}</strong></div>
       <div class="check"><span>Speicherprüfung</span><strong>${usage.scannedAt ? esc(utcTime(usage.scannedAt)) : "Ausstehend"}</strong></div>
     </div></section>
     <section class="split">
       <article class="panel"><h2>TLS-Zertifikat</h2><dl><dt>Allgemeiner Name</dt><dd>${esc(data.tls.subject?.commonName || "—")}</dd><dt>Aussteller</dt><dd>${esc(data.tls.issuer?.commonName || "—")}</dd><dt>Gültig bis</dt><dd>${esc(utcTime(data.tls.notAfter))}</dd><dt>Namen</dt><dd>${esc((data.tls.sans || []).map(value => value[1]).join(", ") || "—")}</dd></dl></article>
-      <article class="panel"><h2>Protokollaufbewahrung</h2><dl><dt>Ältester UTC-Tag</dt><dd>${esc(data.audit.oldest || "—")}</dd><dt>Neuester UTC-Tag</dt><dd>${esc(data.audit.newest || "—")}</dd><dt>Archivgröße</dt><dd>${bytes(data.audit.bytes)}</dd></dl><p class="muted">Abgeschlossene Tagesdateien werden automatisch komprimiert und aufbewahrt, bis ein Administrator sie entfernt.</p></article>
+      <article class="panel"><h2>Protokollspeicherung</h2><dl><dt>Ältester UTC-Tag</dt><dd>${esc(data.audit.oldest || "—")}</dd><dt>Neuester UTC-Tag</dt><dd>${esc(data.audit.newest || "—")}</dd><dt>Datenbankgröße</dt><dd>${bytes(data.audit.bytes)}</dd></dl><p class="muted">Ereignisse werden dauerhaft und indexiert in der gemeinsamen SQLite-Datenbank gespeichert.</p></article>
     </section>`;
 }
 
