@@ -227,7 +227,8 @@ def main() -> int:
     check(any(kind == "group" and sam == "Finance_Analysts" for kind, sam, _ in finance_nodes), "nested Finance Analysts group missing")
     check({"alice", "bob"}.issubset({sam for kind, sam, _ in finance_nodes if kind == "user"}), "Finance users missing")
     project_nodes = flatten_members(groups["Projects"].get("members", []))
-    check({"alice", "bob", "carol", "dave", "eve"}.issubset({sam for kind, sam, _ in project_nodes if kind == "user"}), "transitive Project membership is incomplete")
+    check({"alice", "bob", "carol", "dave", "eve", "frank"}.issubset({sam for kind, sam, _ in project_nodes if kind == "user"}), "transitive or primary-group Project membership is incomplete")
+    check(any(kind == "group" and sam == "Domain Users" for kind, sam, _ in project_nodes), "nested Domain Users group missing")
 
     announce("SMB authorization and real share reads/writes")
     alice_access = engine_run(
@@ -242,6 +243,12 @@ def main() -> int:
         check_result=False,
     )
     check(dave_denied.returncode != 0, "unrelated user Dave can access Finance")
+    frank_projects = engine_run(
+        "exec", CLIENT_CONTAINER, "smbclient", f"//files.{DNS_DOMAIN}/Data", "-m", "SMB3",
+        "-U", f"{WORKGROUP}\\frank%{USER_PASSWORD}", "-c", "cd Projects; ls",
+        check_result=False,
+    )
+    check(frank_projects.returncode == 0, "primary Domain Users membership did not grant Projects access")
     admin_access = engine_run(
         "exec", CLIENT_CONTAINER, "smbclient", f"//files.{DNS_DOMAIN}/Data", "-m", "SMB3",
         "-U", f"{WORKGROUP}\\{ADMIN_USER}%{ADMIN_PASSWORD}", "-c", "cd Finance; ls",

@@ -97,6 +97,7 @@ ensure_user bob "$AD_USER_PASSWORD" Bob Brown
 ensure_user carol "$AD_USER_PASSWORD" Carol Clark
 ensure_user dave "$AD_USER_PASSWORD" Dave Davis
 ensure_user eve "$AD_USER_PASSWORD" Eve Evans
+ensure_user frank "$AD_USER_PASSWORD" Frank Foster
 ensure_user "$AD_WEB_ADMIN_USER" "$AD_WEB_ADMIN_PASSWORD" Preview Administrator
 ensure_user report_svc "$AD_USER_PASSWORD" Report Service
 
@@ -115,6 +116,7 @@ add_members FS_Finance 'Finance_Analysts,bob,report_svc'
 add_members Engineering_Leads carol
 add_members FS_Engineering 'Engineering_Leads,dave'
 add_members FS_Projects 'FS_Finance,FS_Engineering,eve'
+add_members FS_Projects 'Domain Users'
 add_members 'Domain Admins' "$AD_WEB_ADMIN_USER"
 
 add_dns_record() {

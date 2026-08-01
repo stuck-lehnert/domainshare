@@ -438,8 +438,8 @@ def display_name(entry) -> str:
 
 class DirectoryCache:
     ATTRS = [
-        "objectGUID", "distinguishedName", "sAMAccountName", "displayName", "cn",
-        "objectClass", "member",
+        "objectGUID", "objectSid", "distinguishedName", "sAMAccountName",
+        "displayName", "cn", "objectClass", "member", "primaryGroupID",
     ]
 
     def __init__(self):
@@ -487,6 +487,64 @@ class DirectoryCache:
                 if "group" in classes:
                     pending.extend(directory.ldap_values(entry, "member"))
 
+        group_keys_by_primary_rid: Dict[int, List[str]] = {}
+        for root in roots:
+            root_key = directory.normalize_dn(str(root.get("distinguishedName") or ""))
+            rid = directory.sid_rid(str(root.get("objectSid") or ""))
+            if root_key and rid is not None:
+                group_keys_by_primary_rid.setdefault(rid, []).append(root_key)
+        for key, entry in entries.items():
+            classes = {
+                value.lower()
+                for value in directory.ldap_values(entry, "objectClass")
+            }
+            if "group" not in classes:
+                continue
+            principal = directory.parse_principal_from_entry(entry)
+            rid = directory.sid_rid(
+                str(principal.get("objectSid") or "") if principal else ""
+            )
+            if rid is not None:
+                group_keys_by_primary_rid.setdefault(rid, []).append(key)
+
+        primary_members: Dict[str, List[str]] = {}
+        primary_members_truncated = False
+        if group_keys_by_primary_rid and len(entries) < self.max_nodes:
+            primary_entries = directory.search_directory_entries(
+                directory.build_primary_group_users_filter(
+                    group_keys_by_primary_rid.keys()
+                ),
+                self.ATTRS,
+            )
+            for entry in primary_entries:
+                key = directory.normalize_dn(directory.entry_dn(entry))
+                rid = directory.parse_int(
+                    directory.ldap_first(entry, "primaryGroupID") or "",
+                    -1,
+                )
+                if not key or rid not in group_keys_by_primary_rid:
+                    continue
+                if key not in entries and len(entries) >= self.max_nodes:
+                    primary_members_truncated = True
+                    continue
+                entries[key] = entry
+                for group_key in group_keys_by_primary_rid[rid]:
+                    primary_members.setdefault(group_key, []).append(
+                        directory.entry_dn(entry)
+                    )
+        elif group_keys_by_primary_rid:
+            primary_members_truncated = True
+
+        def effective_members(group_key: str, explicit_dns) -> List[str]:
+            result = []
+            seen = set()
+            for dn in [*explicit_dns, *primary_members.get(group_key, [])]:
+                key = directory.normalize_dn(str(dn))
+                if key and key not in seen:
+                    seen.add(key)
+                    result.append(str(dn))
+            return result
+
         folder_map = {}
         try:
             conn = connect_state_db(STATE_DB, read_only=True)
@@ -521,13 +579,22 @@ class DirectoryCache:
                 next_ancestors = {*ancestors, key}
                 node["members"] = [
                     make_node(child, next_ancestors)
-                    for child in directory.ldap_values(entry, "member")
+                    for child in effective_members(
+                        key,
+                        directory.ldap_values(entry, "member"),
+                    )
                 ]
             return node
 
         group_rows = []
         for root in sorted(roots, key=lambda item: str(item["shareName"]).casefold()):
-            members = [make_node(str(dn), set()) for dn in root.get("memberDns", [])]
+            root_key = directory.normalize_dn(
+                str(root.get("distinguishedName") or "")
+            )
+            members = [
+                make_node(dn, set())
+                for dn in effective_members(root_key, root.get("memberDns", []))
+            ]
             flat_users = set()
             flat_groups = set()
 
@@ -555,7 +622,7 @@ class DirectoryCache:
         return {
             "groups": group_rows,
             "fetchedAt": now_utc().isoformat(timespec="seconds"),
-            "truncated": bool(pending),
+            "truncated": bool(pending) or primary_members_truncated,
         }
 
 

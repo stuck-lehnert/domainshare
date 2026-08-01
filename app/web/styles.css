@@ -44,6 +44,12 @@ nav a.active { font-weight: bold; background: #ddd; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: .7rem; }
 .panel-head h2 { margin: 0; }
 .split { display: grid; grid-template-columns: minmax(260px, .7fr) minmax(380px, 1.3fr); gap: 1rem; }
+.shares-view { display: flex; height: calc(100vh - 4.5rem); height: calc(100dvh - 4.5rem); min-height: 0; flex-direction: column; }
+.shares-split { min-height: 0; flex: 1; }
+.shares-split > .panel { display: flex; min-height: 0; margin-bottom: 0; flex-direction: column; }
+.shares-split .list { min-height: 0; flex: 1; overflow-y: auto; }
+.shares-split #tree-panel { display: flex; height: 100%; min-height: 0; flex-direction: column; }
+.shares-split .tree { min-height: 0; max-height: none; flex: 1; overflow-y: auto; }
 .filters { display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)); gap: .6rem; margin-bottom: 1rem; align-items: end; }
 .filters .wide { grid-column: span 2; }
 .table-wrap { width: 100%; overflow-x: auto; }
@@ -82,6 +88,7 @@ progress { width: 100%; }
   .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .filters { grid-template-columns: repeat(3, minmax(120px, 1fr)); }
   .split { grid-template-columns: 1fr; }
+  .shares-split { grid-template-rows: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 700px) {
   .sidebar { display: none; z-index: 5; }

@@ -34,6 +34,7 @@ GROUP_TITLE_ATTRS = ("displayname", "name", "cn")
 USER_STATUS_FILTER = "(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=*))"
 GROUP_SEARCH_ATTRS = [
     "objectGUID",
+    "objectSid",
     "sAMAccountName",
     "displayName",
     "name",
@@ -45,6 +46,7 @@ GROUP_SEARCH_ATTRS = [
 ]
 NESTED_GROUP_SEARCH_ATTRS = [
     "objectGUID",
+    "objectSid",
     "sAMAccountName",
     "distinguishedName",
     "memberOf",
@@ -89,6 +91,7 @@ NestedGroupLookup = Callable[[str], Dict[str, Principal]]
 @dataclass
 class MembershipExpansion:
     group_sams: List[str] = field(default_factory=list)
+    group_sids: Dict[str, str] = field(default_factory=dict)
     unresolved_dns: List[str] = field(default_factory=list)
     cycle_paths: List[List[str]] = field(default_factory=list)
 
@@ -123,6 +126,36 @@ def parse_guid(raw_value: str, is_b64: bool) -> str:
 
     candidate = raw_value.strip().strip("{}")
     return str(uuid.UUID(candidate))
+
+
+def parse_sid(raw_value: str, is_b64: bool) -> str:
+    if not is_b64:
+        candidate = raw_value.strip()
+        if re.fullmatch(r"S-\d+(?:-\d+)+", candidate, re.IGNORECASE):
+            return candidate.upper()
+        raise ValueError("objectSid is not a textual SID")
+
+    raw = base64.b64decode(raw_value)
+    if len(raw) < 8:
+        raise ValueError("objectSid is too short")
+    revision = raw[0]
+    subauthority_count = raw[1]
+    expected_length = 8 + subauthority_count * 4
+    if len(raw) != expected_length:
+        raise ValueError("objectSid has invalid binary length")
+    authority = int.from_bytes(raw[2:8], "big")
+    subauthorities = [
+        int.from_bytes(raw[offset : offset + 4], "little")
+        for offset in range(8, expected_length, 4)
+    ]
+    return "-".join([f"S-{revision}", str(authority), *map(str, subauthorities)])
+
+
+def sid_rid(sid: str) -> Optional[int]:
+    try:
+        return int(sid.rsplit("-", 1)[1])
+    except (AttributeError, IndexError, ValueError):
+        return None
 
 
 def format_duration(seconds: float) -> str:
@@ -286,10 +319,19 @@ def parse_principal_from_entry(entry: LdapEntry) -> Optional[Principal]:
         except ValueError:
             guid = ""
 
+    sid = ""
+    sid_raw = ldap_first_raw(entry, "objectSid")
+    if sid_raw is not None:
+        try:
+            sid = parse_sid(sid_raw[0].strip(), sid_raw[1])
+        except ValueError:
+            sid = ""
+
     object_classes = {value.lower() for value in ldap_values(entry, "objectClass")}
     return {
         "dn": dn,
         "objectGUID": guid,
+        "objectSid": sid,
         "samAccountName": ldap_first(entry, "sAMAccountName") or "",
         "memberDns": ldap_values(entry, "member"),
         "memberOfDns": ldap_values(entry, "memberOf"),
@@ -310,6 +352,13 @@ def parse_groups_from_ldap_entries(entries: List[LdapEntry]) -> List[Dict[str, o
             continue
 
         guid = parse_guid(guid_raw[0].strip(), guid_raw[1])
+        sid = ""
+        sid_raw = ldap_first_raw(entry, "objectSid")
+        if sid_raw is not None:
+            try:
+                sid = parse_sid(sid_raw[0].strip(), sid_raw[1])
+            except ValueError:
+                sid = ""
         object_classes = {value.lower() for value in ldap_values(entry, "objectClass")}
         if not object_classes:
             object_classes = {"group"}
@@ -317,6 +366,7 @@ def parse_groups_from_ldap_entries(entries: List[LdapEntry]) -> List[Dict[str, o
         groups.append(
             {
                 "objectGUID": guid,
+                "objectSid": sid,
                 "samAccountName": sam,
                 "shareName": share_name,
                 "distinguishedName": entry_dn(entry),
@@ -511,6 +561,7 @@ def group_to_principal(group: Dict[str, object]) -> Principal:
     return {
         "dn": str(group.get("distinguishedName") or ""),
         "objectGUID": str(group.get("objectGUID") or ""),
+        "objectSid": str(group.get("objectSid") or ""),
         "samAccountName": str(group.get("samAccountName") or ""),
         "memberDns": [str(dn) for dn in group.get("memberDns", []) if str(dn).strip()],
         "memberOfDns": [
@@ -547,6 +598,16 @@ def build_nested_groups_filter(root_dn: str) -> str:
         "(&(objectClass=group)"
         f"(memberOf:{LDAP_MATCHING_RULE_IN_CHAIN}:={escaped_root_dn}))"
     )
+
+
+def build_primary_group_users_filter(rids: Iterable[int]) -> str:
+    values = sorted({int(rid) for rid in rids if int(rid) >= 0})
+    if not values:
+        raise ValueError("At least one primary group RID is required")
+    rid_filter = "".join(f"(primaryGroupID={rid})" for rid in values)
+    if len(values) > 1:
+        rid_filter = f"(|{rid_filter})"
+    return f"(&(objectClass=user)(!(objectClass=computer)){rid_filter})"
 
 
 def lookup_nested_group_principals(root_dn: str) -> Dict[str, Principal]:
@@ -652,6 +713,9 @@ def expand_group_membership(
         if sam_key not in seen_sams:
             seen_sams.add(sam_key)
             expansion.group_sams.append(sam)
+            sid = str(principal.get("objectSid") or "").strip()
+            if sid:
+                expansion.group_sids[sam_key] = sid
 
     expansion.cycle_paths = find_group_cycle_paths(all_groups)
     return expansion
@@ -956,22 +1020,29 @@ def resolve_group_gids_for_acl(
     workgroup: str,
     group_names: List[str],
     resolver: Callable[[str, str], Optional[int]] = resolve_group_gid_flexible,
+    *,
+    group_sids: Optional[List[str]] = None,
+    sid_resolver: Callable[[str], Optional[int]] = resolve_gid_from_sid,
 ) -> Tuple[List[int], List[str]]:
     gids: List[int] = []
     unresolved: List[str] = []
     seen_gids: Set[int] = set()
     seen_names: Set[str] = set()
+    sids = group_sids or []
 
-    for group_name in group_names:
+    for index, group_name in enumerate(group_names):
         name = group_name.strip()
         name_key = name.casefold()
         if not name or name_key in seen_names:
             continue
         seen_names.add(name_key)
 
-        gid = resolver(workgroup, name)
+        sid = sids[index].strip() if index < len(sids) else ""
+        gid = sid_resolver(sid) if sid else None
         if gid is None:
-            unresolved.append(name)
+            gid = resolver(workgroup, name)
+        if gid is None:
+            unresolved.append(f"{name} ({sid})" if sid else name)
             continue
         if gid not in seen_gids:
             seen_gids.add(gid)
@@ -1406,9 +1477,18 @@ def sync_dynamic_directory_permissions(
             continue
 
         acl_group_names = [sam, *expansion.group_sams]
+        acl_group_sids = [
+            str(ad_group.get("objectSid") or ""),
+            *[
+                expansion.group_sids.get(group_name.casefold(), "")
+                for group_name in expansion.group_sams
+            ],
+        ]
         gid_started = time.monotonic()
         acl_group_gids, unresolved_groups = resolve_group_gids_for_acl(
-            workgroup, acl_group_names
+            workgroup,
+            acl_group_names,
+            group_sids=acl_group_sids,
         )
         gid_elapsed = time.monotonic() - gid_started
         if unresolved_groups or not acl_group_gids:

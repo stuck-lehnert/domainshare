@@ -65,6 +65,55 @@ class DomainAuthenticationTests(unittest.TestCase):
         self.assertNotIn("p@ss word", run.call_args_list[0].args[0])
 
 
+class DirectoryPrimaryGroupTests(unittest.TestCase):
+    def test_tree_expands_users_whose_primary_group_is_nested(self):
+        domain_users_dn = "CN=Domänen-Benutzer,CN=Users,DC=example,DC=com"
+        frank_dn = "CN=Frank,CN=Users,DC=example,DC=com"
+        root = {
+            "objectGUID": "root-guid",
+            "objectSid": "S-1-5-21-111-222-333-1200",
+            "samAccountName": "FS_Alle",
+            "shareName": "Alle",
+            "distinguishedName": "CN=FS_Alle,CN=Users,DC=example,DC=com",
+            "memberDns": [domain_users_dn],
+            "objectClasses": {"group"},
+        }
+        domain_users = {
+            "distinguishedname": [(domain_users_dn, False)],
+            "objectsid": [("S-1-5-21-111-222-333-513", False)],
+            "samaccountname": [("Domänen-Benutzer", False)],
+            "displayname": [("Domänen-Benutzer", False)],
+            "objectclass": [("group", False)],
+        }
+        frank = {
+            "distinguishedname": [(frank_dn, False)],
+            "samaccountname": [("frank", False)],
+            "displayname": [("Frank", False)],
+            "primarygroupid": [("513", False)],
+            "objectclass": [("user", False)],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
+            web_ui, "STATE_DB", os.path.join(tmpdir, "missing.db")
+        ), mock.patch.object(
+            web_ui.directory, "fetch_fileshare_groups", return_value=[root]
+        ), mock.patch.object(
+            web_ui.directory,
+            "search_directory_entries",
+            side_effect=[[domain_users], [frank]],
+        ):
+            result = web_ui.DirectoryCache().fetch()
+
+        nested_group = result["groups"][0]["members"][0]
+        self.assertEqual(nested_group["sam"], "Domänen-Benutzer")
+        self.assertEqual(
+            [member["sam"] for member in nested_group["members"]],
+            ["frank"],
+        )
+        self.assertEqual(result["groups"][0]["userCount"], 1)
+        self.assertFalse(result["truncated"])
+
+
 class AuditParsingTests(unittest.TestCase):
     def test_parses_full_audit_record(self):
         line = (
@@ -420,12 +469,18 @@ class WebPresentationTests(unittest.TestCase):
         self.assertNotIn("localTime", script)
         self.assertIn('class="timestamp"', script)
         self.assertIn(".timestamp { text-align: left;", css)
-        self.assertIn("Umbenennen/Verschieben", script)
+        self.assertIn("Umbenennen", script)
+        self.assertNotIn("Umbenennen/Verschieben", script)
         self.assertIn("Löschen", script)
         self.assertNotIn(">Auflisten<", script)
         self.assertNotIn(">Metadaten<", script)
         self.assertNotIn(">Sitzung<", script)
         self.assertNotIn('name="operation"', script)
+        self.assertIn('class="shares-view"', script)
+        self.assertIn('class="split shares-split"', script)
+        self.assertIn(".shares-view { display: flex; height: calc(100vh - 4.5rem);", css)
+        self.assertIn(".shares-split .list", css)
+        self.assertIn(".shares-split .tree", css)
 
     def test_samba_audits_only_supported_file_operations(self):
         path = os.path.join(os.path.dirname(__file__), "..", "etc", "samba", "smb.conf")

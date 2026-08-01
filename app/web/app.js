@@ -24,7 +24,7 @@ const utcTime = value => {
   const pad = number => String(number).padStart(2, "0");
   return `${pad(date.getUTCDate())}.${pad(date.getUTCMonth() + 1)}.${date.getUTCFullYear()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())} UTC`;
 };
-const actionLabel = value => ({read: "Lesen", write: "Schreiben", move: "Umbenennen/Verschieben", delete: "Löschen"}[value] || value || "—");
+const actionLabel = value => ({read: "Lesen", write: "Schreiben", move: "Umbenennen", delete: "Löschen"}[value] || value || "—");
 const nodeTypeLabel = value => ({group: "Gruppe", user: "Benutzer", computer: "Computer", unknown: "Unbekannt"}[value] || value);
 const backupStateLabel = value => ({starting: "Startet", running: "Läuft", completed: "Abgeschlossen", failed: "Fehlgeschlagen", waiting: "Wartet", disabled: "Deaktiviert"}[value] || value || "Unbekannt");
 function backupMessage(data) {
@@ -186,12 +186,12 @@ async function renderShares() {
   const data = await api("/api/groups");
   state.groups = data;
   const groups = data.groups || [];
-  content.innerHTML = pageHead("Dateifreigaben", "FS_*-Ordnergruppen und ihre wirksamen verschachtelten Mitgliedschaften.", `<span class="muted">Verzeichnisstand ${esc(utcTime(data.fetchedAt))}</span>`) + `
+  content.innerHTML = `<div class="shares-view">` + pageHead("Dateifreigaben", "FS_*-Ordnergruppen und ihre wirksamen verschachtelten Mitgliedschaften.", `<span class="muted">Verzeichnisstand ${esc(utcTime(data.fetchedAt))}</span>`) + `
     ${data.truncated ? `<p>${badge("Ergebnis gekürzt", "warn")} WEB_MAX_GROUP_NODES erhöhen, um alle Mitglieder anzuzeigen.</p>` : ""}
-    <section class="split">
+    <section class="split shares-split">
       <article class="panel"><div class="panel-head"><h2>Gruppenordner</h2><span>${groups.length}</span></div><input id="group-filter" type="search" placeholder="Gruppen oder Mitglieder filtern"><ul id="group-list" class="list"></ul></article>
       <article class="panel"><div id="tree-panel"></div></article>
-    </section>`;
+    </section></div>`;
   const list = document.querySelector("#group-list");
   const tree = document.querySelector("#tree-panel");
   let selected = groups[0] || null;
@@ -230,14 +230,14 @@ async function renderStorage(type) {
 async function renderActivity() {
   const today = new Date();
   const yesterday = new Date(Date.now() - 86400000);
-  content.innerHTML = pageHead("Aktivitätsprotokoll", "Lese-, Schreib-, Umbenennungs-/Verschiebe- und Löschvorgänge nach Datum, Identität, Freigabe, Ergebnis oder Pfad durchsuchen.") + `
+  content.innerHTML = pageHead("Aktivitätsprotokoll", "Lese-, Schreib-, Umbenennungs- und Löschvorgänge nach Datum, Identität, Freigabe, Ergebnis oder Pfad durchsuchen.") + `
     <section class="panel">
       <form id="activity-filter" class="filters">
         <label>Von (UTC)<input name="from" type="date" value="${isoDay(yesterday)}" required></label>
         <label>Bis (UTC)<input name="to" type="date" value="${isoDay(today)}" required></label>
         <label>Benutzer<input name="user" list="users-list" placeholder="Alle Benutzer"></label>
         <label>Freigabe<input name="share" list="shares-list" placeholder="Alle Freigaben"></label>
-        <label>Aktion<select name="action"><option value="">Alle Aktionen</option><option value="read">Lesen</option><option value="write">Schreiben</option><option value="move">Umbenennen/Verschieben</option><option value="delete">Löschen</option></select></label>
+        <label>Aktion<select name="action"><option value="">Alle Aktionen</option><option value="read">Lesen</option><option value="write">Schreiben</option><option value="move">Umbenennen</option><option value="delete">Löschen</option></select></label>
         <label>Ergebnis<select name="result"><option value="">Alle Ergebnisse</option><option value="OK">Erfolgreich</option><option value="fail">Fehlgeschlagen</option></select></label>
         <label class="wide">Pfad enthält<input name="path" placeholder="Ordner oder Dateiname"></label>
         <button type="submit">Filter anwenden</button>

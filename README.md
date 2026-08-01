@@ -10,7 +10,7 @@ This repository provides a production-oriented Samba file server container that 
   - `\\server\Data` -> `/data/groups/data`
   - `\\server\FSLogix` -> `/data/fslogix`
 - FS_* groups are projected as folders inside the Data share (`/data/groups/data/<groupName>`).
-- Data folder ACLs expand nested AD group membership recursively and detect group cycles.
+- Data folder ACLs expand nested AD group membership recursively, resolve groups by SID, include `primaryGroupID` membership, and detect group cycles.
 - Group records, normalized activity events, collector offsets, and web caches share one SQLite database at `/state/shares.db`.
 - Group folders are name-based while active and moved to archive on deactivation:
   - active: `/data/groups/data/<groupName>`
@@ -22,7 +22,7 @@ This repository provides a production-oriented Samba file server container that 
 - Setup prompts for well-known authorization groups by SID (`DOMAIN_USERS_SID`, `DOMAIN_ADMINS_SID`) to avoid localized group names.
 - `FSLOGIX_GROUP_SID` controls who can access the default FSLogix share (defaults to `DOMAIN_USERS_SID`).
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
-- Samba `full_audit` is restricted to successful and failed reads, writes, renames/moves, and deletions.
+- Samba `full_audit` is restricted to successful and failed reads, writes, renames, and deletions.
 - A collector normalizes those four actions and persists them in indexed SQLite tables; activity is never automatically deleted.
 - A read-only HTTPS web console provides group membership trees, storage usage, searchable activity, live backup progress, and system health.
 - Web sign-in validates the submitted username/password with Kerberos, permits only users whose winbind group SID set contains `DOMAIN_ADMINS_SID`, and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
@@ -120,7 +120,7 @@ The launcher builds the current application and starts an isolated, run-scoped n
 - a real Smallstep CA whose ACME provisioner issues the web UI certificate for `files.localhost`;
 - an authenticated rsync daemon used by the normal backup implementation;
 - the actual file-server image, joined to the dummy domain;
-- a continuous SMB client that exercises reads, writes, renames/moves, and deletions, including activity from an excluded dummy service account.
+- a continuous SMB client that exercises reads, writes, renames, and deletions, including activity from an excluded dummy service account.
 
 The preview starts with group, Private, and FSLogix data. The client keeps current activity moving, while a real backup runs immediately and repeats in the background. Open the URL and use the credentials printed by the launcher. Defaults are:
 
@@ -282,7 +282,7 @@ Open `https://<WEB_HOSTNAME>/` after setup. Only members of the group identified
 The console is intentionally operational and plain:
 
 - **Overview**: current capacity totals, active group count, recent activity, and backup state.
-- **File shares**: one selectable tree per active `FS_*` group/folder with recursively expanded user and nested-group membership, cycle markers, and a live filter.
+- **File shares**: one selectable tree per active `FS_*` group/folder with recursively expanded user, nested-group, and AD primary-group membership, cycle markers, and a live filter.
 - **Data usage**: cached recursive size of every top-level `/Data` group folder.
 - **User usage**: per-user `/Private + /FSLogix` totals with component sizes.
 - **Activity**: dynamic date, user, share, action, result, and path filters with pagination.
@@ -507,16 +507,20 @@ docker compose exec samba python3 -m json.tool /state/backup-status.json
   docker compose exec samba tail -n 100 /var/log/reconcile.log
   ```
 
-### Nested Data group access fails
+### Nested or primary Data group access fails
 
 - Check reconciliation logs for detected group cycles or unresolved nested members.
-- Verify winbind can resolve every nested group to a local GID:
+- The reconciler resolves group SIDs to GIDs first, so localized names such as `Domänen-Benutzer` do not affect ACL generation.
+- Verify the SID mapping, the user's primary/supplementary groups, and the resulting ACL:
 
   ```bash
-  docker compose exec samba getent group 'EXAMPLE\NestedGroup'
+  docker compose exec samba wbinfo --name-to-sid 'EXAMPLE\Domänen-Benutzer'
+  docker compose exec samba wbinfo --sid-to-gid S-1-5-21-...-513
   docker compose exec samba id 'EXAMPLE\alice'
   docker compose exec samba getfacl /data/groups/data/<groupName>
   ```
+
+Users whose group is represented only by AD `primaryGroupID` are included automatically; they do not need to appear in the group's LDAP `member` attribute.
 
 ### Data folder permissions are incorrect
 

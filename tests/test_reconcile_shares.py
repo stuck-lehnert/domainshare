@@ -18,10 +18,11 @@ USER_3_DN = "CN=Carol,OU=Users,DC=example,DC=com"
 COMPUTER_DN = "CN=PC01,OU=Computers,DC=example,DC=com"
 
 
-def principal(dn, sam, classes, members=(), member_of=()):
+def principal(dn, sam, classes, members=(), member_of=(), sid=""):
     return {
         "dn": dn,
         "objectGUID": "",
+        "objectSid": sid,
         "samAccountName": sam,
         "objectClasses": set(classes),
         "memberDns": list(members),
@@ -38,6 +39,22 @@ class GroupFolderNameTests(unittest.TestCase):
         self.assertEqual(rs.sanitize_group_folder_name("."), "")
         self.assertEqual(rs.sanitize_group_folder_name(".."), "")
         self.assertEqual(rs.sanitize_group_folder_name("Finance."), "Finance")
+
+
+class SidParsingTests(unittest.TestCase):
+    def test_parses_textual_and_binary_group_sid(self):
+        expected = "S-1-5-21-111-222-333-513"
+        raw = bytes((1, 5)) + (5).to_bytes(6, "big") + b"".join(
+            value.to_bytes(4, "little")
+            for value in (21, 111, 222, 333, 513)
+        )
+
+        self.assertEqual(rs.parse_sid(expected.lower(), False), expected)
+        self.assertEqual(
+            rs.parse_sid(base64.b64encode(raw).decode("ascii"), True),
+            expected,
+        )
+        self.assertEqual(rs.sid_rid(expected), 513)
 
 
 class LdapParsingTests(unittest.TestCase):
@@ -75,6 +92,7 @@ member;range=2-2: CN=Ranged,OU=Groups,DC=example,DC=com
         output = f"""
 dn: {ROOT_DN}
 objectGUID: 550e8400-e29b-41d4-a716-446655440000
+objectSid: S-1-5-21-111-222-333-1001
 objectClass: group
 sAMAccountName: FS_Data
 displayName: Data Folder
@@ -88,6 +106,7 @@ memberOf: CN=Parent,OU=Groups,DC=example,DC=com
 
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0]["samAccountName"], "FS_Data")
+        self.assertEqual(groups[0]["objectSid"], "S-1-5-21-111-222-333-1001")
         self.assertEqual(groups[0]["shareName"], "Data Folder")
         self.assertEqual(groups[0]["distinguishedName"], ROOT_DN)
         self.assertEqual(groups[0]["memberDns"], [GROUP_A_DN])
@@ -109,6 +128,13 @@ memberOf: CN=Parent,OU=Groups,DC=example,DC=com
             rs.build_nested_groups_filter(ROOT_DN),
             "(&(objectClass=group)"
             f"(memberOf:{rs.LDAP_MATCHING_RULE_IN_CHAIN}:={ROOT_DN}))",
+        )
+
+    def test_primary_group_filter_is_numeric_and_deduplicated(self):
+        self.assertEqual(
+            rs.build_primary_group_users_filter([513, 513, 515]),
+            "(&(objectClass=user)(!(objectClass=computer))"
+            "(|(primaryGroupID=513)(primaryGroupID=515)))",
         )
 
 
@@ -137,7 +163,7 @@ class MembershipExpansionTests(unittest.TestCase):
         }
         lookup = self.lookup_from(
             [
-                principal(GROUP_A_DN, "GroupA", {"group"}, member_of=[ROOT_DN]),
+                principal(GROUP_A_DN, "GroupA", {"group"}, member_of=[ROOT_DN], sid="S-1-5-21-1-2-3-1101"),
                 principal(GROUP_B_DN, "GroupB", {"group"}, member_of=[GROUP_A_DN]),
             ]
         )
@@ -145,6 +171,10 @@ class MembershipExpansionTests(unittest.TestCase):
         expansion = rs.expand_group_membership(root_group, lookup_func=lookup)
 
         self.assertEqual(expansion.group_sams, ["GroupA", "GroupB"])
+        self.assertEqual(
+            expansion.group_sids,
+            {"groupa": "S-1-5-21-1-2-3-1101"},
+        )
         self.assertEqual(expansion.unresolved_dns, [])
         self.assertEqual(expansion.cycle_paths, [["FS_Data", "GroupA", "FS_Data"]])
 
@@ -202,6 +232,31 @@ class MembershipExpansionTests(unittest.TestCase):
 
 
 class AclResolutionTests(unittest.TestCase):
+    def test_sid_resolution_handles_localized_primary_group_name(self):
+        names_seen = []
+
+        def name_resolver(workgroup, group_name):
+            names_seen.append((workgroup, group_name))
+            return None
+
+        gids, unresolved = rs.resolve_group_gids_for_acl(
+            "BEISPIEL",
+            ["FS_Daten", "Domänen-Benutzer"],
+            name_resolver,
+            group_sids=[
+                "S-1-5-21-111-222-333-1200",
+                "S-1-5-21-111-222-333-513",
+            ],
+            sid_resolver=lambda sid: {
+                "S-1-5-21-111-222-333-1200": 11200,
+                "S-1-5-21-111-222-333-513": 10513,
+            }.get(sid),
+        )
+
+        self.assertEqual(gids, [11200, 10513])
+        self.assertEqual(unresolved, [])
+        self.assertEqual(names_seen, [])
+
     def test_gid_resolution_preserves_order_dedupes_and_reports_missing(self):
         mapping = {"FS_Data": 1001, "Nested": 1002}
 
