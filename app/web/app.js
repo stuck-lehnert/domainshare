@@ -29,8 +29,15 @@ const nodeTypeLabel = value => ({group: "Gruppe", user: "Benutzer", computer: "C
 const backupStateLabel = value => ({starting: "Startet", running: "Läuft", completed: "Abgeschlossen", failed: "Fehlgeschlagen", waiting: "Wartet", disabled: "Deaktiviert"}[value] || value || "Unbekannt");
 function backupMessage(data) {
   const message = String(data.message || "");
-  if (!message) return data.enabled ? `Täglich um ${String(data.scheduledHour).padStart(2, "0")}:00 UTC geplant.` : "Sicherungen sind nicht eingerichtet.";
+  if (!message) {
+    if (!data.enabled) return "Sicherungen sind nicht eingerichtet.";
+    if (!data.automaticEnabled) return "Automatische Sicherungen sind ausgeschaltet; manueller Start ist verfügbar.";
+    return `Täglich um ${String(data.scheduledHour).padStart(2, "0")}:00 UTC geplant.`;
+  }
   if (message === "Starting backup") return "Sicherung wird gestartet.";
+  if (message === "Creating consistent state database snapshot") return "Konsistenter Datenbankstand wird erstellt.";
+  if (message === "Creating encrypted group archives") return "Verschlüsselte Gruppenarchive werden erstellt.";
+  if (message.startsWith("Archiving group ")) return `Gruppenarchiv ${message.slice(16)} wird erstellt.`;
   if (message === "Measuring backup payload") return "Sicherungsumfang wird ermittelt.";
   if (message.startsWith("Backup payload: ")) return `Sicherungsumfang: ${message.slice(16)}`;
   if (message.startsWith("Syncing ")) return `${message.slice(8)} wird synchronisiert.`;
@@ -94,8 +101,10 @@ function routeFor(path) {
   if (path.startsWith("/storage/data")) return "storage-data";
   if (path.startsWith("/storage/users")) return "storage-users";
   if (path.startsWith("/shares")) return "shares";
+  if (path.startsWith("/reconciliation")) return "reconciliation";
   if (path.startsWith("/activity")) return "activity";
   if (path.startsWith("/backup")) return "backup";
+  if (path.startsWith("/report")) return "report";
   if (path.startsWith("/system")) return "system";
   return "overview";
 }
@@ -111,10 +120,12 @@ async function navigate(path, replace = false) {
   try {
     if (route === "overview") await renderOverview();
     if (route === "shares") await renderShares();
+    if (route === "reconciliation") await renderReconciliation();
     if (route === "storage-data") await renderStorage("data");
     if (route === "storage-users") await renderStorage("users");
     if (route === "activity") await renderActivity();
     if (route === "backup") await renderBackup();
+    if (route === "report") await renderReport();
     if (route === "system") await renderSystem();
     content.focus();
   } catch (error) {
@@ -270,33 +281,241 @@ async function renderActivity() {
   await load(false);
 }
 
+function triggerLabel(value) {
+  return ({automatic: "Automatisch", web: "Weboberfläche", manual: "Befehlszeile", startup: "Systemstart"}[value] || value || "—");
+}
+
+function processIsActive(data) {
+  return ["starting", "running"].includes(data?.state);
+}
+
 function backupMarkup(data) {
-  const stateName = data.state || (data.enabled ? "waiting" : "disabled");
+  const stateName = data.enabled ? (data.state || "waiting") : "disabled";
   const active = data.activeFiles || [];
+  const automatic = data.automaticEnabled
+    ? `Täglich um ${String(data.scheduledHour).padStart(2, "0")}:00 UTC`
+    : data.enabled ? "Ausgeschaltet" : "Nicht eingerichtet";
   return `
     <section class="cards">
       <article class="card"><span class="label">Status</span><span class="value">${esc(backupStateLabel(stateName))}</span></article>
       <article class="card"><span class="label">Fortschritt</span><span class="value">${decimal(data.percent)} %</span></article>
       <article class="card"><span class="label">Übertragen</span><span class="value">${bytes(data.transferredBytes)}</span></article>
-      <article class="card"><span class="label">Gestartet</span><span class="value">${data.startedAt ? esc(utcTime(data.startedAt)) : "—"}</span></article>
+      <article class="card"><span class="label">Automatik</span><span class="value">${esc(automatic)}</span></article>
     </section>
     <section class="panel"><div class="panel-head"><h2>Aktueller Lauf</h2>${badge(backupStateLabel(stateName), stateName === "failed" ? "error" : "")}</div>
       <p>${esc(backupMessage(data))}</p>
       <progress class="progress-large" max="100" value="${Number(data.percent || 0)}"></progress>
       <div class="status-line"><strong>${bytes(data.transferredBytes)} / ${bytes(data.totalBytes)}</strong><span class="muted">${esc(data.currentSource || "")}</span><span class="muted">${esc(data.snapshot || "")}</span></div>
+      <dl><dt>Auslöser</dt><dd>${esc(triggerLabel(data.trigger))}</dd><dt>Gestartet</dt><dd>${esc(utcTime(data.startedAt))}</dd><dt>Beendet</dt><dd>${esc(utcTime(data.finishedAt))}</dd></dl>
       ${active.length ? `<h3>Dateien in Bearbeitung</h3><div class="table-wrap"><table><thead><tr><th>Datei</th><th>Fortschritt</th><th>Übertragen</th></tr></thead><tbody>${active.map(file => `<tr><td class="path">${esc(file.path)}</td><td><progress max="100" value="${Number(file.percent || 0)}"></progress></td><td class="numeric">${bytes(file.transferredBytes)} / ${bytes(file.totalBytes)}</td></tr>`).join("")}</tbody></table></div>` : ""}
     </section>
-    <section class="panel"><div class="panel-head"><h2>Sicherungsprotokoll</h2><span class="muted">Letzte ${data.log?.length || 0} Zeilen</span></div><pre class="log">${esc((data.log || []).join("\n") || "Noch keine Ausgabe vorhanden.")}</pre></section>`;
+    <section class="panel"><div class="panel-head"><h2>Sicherungsprotokoll</h2><span class="muted">Letzte ${data.log?.length || 0} Zeilen</span></div><pre id="backup-log" class="log">${esc((data.log || []).join("\n") || "Noch keine Ausgabe vorhanden.")}</pre></section>`;
 }
 
 async function renderBackup() {
-  content.innerHTML = pageHead("Sicherungen", "Live-Fortschritt und letzte Sicherungsausgabe. Auf dieser Seite können Sicherungen weder gestartet noch geändert werden.") + '<div id="backup-body"></div>';
-  const refresh = async () => {
-    try { document.querySelector("#backup-body").innerHTML = backupMarkup(await api("/api/backup")); }
-    catch (error) { notice(error.message); }
+  content.innerHTML = pageHead(
+    "Sicherungen",
+    "Sicherungen manuell starten sowie Fortschritt und Ausgabe verfolgen.",
+    '<button id="start-backup" type="button">Sicherung jetzt starten</button>'
+  ) + '<div id="backup-body"></div>';
+  const button = document.querySelector("#start-backup");
+  let logLines = [];
+  let previousActive = false;
+  let polling = false;
+  const refresh = async includeLog => {
+    try {
+      const currentLog = document.querySelector("#backup-log");
+      const previousScrollTop = currentLog?.scrollTop || 0;
+      const data = await api(includeLog ? "/api/backup" : "/api/backup?log=0");
+      if (Array.isArray(data.log)) logLines = data.log;
+      data.log = logLines;
+      document.querySelector("#backup-body").innerHTML = backupMarkup(data);
+      button.disabled = !data.manualEnabled || processIsActive(data);
+      button.title = data.manualEnabled ? "" : "Es ist kein Sicherungsziel eingerichtet.";
+      const logView = document.querySelector("#backup-log");
+      if (logView) {
+        logView.scrollTop = includeLog ? logView.scrollHeight : previousScrollTop;
+      }
+      return data;
+    } catch (error) {
+      notice(error.message);
+      return null;
+    }
   };
-  await refresh();
-  state.timer = window.setInterval(refresh, 2000);
+  const poll = async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const status = await refresh(false);
+      if (!status) return;
+      const active = processIsActive(status);
+      if (active || previousActive) {
+        const complete = await refresh(true);
+        previousActive = complete ? processIsActive(complete) : active;
+      } else {
+        previousActive = false;
+      }
+    } finally {
+      polling = false;
+    }
+  };
+  button.addEventListener("click", async () => {
+    if (!window.confirm("Sicherung jetzt starten?")) return;
+    button.disabled = true;
+    try {
+      await api("/api/actions/backup", {method: "POST", body: "{}"});
+      notice("Sicherung wurde gestartet.");
+      await poll();
+    } catch (error) {
+      notice(error.message);
+      button.disabled = false;
+    }
+  });
+  const initial = await refresh(true);
+  previousActive = processIsActive(initial);
+  state.timer = window.setInterval(() => { void poll(); }, 2000);
+}
+
+const reconciliationStateLabel = value => ({
+  starting: "Startet",
+  running: "Läuft",
+  completed: "Abgeschlossen",
+  failed: "Fehlgeschlagen",
+  waiting: "Wartet",
+}[value] || value || "Unbekannt");
+
+const reconciliationPhaseLabel = value => ({
+  starting: "Vorbereitung",
+  winbind: "Domänenzwischenspeicher",
+  directory: "Active Directory",
+  database: "Freigabendatenbank",
+  "data-permissions": "Datenberechtigungen",
+  fslogix: "FSLogix",
+  private: "Private Ordner",
+  samba: "Samba-Konfiguration",
+  completed: "Abgeschlossen",
+  failed: "Fehlgeschlagen",
+  waiting: "Wartet",
+}[value] || value || "—");
+
+function reconciliationMarkup(data) {
+  const stateName = data.state || "waiting";
+  const phase = reconciliationPhaseLabel(data.phase);
+  const current = data.currentItem ? ` · ${data.currentItem}` : "";
+  const message = stateName === "failed"
+    ? (data.message || "Der Freigabenabgleich ist fehlgeschlagen.")
+    : `${phase}${current}`;
+  return `
+    <section class="cards">
+      <article class="card"><span class="label">Status</span><span class="value">${esc(reconciliationStateLabel(stateName))}</span></article>
+      <article class="card"><span class="label">Fortschritt</span><span class="value">${decimal(data.percent)} %</span></article>
+      <article class="card"><span class="label">Gestartet</span><span class="value">${esc(utcTime(data.startedAt))}</span></article>
+      <article class="card"><span class="label">Automatik</span><span class="value">Alle ${esc(data.scheduledIntervalMinutes || 5)} Minuten</span></article>
+    </section>
+    <section class="panel"><div class="panel-head"><h2>Aktueller Abgleich</h2>${badge(reconciliationStateLabel(stateName), stateName === "failed" ? "error" : "")}</div>
+      <p>${esc(message)}</p>
+      <progress class="progress-large" max="100" value="${Number(data.percent || 0)}"></progress>
+      <dl><dt>Phase</dt><dd>${esc(phase)}</dd><dt>Auslöser</dt><dd>${esc(triggerLabel(data.trigger))}</dd><dt>Beendet</dt><dd>${esc(utcTime(data.finishedAt))}</dd></dl>
+    </section>
+    <section class="panel"><div class="panel-head"><h2>Abgleichsprotokoll</h2><span class="muted">Letzte ${data.log?.length || 0} Zeilen</span></div><pre id="reconciliation-log" class="log">${esc((data.log || []).join("\n") || "Noch keine Ausgabe vorhanden.")}</pre></section>`;
+}
+
+async function renderReconciliation() {
+  content.innerHTML = pageHead(
+    "Freigabenabgleich",
+    "Freigaben, Gruppenordner und Berechtigungen sofort mit Active Directory abgleichen.",
+    '<button id="start-reconciliation" type="button">Freigaben jetzt abgleichen</button>'
+  ) + '<div id="reconciliation-body"></div>';
+  const button = document.querySelector("#start-reconciliation");
+  let logLines = [];
+  let previousActive = false;
+  let polling = false;
+  const refresh = async includeLog => {
+    try {
+      const currentLog = document.querySelector("#reconciliation-log");
+      const previousScrollTop = currentLog?.scrollTop || 0;
+      const data = await api(
+        includeLog ? "/api/reconciliation" : "/api/reconciliation?log=0"
+      );
+      if (Array.isArray(data.log)) logLines = data.log;
+      data.log = logLines;
+      document.querySelector("#reconciliation-body").innerHTML = reconciliationMarkup(data);
+      button.disabled = processIsActive(data);
+      const logView = document.querySelector("#reconciliation-log");
+      if (logView) {
+        logView.scrollTop = includeLog ? logView.scrollHeight : previousScrollTop;
+      }
+      return data;
+    } catch (error) {
+      notice(error.message);
+      return null;
+    }
+  };
+  const poll = async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const status = await refresh(false);
+      if (!status) return;
+      const active = processIsActive(status);
+      if (active || previousActive) {
+        const complete = await refresh(true);
+        previousActive = complete ? processIsActive(complete) : active;
+      } else {
+        previousActive = false;
+      }
+    } finally {
+      polling = false;
+    }
+  };
+  button.addEventListener("click", async () => {
+    if (!window.confirm("Freigaben jetzt mit Active Directory abgleichen?")) return;
+    button.disabled = true;
+    try {
+      await api("/api/actions/reconciliation", {method: "POST", body: "{}"});
+      notice("Freigabenabgleich wurde gestartet.");
+      await poll();
+    } catch (error) {
+      notice(error.message);
+      button.disabled = false;
+    }
+  });
+  const initial = await refresh(true);
+  previousActive = processIsActive(initial);
+  state.timer = window.setInterval(() => { void poll(); }, 1500);
+}
+
+async function renderReport() {
+  content.innerHTML = pageHead("PDF-Bericht", "Vollständiger, druckbarer Stand der Dateiserver-Konfiguration und Belegung.") + `
+    <section class="panel">
+      <h2>Enthaltene Informationen</h2>
+      <ul>
+        <li>Speicherbelegung von Daten-, Private- und FSLogix-Bereichen</li>
+        <li>Alle Dateifreigabegruppen mit vollständiger Mitgliedschaftshierarchie</li>
+        <li>Aktueller Sicherungsstatus und laufende Dateiübertragungen</li>
+        <li>Systemprüfungen und TLS-Zertifikatsdaten</li>
+      </ul>
+      <p>Aktivitätsprotokoll und Sicherungsprotokoll sind ausdrücklich nicht enthalten.</p>
+      <p><button id="create-report" type="button">PDF erstellen</button></p>
+      <p id="report-status" class="muted" role="status">Die Erstellung erfolgt vollständig in diesem Browser mit Typst.</p>
+    </section>`;
+  const button = document.querySelector("#create-report");
+  const status = document.querySelector("#report-status");
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      status.textContent = "Berichtsdaten werden geladen…";
+      const data = await api("/api/report");
+      status.textContent = "Typst wird geladen…";
+      const {createPdfReport} = await import("/assets/report.mjs");
+      const result = await createPdfReport(data, message => { status.textContent = message; });
+      status.textContent = `PDF erstellt: ${result.filename} (${bytes(result.size)})`;
+    } catch (error) {
+      status.textContent = `PDF konnte nicht erstellt werden: ${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  });
 }
 
 async function renderSystem() {

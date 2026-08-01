@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import sqlite3
 import tempfile
@@ -28,6 +29,30 @@ def principal(dn, sam, classes, members=(), member_of=(), sid=""):
         "memberDns": list(members),
         "memberOfDns": list(member_of),
     }
+
+
+class ReconcileStatusTests(unittest.TestCase):
+    def test_status_tracks_web_trigger_progress_and_completion_in_utc(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "reconcile-status.json")
+            status = rs.ReconcileStatus(status_path)
+
+            status.begin("web")
+            status.progress(57.5, "data-permissions", "Syncing permissions", "FS_Finance")
+            status.complete("Reconciliation completed")
+
+            with open(status_path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+
+        self.assertEqual(payload["state"], "completed")
+        self.assertEqual(payload["trigger"], "web")
+        self.assertEqual(payload["phase"], "completed")
+        self.assertEqual(payload["percent"], 100.0)
+        self.assertEqual(payload["message"], "Reconciliation completed")
+        self.assertIsNone(payload["currentItem"])
+        self.assertRegex(payload["startedAt"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$")
+        self.assertRegex(payload["finishedAt"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$")
+        self.assertFalse(os.path.exists(f"{status_path}.tmp"))
 
 
 class GroupFolderNameTests(unittest.TestCase):

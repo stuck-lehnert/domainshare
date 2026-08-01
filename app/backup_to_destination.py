@@ -24,6 +24,9 @@ STATE_DB_PATH = os.getenv(
 LOCK_PATH = os.path.join(STATE_ROOT, "backup.lock")
 DEFAULT_BACKUP_LOG_FILE = "/var/log/backup.log"
 DEFAULT_BACKUP_STATUS_FILE = "/state/backup-status.json"
+DEFAULT_ARCHIVE_TEMP_DIR = "/tmp"
+GROUPS_SOURCE_PATH = "/data/groups"
+GROUP_ARCHIVE_CATEGORIES = ("data", "archive")
 DEFAULT_PROGRESS_MODE = "auto"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 10
 PROGRESS_BAR_WIDTH = 28
@@ -48,7 +51,7 @@ RSYNC_IGNORED_RECORD_PREFIXES = (
 
 BACKUP_SOURCES: List[Tuple[str, str]] = [
     ("/data/private", "data/private"),
-    ("/data/groups", "data/groups"),
+    (GROUPS_SOURCE_PATH, "data/groups"),
     ("/data/fslogix", "data/fslogix"),
     (STATE_ROOT, "state"),
     ("/var/lib/samba/private", "samba/private"),
@@ -197,9 +200,10 @@ class BackupStatus:
                 flush=True,
             )
 
-    def begin(self, destination: str) -> None:
+    def begin(self, destination: str, trigger: str) -> None:
         self.write(
             state="starting",
+            trigger=trigger,
             startedAt=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
             finishedAt=None,
             destination=destination,
@@ -226,7 +230,7 @@ class BackupStatus:
             )
         self.write(
             state="running",
-            currentSource=reporter.source_path,
+            currentSource=reporter.destination_path,
             percent=round(reporter.overall_progress.percent, 2),
             transferredBytes=reporter.overall_progress.transferred_bytes,
             totalBytes=reporter.overall_progress.total_bytes,
@@ -275,6 +279,7 @@ def run_command(
     env: Optional[Dict[str, str]] = None,
     input_text: Optional[str] = None,
     check: bool = True,
+    cwd: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     result = subprocess.run(
         command,
@@ -282,6 +287,7 @@ def run_command(
         text=True,
         env=env,
         input=input_text,
+        cwd=cwd,
     )
     if check and result.returncode != 0:
         output = result.stderr.strip() or result.stdout.strip()
@@ -981,16 +987,141 @@ def prepare_state_snapshot(
         raise
 
 
+def archive_password() -> str:
+    password = os.getenv("BACKUP_ARCHIVE_PASSWORD", "")
+    if not password:
+        raise RuntimeError(
+            "BACKUP_ARCHIVE_PASSWORD must be set when group data is backed up"
+        )
+    if any(char in password for char in "\r\n\0"):
+        raise RuntimeError("BACKUP_ARCHIVE_PASSWORD contains unsupported characters")
+    return password
+
+
+def create_group_archive(source_path: str, archive_path: str, password: str) -> None:
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    source_parent = os.path.dirname(source_path)
+    source_name = os.path.basename(source_path)
+    result = run_command(
+        [
+            "7z",
+            "a",
+            "-t7z",
+            "-m0=lzma2",
+            "-mx=5",
+            "-mmt=on",
+            "-ms=off",
+            "-mhe=on",
+            "-p",
+            "-y",
+            archive_path,
+            "--",
+            source_name,
+        ],
+        input_text=f"{password}\n",
+        check=False,
+        env=os.environ.copy(),
+        cwd=source_parent,
+    )
+    if result.returncode != 0:
+        output = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"Unable to archive group {source_name}: {output}")
+
+
+def copy_backup_entry(entry: os.DirEntry, destination: str) -> None:
+    if entry.is_symlink():
+        os.symlink(os.readlink(entry.path), destination)
+    elif entry.is_dir(follow_symlinks=False):
+        shutil.copytree(entry.path, destination, symlinks=True)
+    else:
+        shutil.copy2(entry.path, destination, follow_symlinks=False)
+
+
+def prepare_group_archives(
+    source_root: str = GROUPS_SOURCE_PATH,
+    password: Optional[str] = None,
+    temporary_parent: Optional[str] = None,
+) -> Tuple[str, str, int]:
+    """Stage every active and archived group directory as one encrypted 7z."""
+    archive_secret = password if password is not None else archive_password()
+    temp_parent = (
+        temporary_parent
+        if temporary_parent is not None
+        else os.getenv("BACKUP_ARCHIVE_TEMP_DIR", DEFAULT_ARCHIVE_TEMP_DIR).strip()
+    )
+    if temp_parent:
+        os.makedirs(temp_parent, exist_ok=True)
+    temporary_root = tempfile.mkdtemp(
+        prefix="backup-groups-",
+        dir=temp_parent or None,
+    )
+    staged_root = os.path.join(temporary_root, "groups")
+    archive_count = 0
+    try:
+        os.makedirs(staged_root, exist_ok=True)
+        entries = sorted(os.scandir(source_root), key=lambda entry: entry.name.casefold())
+        by_name = {entry.name: entry for entry in entries}
+        for category in GROUP_ARCHIVE_CATEGORIES:
+            source_category = by_name.pop(category, None)
+            if source_category is None:
+                continue
+            target_category = os.path.join(staged_root, category)
+            if (
+                source_category.is_symlink()
+                or not source_category.is_dir(follow_symlinks=False)
+            ):
+                copy_backup_entry(source_category, target_category)
+                continue
+
+            os.makedirs(target_category, exist_ok=True)
+            members = sorted(
+                os.scandir(source_category.path),
+                key=lambda entry: entry.name.casefold(),
+            )
+            for entry in members:
+                target = os.path.join(target_category, entry.name)
+                if entry.is_dir(follow_symlinks=False) and not entry.is_symlink():
+                    relative_name = f"{category}/{entry.name}"
+                    log(f"Creating encrypted non-solid archive for {relative_name}")
+                    if BACKUP_STATUS is not None:
+                        BACKUP_STATUS.write(
+                            state="running",
+                            currentSource=relative_name,
+                            message=f"Archiving group {relative_name}",
+                            activeFiles=[],
+                        )
+                    create_group_archive(
+                        entry.path,
+                        f"{target}.7z",
+                        archive_secret,
+                    )
+                    archive_count += 1
+                else:
+                    log(f"Preserving non-group entry {category}/{entry.name}")
+                    copy_backup_entry(entry, target)
+
+        for entry in sorted(by_name.values(), key=lambda value: value.name.casefold()):
+            log(f"Preserving additional groups source entry {entry.name}")
+            copy_backup_entry(entry, os.path.join(staged_root, entry.name))
+
+        return temporary_root, staged_root, archive_count
+    except Exception:
+        shutil.rmtree(temporary_root, ignore_errors=True)
+        raise
+
+
 def available_sources(
     state_snapshot: Optional[str] = None,
+    groups_snapshot: Optional[str] = None,
 ) -> List[Tuple[str, str]]:
     sources: List[Tuple[str, str]] = []
     for source_path, destination_path in BACKUP_SOURCES:
-        effective_source = (
-            state_snapshot
-            if destination_path == "state" and state_snapshot is not None
-            else source_path
-        )
+        if destination_path == "state" and state_snapshot is not None:
+            effective_source = state_snapshot
+        elif destination_path == "data/groups" and groups_snapshot is not None:
+            effective_source = groups_snapshot
+        else:
+            effective_source = source_path
         if os.path.isdir(effective_source):
             sources.append((effective_source, destination_path))
         else:
@@ -1539,15 +1670,32 @@ def run_backup() -> int:
     BACKUP_STATUS = BackupStatus(
         os.getenv("BACKUP_STATUS_FILE", DEFAULT_BACKUP_STATUS_FILE).strip()
     )
-    BACKUP_STATUS.begin(redact_destination(destination.raw_url))
+    BACKUP_STATUS.begin(
+        redact_destination(destination.raw_url),
+        os.getenv("BACKUP_TRIGGER", "manual").strip() or "manual",
+    )
     backend = None
     state_snapshot_root = None
+    group_archive_root = None
     try:
         state_snapshot = None
         if os.path.isdir(STATE_ROOT):
             BACKUP_STATUS.write(message="Creating consistent state database snapshot")
             state_snapshot_root, state_snapshot = prepare_state_snapshot()
-        sources = available_sources(state_snapshot)
+
+        groups_snapshot = None
+        if os.path.isdir(GROUPS_SOURCE_PATH):
+            BACKUP_STATUS.write(
+                state="running",
+                currentSource="data/groups",
+                message="Creating encrypted group archives",
+            )
+            group_archive_root, groups_snapshot, archive_count = prepare_group_archives(
+                password=archive_password()
+            )
+            log(f"Created {archive_count} encrypted non-solid group archive(s)")
+
+        sources = available_sources(state_snapshot, groups_snapshot)
         if not sources:
             log("No backup sources are available, skipping backup")
             return 0
@@ -1608,6 +1756,8 @@ def run_backup() -> int:
             backend.close()
         if state_snapshot_root is not None:
             shutil.rmtree(state_snapshot_root, ignore_errors=True)
+        if group_archive_root is not None:
+            shutil.rmtree(group_archive_root, ignore_errors=True)
 
 
 def with_lock() -> int:

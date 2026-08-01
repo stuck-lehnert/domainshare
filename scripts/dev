@@ -41,6 +41,8 @@ dev_admin_user=${DEV_ADMIN_USER:-previewadmin}
 dev_admin_password=${DEV_ADMIN_PASSWORD:-PreviewAdmin123!}
 dev_backup_user=${DEV_BACKUP_USER:-preview}
 dev_backup_password=${DEV_BACKUP_PASSWORD:-PreviewBackup123!}
+dev_archive_password=${DEV_ARCHIVE_PASSWORD:-PreviewArchive123!}
+dev_backup_auto_enabled=${DEV_BACKUP_AUTO_ENABLED:-true}
 dev_ca_password=${DEV_CA_PASSWORD:-PreviewCa123!}
 dev_ca_provisioner=${DEV_CA_PROVISIONER:-preview}
 dev_https_port=${DEV_HTTPS_PORT:-8443}
@@ -250,6 +252,7 @@ printf 'starting disposable rsync backup target\n'
   --ip "$backup_ip" \
   -e "BACKUP_USERNAME=${dev_backup_user}" \
   -e "BACKUP_PASSWORD=${dev_backup_password}" \
+  -e "PREVIEW_ARCHIVE_PASSWORD=${dev_archive_password}" \
   -v "$backup_volume:/backup" \
   "$backup_image" >/dev/null
 
@@ -326,6 +329,8 @@ printf 'starting actual file server and HTTPS web UI\n'
   -e "WEB_DIRECTORY_CACHE_SECONDS=30" \
   -e "AUDIT_POLL_SECONDS=0.25" \
   -e "BACKUP_DESTINATION=rsync://${dev_backup_user}:${dev_backup_password}@backup.${dev_dns_domain}/backups/fileserver" \
+  -e "BACKUP_ARCHIVE_PASSWORD=${dev_archive_password}" \
+  -e "BACKUP_AUTO_ENABLED=${dev_backup_auto_enabled}" \
   -e "BACKUP_PROGRESS=never" \
   -e "BACKUP_PROGRESS_INTERVAL_SECONDS=1" \
   -e "BACKUP_RETENTION_DAILY=3" \
@@ -389,7 +394,7 @@ run_backup_loop() {
   local elapsed
   while "$engine" inspect "$files_container" >/dev/null 2>&1; do
     "$engine" exec "$files_container" /bin/bash -lc \
-      'source /app/runtime.env && exec /usr/bin/python3 /app/backup_to_destination.py' || true
+      'source /app/runtime.env && BACKUP_TRIGGER=automatic exec /usr/bin/python3 /app/backup_to_destination.py' || true
     elapsed=0
     while (( elapsed < dev_backup_interval )); do
       "$engine" inspect "$files_container" >/dev/null 2>&1 || return 0

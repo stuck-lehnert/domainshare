@@ -14,6 +14,7 @@ RUN apt-get update \
         libnss-winbind \
         libpam-winbind \
         python3 \
+        p7zip-full \
         rclone \
         rsync \
         samba \

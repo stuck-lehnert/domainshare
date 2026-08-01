@@ -3,7 +3,7 @@ FROM debian:12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends rsync tini \
+    && apt-get install -y --no-install-recommends p7zip-full rsync tini \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /backup
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Read-only HTTPS administration UI for the AD-integrated file server."""
+"""HTTPS administration UI for the AD-integrated file server."""
 
 import base64
 import datetime as dt
+import fcntl
 import hashlib
 import hmac
 import http.cookies
@@ -59,6 +60,12 @@ STATIC_ROOT = os.getenv("WEB_STATIC_DIR", "/app/web")
 STATE_DB = STATE_DB_PATH
 BACKUP_STATUS_FILE = os.getenv("BACKUP_STATUS_FILE", "/state/backup-status.json")
 BACKUP_LOG_FILE = os.getenv("BACKUP_LOG_FILE", "/var/log/backup.log")
+BACKUP_LOCK_FILE = "/state/backup.lock"
+RECONCILE_STATUS_FILE = os.getenv(
+    "RECONCILE_STATUS_FILE", "/state/reconcile-status.json"
+)
+RECONCILE_LOG_FILE = os.getenv("RECONCILE_LOG_FILE", "/var/log/reconcile.log")
+RECONCILE_LOCK_FILE = "/state/reconcile.lock"
 TLS_CERT_FILE = os.getenv("WEB_TLS_CERT_FILE", "/state/tls/web.crt")
 TLS_KEY_FILE = os.getenv("WEB_TLS_KEY_FILE", "/state/tls/web.key")
 JWT_COOKIE = "adfs_session"
@@ -68,6 +75,7 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SID_RE = re.compile(r"S-\d+(?:-\d+)+", re.IGNORECASE)
 LOGIN_LIMIT: Dict[str, deque] = {}
 LOGIN_LIMIT_LOCK = threading.Lock()
+ACTION_LAUNCH_LOCK = threading.Lock()
 
 
 def log(message: str) -> None:
@@ -83,6 +91,81 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
         return max(minimum, min(maximum, int(os.getenv(name, str(default)))))
     except ValueError:
         return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def query_includes_log(params: Dict[str, List[str]]) -> bool:
+    raw = params.get("log", ["1"])[0].strip().casefold()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def lock_is_held(path: str) -> bool:
+    try:
+        with open(path, "r+", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return False
+
+
+class ActionConflict(RuntimeError):
+    pass
+
+
+def launch_background(command: List[str], extra_env: Dict[str, str]) -> None:
+    environment = os.environ.copy()
+    environment.update(extra_env)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Aktion konnte nicht gestartet werden: {exc}") from exc
+    threading.Thread(target=process.wait, name="action-reaper", daemon=True).start()
+
+
+def start_backup_action(username: str) -> Dict[str, object]:
+    if not os.getenv("BACKUP_DESTINATION", "").strip():
+        raise ActionConflict("Es ist kein Sicherungsziel eingerichtet")
+    if not os.getenv("BACKUP_ARCHIVE_PASSWORD", ""):
+        raise ActionConflict("BACKUP_ARCHIVE_PASSWORD ist nicht gesetzt")
+    with ACTION_LAUNCH_LOCK:
+        if lock_is_held(BACKUP_LOCK_FILE):
+            raise ActionConflict("Eine Sicherung läuft bereits")
+        launch_background(
+            [sys.executable, "/app/backup_to_destination.py"],
+            {"BACKUP_TRIGGER": "web"},
+        )
+    log(f"{username} started a manual backup")
+    return {"accepted": True, "action": "backup"}
+
+
+def start_reconciliation_action(username: str) -> Dict[str, object]:
+    with ACTION_LAUNCH_LOCK:
+        if lock_is_held(RECONCILE_LOCK_FILE):
+            raise ActionConflict("Ein Freigabenabgleich läuft bereits")
+        launch_background(
+            [sys.executable, "/app/reconcile_shares.py"],
+            {"RECONCILE_TRIGGER": "web"},
+        )
+    log(f"{username} started a manual share reconciliation")
+    return {"accepted": True, "action": "reconciliation"}
 
 
 def read_json(path: str, default):
@@ -662,11 +745,39 @@ def tail_lines(path: str, count: int) -> List[str]:
         return []
 
 
-def backup_payload() -> Dict[str, object]:
+def backup_payload(include_log: bool = True) -> Dict[str, object]:
     value = read_json(BACKUP_STATUS_FILE, {})
-    value["enabled"] = bool(os.getenv("BACKUP_DESTINATION", "").strip())
+    value.pop("log", None)
+    configured = bool(os.getenv("BACKUP_DESTINATION", "").strip())
+    automatic = configured and env_bool("BACKUP_AUTO_ENABLED", True)
+    value["enabled"] = configured
+    value["manualEnabled"] = configured
+    value["automaticEnabled"] = automatic
     value["scheduledHour"] = env_int("BACKUP_START_HOUR", 2, 0, 23)
-    value["log"] = tail_lines(BACKUP_LOG_FILE, 100)
+    if "state" not in value:
+        value["state"] = "waiting" if configured else "disabled"
+        value["percent"] = 0.0
+    if include_log:
+        value["log"] = tail_lines(BACKUP_LOG_FILE, 100)
+    return value
+
+
+def reconciliation_payload(include_log: bool = True) -> Dict[str, object]:
+    value = read_json(RECONCILE_STATUS_FILE, {})
+    value.pop("log", None)
+    if "state" not in value:
+        value.update(
+            {
+                "state": "waiting",
+                "phase": "waiting",
+                "percent": 0.0,
+                "message": "No reconciliation has run yet",
+            }
+        )
+    value["automaticEnabled"] = True
+    value["scheduledIntervalMinutes"] = 5
+    if include_log:
+        value["log"] = tail_lines(RECONCILE_LOG_FILE, 150)
     return value
 
 
@@ -728,15 +839,46 @@ class App:
         recent = query_audit({"limit": ["12"]})
         return {"usage": usage, "activeGroups": share_count(), "recentEvents": recent["events"], "eventCount": recent["matched"], "backup": backup_payload(), "audit": audit_archive_summary()}
 
-    def system(self) -> Dict[str, object]:
+    def system_summary(self) -> Dict[str, object]:
         checks = {}
-        for name, command in {"domainTrust": ["wbinfo", "-t"], "sambaConfig": ["testparm", "-s"]}.items():
+        commands = {
+            "domainTrust": ["wbinfo", "-t"],
+            "sambaConfig": ["testparm", "-s"],
+        }
+        for name, command in commands.items():
             try:
-                result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+                result = subprocess.run(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                )
                 checks[name] = result.returncode == 0
             except (OSError, subprocess.TimeoutExpired):
                 checks[name] = False
-        return {"hostname": os.getenv("WEB_HOSTNAME", ""), "checks": checks, "tls": tls_summary(), "audit": audit_archive_summary(), "usage": self.usage.snapshot(), "serverTime": now_utc().isoformat(timespec="seconds")}
+        return {
+            "hostname": os.getenv("WEB_HOSTNAME", ""),
+            "checks": checks,
+            "tls": tls_summary(),
+            "serverTime": now_utc().isoformat(timespec="seconds"),
+        }
+
+    def system(self) -> Dict[str, object]:
+        value = self.system_summary()
+        value["audit"] = audit_archive_summary()
+        value["usage"] = self.usage.snapshot()
+        return value
+
+    def report(self) -> Dict[str, object]:
+        """Return every reportable snapshot without reading either log."""
+        return {
+            "generatedAt": now_utc().isoformat(timespec="seconds"),
+            "groups": self.directory.get(),
+            "storage": self.usage.snapshot(),
+            "backup": backup_payload(include_log=False),
+            "system": self.system_summary(),
+        }
 
 
 APP: Optional[App] = None
@@ -748,13 +890,18 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         log(f"{self.client_address[0]} {fmt % args}")
 
-    def security_headers(self) -> None:
+    def security_headers(self, cache_control: str = "no-store") -> None:
         self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
+            "style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        )
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
 
     def send_json(self, value: object, status: int = 200, cookie: Optional[str] = None) -> None:
         body = json.dumps(value, separators=(",", ":")).encode()
@@ -836,6 +983,25 @@ class Handler(BaseHTTPRequestHandler):
             cookie = f"{JWT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
             self.send_json({"ok": True}, cookie=cookie)
             return
+        if parsed.path.startswith("/api/actions/"):
+            user = self.require_user()
+            if user is None:
+                return
+            try:
+                if parsed.path == "/api/actions/backup":
+                    result = start_backup_action(str(user["sub"]))
+                elif parsed.path == "/api/actions/reconciliation":
+                    result = start_reconciliation_action(str(user["sub"]))
+                else:
+                    self.send_error_json(HTTPStatus.NOT_FOUND, "Nicht gefunden")
+                    return
+                self.send_json(result, HTTPStatus.ACCEPTED)
+            except ActionConflict as exc:
+                self.send_error_json(HTTPStatus.CONFLICT, str(exc))
+            except RuntimeError as exc:
+                log(f"Action {parsed.path} failed: {exc}")
+                self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            return
         self.send_error_json(HTTPStatus.NOT_FOUND, "Nicht gefunden")
 
     def do_GET(self) -> None:  # pylint: disable=invalid-name,too-many-return-statements
@@ -861,9 +1027,17 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/activity":
                     self.send_json(query_audit(params))
                 elif path == "/api/backup":
-                    self.send_json(backup_payload())
+                    self.send_json(
+                        backup_payload(include_log=query_includes_log(params))
+                    )
+                elif path == "/api/reconciliation":
+                    self.send_json(
+                        reconciliation_payload(include_log=query_includes_log(params))
+                    )
                 elif path == "/api/system":
                     self.send_json(APP.system())
+                elif path == "/api/report":
+                    self.send_json(APP.report())
                 else:
                     self.send_error_json(HTTPStatus.NOT_FOUND, "Nicht gefunden")
             except (ValueError, OSError, RuntimeError) as exc:
@@ -875,7 +1049,12 @@ class Handler(BaseHTTPRequestHandler):
     def serve_static(self, path: str) -> None:
         files = {
             "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
+            "/assets/report.mjs": ("report.mjs", "text/javascript; charset=utf-8"),
             "/assets/styles.css": ("styles.css", "text/css; charset=utf-8"),
+            "/assets/vendor/typst/0.6.0-csp1/typst.mjs": ("vendor/typst/typst.mjs", "text/javascript; charset=utf-8"),
+            "/assets/vendor/typst/0.6.0-csp1/compiler.wasm": ("vendor/typst/compiler.wasm", "application/wasm"),
+            "/assets/vendor/typst/0.6.0-csp1/LibertinusSerif-Regular.otf": ("vendor/typst/LibertinusSerif-Regular.otf", "font/otf"),
+            "/assets/vendor/typst/0.6.0-csp1/LibertinusSerif-Semibold.otf": ("vendor/typst/LibertinusSerif-Semibold.otf", "font/otf"),
             "/favicon.svg": ("favicon.svg", "image/svg+xml"),
         }
         if path in files:
@@ -889,7 +1068,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.NOT_FOUND, "Statische Datei nicht gefunden")
             return
         self.send_response(HTTPStatus.OK)
-        self.security_headers()
+        cache_control = (
+            "public, max-age=31536000, immutable"
+            if path.startswith("/assets/vendor/typst/")
+            else "no-store"
+        )
+        self.security_headers(cache_control)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

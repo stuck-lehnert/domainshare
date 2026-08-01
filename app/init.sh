@@ -217,6 +217,19 @@ write_runtime_env_file() {
     if [[ -n "${BACKUP_LOG_FILE:-}" ]]; then
       printf 'export BACKUP_LOG_FILE=%q\n' "$BACKUP_LOG_FILE"
     fi
+    printf 'export BACKUP_AUTO_ENABLED=%q\n' "${BACKUP_AUTO_ENABLED:-true}"
+    if [[ -n "${BACKUP_ARCHIVE_PASSWORD:-}" ]]; then
+      printf 'export BACKUP_ARCHIVE_PASSWORD=%q\n' "$BACKUP_ARCHIVE_PASSWORD"
+    fi
+    if [[ -n "${BACKUP_ARCHIVE_TEMP_DIR:-}" ]]; then
+      printf 'export BACKUP_ARCHIVE_TEMP_DIR=%q\n' "$BACKUP_ARCHIVE_TEMP_DIR"
+    fi
+    if [[ -n "${RECONCILE_LOG_FILE:-}" ]]; then
+      printf 'export RECONCILE_LOG_FILE=%q\n' "$RECONCILE_LOG_FILE"
+    fi
+    if [[ -n "${RECONCILE_STATUS_FILE:-}" ]]; then
+      printf 'export RECONCILE_STATUS_FILE=%q\n' "$RECONCILE_STATUS_FILE"
+    fi
     if [[ -n "${BACKUP_PROGRESS:-}" ]]; then
       printf 'export BACKUP_PROGRESS=%q\n' "$BACKUP_PROGRESS"
     fi
@@ -542,7 +555,7 @@ start_observability_services() {
           ;;
       esac
     fi
-    log "Starting read-only web UI for https://${WEB_HOSTNAME}"
+    log "Starting administration web UI for https://${WEB_HOSTNAME}"
     python3 /app/web_ui.py &
   else
     log 'WEB_ENABLED is false; web UI disabled'
@@ -553,12 +566,12 @@ install_cron_job() {
   cat > /etc/cron.d/reconcile-shares <<'EOF'
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-*/5 * * * * root source /app/runtime.env && /usr/bin/python3 /app/reconcile_shares.py >> /var/log/reconcile.log 2>&1
+*/5 * * * * root source /app/runtime.env && RECONCILE_TRIGGER=automatic /usr/bin/python3 /app/reconcile_shares.py
 EOF
 
-  if [[ -n "${BACKUP_DESTINATION:-}" ]]; then
+  if [[ -n "${BACKUP_DESTINATION:-}" ]] && env_is_true "${BACKUP_AUTO_ENABLED:-true}"; then
     cat >> /etc/cron.d/reconcile-shares <<EOF
-0 ${BACKUP_START_HOUR} * * * root source /app/runtime.env && /usr/bin/python3 /app/backup_to_destination.py
+0 ${BACKUP_START_HOUR} * * * root source /app/runtime.env && BACKUP_TRIGGER=automatic /usr/bin/python3 /app/backup_to_destination.py
 EOF
   fi
 
@@ -607,14 +620,16 @@ render_smb_conf
 write_runtime_env_file
 
 log 'Running startup reconciliation'
-python3 /app/reconcile_shares.py
+RECONCILE_TRIGGER=startup python3 /app/reconcile_shares.py
 
 start_observability_services
 
-if [[ -n "${BACKUP_DESTINATION:-}" ]]; then
-  log "Backups enabled: daily at ${BACKUP_START_HOUR}:00 UTC."
+if [[ -n "${BACKUP_DESTINATION:-}" ]] && env_is_true "${BACKUP_AUTO_ENABLED:-true}"; then
+  log "Backups enabled: automatic daily run at ${BACKUP_START_HOUR}:00 UTC and manual runs available."
+elif [[ -n "${BACKUP_DESTINATION:-}" ]]; then
+  log 'Automatic backups disabled; manual runs remain available through the web UI and CLI.'
 else
-  log 'BACKUP_DESTINATION is unset; scheduled backup disabled'
+  log 'BACKUP_DESTINATION is unset; backups disabled'
 fi
 
 install_cron_job

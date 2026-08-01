@@ -124,6 +124,9 @@ write_env_file() {
   local domain_admins_sid=""
   local fslogix_group_sid=""
   local backup_destination=""
+  local backup_archive_password=""
+  local backup_auto_enabled="true"
+  local backup_auto_input=""
   local backup_start_hour="2"
   local backup_retention_daily="3"
   local backup_retention_weekly="2"
@@ -205,6 +208,14 @@ write_env_file() {
   fi
 
   read -r -p "BACKUP_DESTINATION (optional URL, press Enter to disable): " backup_destination
+  if [[ -n "$backup_destination" ]]; then
+    prompt_value backup_archive_password "BACKUP_ARCHIVE_PASSWORD (encrypts group archives)" true
+    read -r -p "Enable automatic daily backups? [Y/n]: " backup_auto_input
+    case "${backup_auto_input,,}" in
+      n|no) backup_auto_enabled="false" ;;
+      *) backup_auto_enabled="true" ;;
+    esac
+  fi
   read -r -p "BACKUP_START_HOUR [2]: " backup_start_hour
   backup_start_hour="${backup_start_hour:-2}"
   read -r -p "BACKUP_RETENTION_DAILY [3]: " backup_retention_daily
@@ -294,6 +305,8 @@ AD_DNS_IP=${ad_dns_ip}
 AD_DNS_NAME=${ad_dns_name}
 AD_DNS_IP_AUTO=${ad_dns_ip_auto}
 BACKUP_DESTINATION=${backup_destination}
+BACKUP_ARCHIVE_PASSWORD=${backup_archive_password}
+BACKUP_AUTO_ENABLED=${backup_auto_enabled}
 BACKUP_START_HOUR=${backup_start_hour}
 BACKUP_RETENTION_DAILY=${backup_retention_daily}
 BACKUP_RETENTION_WEEKLY=${backup_retention_weekly}
@@ -373,6 +386,8 @@ AD_DNS_IP=${ad_dns_ip}
 AD_DNS_NAME=${ad_dns_name}
 AD_DNS_IP_AUTO=${ad_dns_ip_auto}
 BACKUP_DESTINATION=${backup_destination}
+BACKUP_ARCHIVE_PASSWORD=${backup_archive_password}
+BACKUP_AUTO_ENABLED=${backup_auto_enabled}
 BACKUP_START_HOUR=${backup_start_hour}
 BACKUP_RETENTION_DAILY=${backup_retention_daily}
 BACKUP_RETENTION_WEEKLY=${backup_retention_weekly}
@@ -400,6 +415,9 @@ ACME_HTTP_PORT=${acme_http_port}
 # BACKUP_DESTINATION=smb://DOMAIN%5Cuser:pass@backup.example.com/Backups/samba
 # BACKUP_DESTINATION=davfs://user:pass@webdav.example.com/remote.php/dav/files/backup
 # BACKUP_DESTINATION=sftp://user:pass@sftp.example.com/exports/samba
+# BACKUP_ARCHIVE_PASSWORD=use-a-long-random-secret
+# BACKUP_AUTO_ENABLED=true
+# BACKUP_ARCHIVE_TEMP_DIR=/tmp
 # BACKUP_START_HOUR=2
 # BACKUP_RETENTION_DAILY=3
 # BACKUP_RETENTION_WEEKLY=2

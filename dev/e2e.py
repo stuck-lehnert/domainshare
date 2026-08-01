@@ -159,10 +159,51 @@ def main() -> int:
     check(b"[hidden]" in styles.body and b"display: none !important" in styles.body, "hidden views can be made visible by author CSS")
     script = http("/assets/app.js")
     check(b"getUTCHours()" in script.body and b" UTC`" in script.body, "UI does not format timestamps explicitly in UTC")
+    check(
+        b"Sicherung jetzt starten" in script.body
+        and b"Freigaben jetzt abgleichen" in script.body
+        and b'href="/reconciliation"' in index.body,
+        "manual actions or the top-level reconciliation navigation are missing",
+    )
     check(b"localTime" not in script.body and b"eyebrow" not in script.body, "obsolete local-time or decorative UI code remains")
+    report_script = http("/assets/report.mjs")
+    check(
+        report_script.status == 200
+        and b"compiler.pdf({mainContent:" in report_script.body
+        and b"getUTCHours()" in report_script.body,
+        "client-side Typst report module is missing or does not use UTC",
+    )
+    typst_script = http("/assets/vendor/typst/0.6.0-csp1/typst.mjs")
+    check(
+        typst_script.status == 200 and b"TypstSnippet" in typst_script.body,
+        "vendored Typst browser wrapper is missing",
+    )
+    typst_wasm = http("/assets/vendor/typst/0.6.0-csp1/compiler.wasm")
+    check(
+        typst_wasm.status == 200
+        and typst_wasm.body.startswith(b"\x00asm")
+        and typst_wasm.headers.get("Content-Type") == "application/wasm",
+        "vendored Typst compiler WASM is missing or has the wrong MIME type",
+    )
+    check(
+        "immutable" in typst_wasm.headers.get("Cache-Control", ""),
+        "large immutable Typst assets are not browser-cacheable",
+    )
+    typst_font = http("/assets/vendor/typst/0.6.0-csp1/LibertinusSerif-Regular.otf")
+    check(
+        typst_font.status == 200
+        and typst_font.body.startswith(b"OTTO")
+        and typst_font.headers.get("Content-Type") == "font/otf",
+        "vendored Typst report font is missing or has the wrong MIME type",
+    )
     check(b"brand-mark" not in index.body, "decorative brand mark remains")
     check("max-age=" in index.headers.get("Strict-Transport-Security", ""), "HSTS missing")
-    check("default-src 'self'" in index.headers.get("Content-Security-Policy", ""), "CSP missing")
+    csp = index.headers.get("Content-Security-Policy", "")
+    check("default-src 'self'" in csp, "CSP missing")
+    check(
+        "script-src 'self' 'wasm-unsafe-eval'" in csp and "'unsafe-eval'" not in csp,
+        "CSP does not narrowly permit the local WebAssembly compiler",
+    )
     with socket.create_connection(("localhost", HTTPS_PORT), timeout=10) as raw:
         with TLS_CONTEXT.wrap_socket(raw, server_hostname=HTTPS_HOST) as secured:
             certificate = secured.getpeercert()
@@ -173,6 +214,14 @@ def main() -> int:
     announce("JWT boundary, real Kerberos credentials, and Domain Admin authorization")
     unauthenticated = http("/api/session")
     check(unauthenticated.status == 401, "protected API accepted an anonymous request")
+    check(
+        http("/api/actions/backup", method="POST", value={}).status == 401,
+        "anonymous backup action was accepted",
+    )
+    check(
+        http("/api/actions/reconciliation", method="POST", value={}).status == 401,
+        "anonymous reconciliation action was accepted",
+    )
     non_admin = http(
         "/api/login",
         method="POST",
@@ -386,6 +435,95 @@ def main() -> int:
     )
     check(marker.returncode == 0, "backup target has no completed snapshot marker")
 
+    announce("encrypted non-solid per-group archives at the backup target")
+    archive_check = engine_run(
+        "exec",
+        BACKUP_CONTAINER,
+        "sh",
+        "-ec",
+        """
+archive=$(find /backup/fileserver/snapshots -path '*/data/groups/data/Finance.7z' -type f | sort | tail -n 1)
+test -n "$archive"
+archive_dir=${archive%/*}
+archive_count=$(find "$archive_dir" -maxdepth 1 -type f -name '*.7z' | wc -l | tr -d ' ')
+test "$archive_count" -eq 3
+test ! -d "$archive_dir/Finance"
+listing=$(printf '%s\n' "$PREVIEW_ARCHIVE_PASSWORD" | 7z l -slt "$archive")
+printf '%s\n' "$listing" | grep -q '^Solid = -$'
+printf '%s\n' "$listing" | grep -q '^Encrypted = +$'
+if printf '%s\n' 'wrong archive password' | 7z l -slt "$archive" >/dev/null 2>&1; then
+    exit 1
+fi
+""",
+        check_result=False,
+    )
+    check(
+        archive_check.returncode == 0,
+        "group archive is missing, solid, unencrypted, or accepted a wrong password: "
+        + (archive_check.stderr.strip() or archive_check.stdout.strip()),
+    )
+
+    announce("authenticated manual backup action and terminal status")
+    manual_backup_start = eventually(
+        "manual backup action acceptance",
+        lambda: http("/api/actions/backup", method="POST", value={}, token=token),
+        lambda response: response.status == 202,
+        timeout=30,
+    )
+    check(
+        manual_backup_start.json().get("action") == "backup",
+        "manual backup action returned the wrong payload",
+    )
+    manual_backup = eventually(
+        "manual web backup completion",
+        lambda: http("/api/backup", token=token),
+        lambda response: (
+            response.status == 200
+            and response.json().get("trigger") == "web"
+            and response.json().get("state") in {"completed", "failed"}
+        ),
+        timeout=240,
+        interval=2,
+    ).json()
+    check(manual_backup.get("state") == "completed", f"manual web backup failed: {manual_backup}")
+    check(float(manual_backup.get("percent", 0)) == 100.0, "manual web backup is not at 100%")
+
+    announce("authenticated reconciliation action, progress status, and live log")
+    reconciliation_start = eventually(
+        "manual reconciliation action acceptance",
+        lambda: http("/api/actions/reconciliation", method="POST", value={}, token=token),
+        lambda response: response.status == 202,
+        timeout=30,
+    )
+    check(
+        reconciliation_start.json().get("action") == "reconciliation",
+        "manual reconciliation action returned the wrong payload",
+    )
+    reconciliation = eventually(
+        "manual reconciliation completion",
+        lambda: http("/api/reconciliation", token=token),
+        lambda response: (
+            response.status == 200
+            and response.json().get("trigger") == "web"
+            and response.json().get("state") in {"completed", "failed"}
+        ),
+        timeout=240,
+        interval=1,
+    ).json()
+    check(
+        reconciliation.get("state") == "completed",
+        f"manual reconciliation failed: {reconciliation}",
+    )
+    check(
+        float(reconciliation.get("percent", 0)) == 100.0
+        and reconciliation.get("phase") == "completed",
+        "completed reconciliation status is incomplete",
+    )
+    check(
+        any("completed" in line.casefold() for line in reconciliation.get("log", [])),
+        "reconciliation completion is absent from the live log",
+    )
+
     announce("overview and system health aggregation")
     overview = http("/api/overview", token=token)
     check(overview.status == 200 and overview.json().get("activeGroups") == 3, "overview group count is wrong")
@@ -396,6 +534,35 @@ def main() -> int:
     check(system_payload.get("checks", {}).get("sambaConfig") is True, "system reports invalid Samba config")
     check(system_payload.get("tls", {}).get("sans"), "system TLS summary is empty")
     check(system_payload.get("audit", {}).get("days", 0) >= 1, "system activity database summary is incomplete")
+
+    announce("log-free PDF report snapshot")
+    report = http("/api/report", token=token)
+    check(report.status == 200, f"report endpoint failed: {report.body!r}")
+    report_payload = report.json()
+    check(
+        set(report_payload) == {"generatedAt", "groups", "storage", "backup", "system"},
+        f"report snapshot has unexpected sections: {sorted(report_payload)}",
+    )
+    check("log" not in report_payload["backup"], "backup log leaked into report snapshot")
+    check("audit" not in report_payload["system"], "activity metadata leaked into report snapshot")
+    check("usage" not in report_payload["system"], "duplicate usage leaked into report snapshot")
+    check(
+        report_payload["groups"].get("groups") == groups_payload.get("groups"),
+        "report membership hierarchy differs from the group API",
+    )
+    report_totals = report_payload["storage"].get("totals", {})
+    check(
+        all(int(report_totals.get(field, 0)) > 0 for field in (
+            "dataBytes",
+            "privateBytes",
+            "fslogixBytes",
+        )),
+        "report storage snapshot is incomplete",
+    )
+    check(
+        report_payload["backup"].get("state") == backup_payload.get("state"),
+        "report backup status differs from the backup API",
+    )
 
     logout = http("/api/logout", method="POST", value={}, token=token)
     check(logout.status == 200 and "Max-Age=0" in logout.headers.get("Set-Cookie", ""), "logout did not clear session cookie")

@@ -1,6 +1,8 @@
 import datetime as dt
 import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -32,6 +34,167 @@ class TokenManagerTests(unittest.TestCase):
     def test_requires_a_long_secret(self):
         with self.assertRaisesRegex(RuntimeError, "32 bytes"):
             web_ui.TokenManager("short", 600)
+
+
+class ReportPayloadTests(unittest.TestCase):
+    @mock.patch("app.web_ui.backup_payload")
+    def test_report_snapshot_excludes_all_log_data(self, backup_payload):
+        backup_payload.return_value = {"state": "completed"}
+        app = mock.Mock()
+        app.directory.get.return_value = {"groups": [], "fetchedAt": None}
+        app.usage.snapshot.return_value = {"groups": [], "users": [], "totals": {}}
+        app.system_summary.return_value = {
+            "hostname": "files.example.test",
+            "checks": {},
+            "tls": {},
+            "serverTime": "2026-08-01T12:00:00+00:00",
+        }
+
+        payload = web_ui.App.report(app)
+
+        backup_payload.assert_called_once_with(include_log=False)
+        self.assertNotIn("log", payload["backup"])
+        self.assertNotIn("audit", payload["system"])
+        self.assertNotIn("usage", payload["system"])
+        self.assertEqual(payload["system"]["hostname"], "files.example.test")
+
+    @mock.patch("app.web_ui.tail_lines")
+    @mock.patch("app.web_ui.read_json")
+    def test_log_free_backup_snapshot_does_not_read_log_file(self, read_json, tail_lines):
+        read_json.return_value = {
+            "state": "completed",
+            "log": ["GEHEIME SICHERUNGSAUSGABE"],
+        }
+
+        payload = web_ui.backup_payload(include_log=False)
+
+        self.assertNotIn("log", payload)
+        tail_lines.assert_not_called()
+
+
+class AdministrationActionTests(unittest.TestCase):
+    def test_log_query_flag_defaults_on_and_accepts_explicit_off_values(self):
+        self.assertTrue(web_ui.query_includes_log({}))
+        self.assertTrue(web_ui.query_includes_log({"log": ["1"]}))
+        for value in ("0", "false", "NO", "off"):
+            self.assertFalse(web_ui.query_includes_log({"log": [value]}))
+
+    @mock.patch("app.web_ui.tail_lines", return_value=["backup log"])
+    @mock.patch("app.web_ui.read_json", return_value={})
+    def test_backup_payload_exposes_manual_mode_when_automatic_runs_are_off(
+        self, _read_json, _tail_lines
+    ):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BACKUP_DESTINATION": "rsync://backup.example.test/target",
+                "BACKUP_AUTO_ENABLED": "false",
+                "BACKUP_START_HOUR": "4",
+            },
+            clear=True,
+        ):
+            payload = web_ui.backup_payload()
+
+        self.assertTrue(payload["enabled"])
+        self.assertTrue(payload["manualEnabled"])
+        self.assertFalse(payload["automaticEnabled"])
+        self.assertEqual(payload["scheduledHour"], 4)
+        self.assertEqual(payload["state"], "waiting")
+        self.assertEqual(payload["log"], ["backup log"])
+
+    @mock.patch("app.web_ui.tail_lines", return_value=["reconcile log"])
+    @mock.patch("app.web_ui.read_json", return_value={})
+    def test_reconciliation_payload_has_progress_schedule_and_log(
+        self, _read_json, _tail_lines
+    ):
+        payload = web_ui.reconciliation_payload()
+
+        self.assertEqual(payload["state"], "waiting")
+        self.assertEqual(payload["phase"], "waiting")
+        self.assertEqual(payload["percent"], 0.0)
+        self.assertTrue(payload["automaticEnabled"])
+        self.assertEqual(payload["scheduledIntervalMinutes"], 5)
+        self.assertEqual(payload["log"], ["reconcile log"])
+
+    @mock.patch("app.web_ui.tail_lines")
+    @mock.patch("app.web_ui.read_json", return_value={"state": "completed"})
+    def test_log_free_reconciliation_snapshot_does_not_read_log_file(
+        self, _read_json, tail_lines
+    ):
+        payload = web_ui.reconciliation_payload(include_log=False)
+
+        self.assertNotIn("log", payload)
+        tail_lines.assert_not_called()
+
+    @mock.patch("app.web_ui.log")
+    @mock.patch("app.web_ui.launch_background")
+    @mock.patch("app.web_ui.lock_is_held", return_value=False)
+    def test_manual_backup_launches_with_web_trigger(
+        self, _lock_is_held, launch_background, _log
+    ):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BACKUP_DESTINATION": "rsync://backup.example.test/target",
+                "BACKUP_ARCHIVE_PASSWORD": "archive secret",
+            },
+            clear=True,
+        ):
+            result = web_ui.start_backup_action("EXAMPLE\\alice")
+
+        self.assertEqual(result, {"accepted": True, "action": "backup"})
+        launch_background.assert_called_once_with(
+            [web_ui.sys.executable, "/app/backup_to_destination.py"],
+            {"BACKUP_TRIGGER": "web"},
+        )
+
+    @mock.patch("app.web_ui.launch_background")
+    @mock.patch("app.web_ui.lock_is_held", return_value=False)
+    def test_manual_backup_requires_archive_password(
+        self, _lock_is_held, launch_background
+    ):
+        with mock.patch.dict(
+            os.environ,
+            {"BACKUP_DESTINATION": "rsync://backup.example.test/target"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                web_ui.ActionConflict, "BACKUP_ARCHIVE_PASSWORD"
+            ):
+                web_ui.start_backup_action("EXAMPLE\\alice")
+
+        launch_background.assert_not_called()
+
+    @mock.patch("app.web_ui.log")
+    @mock.patch("app.web_ui.launch_background")
+    @mock.patch("app.web_ui.lock_is_held", return_value=False)
+    def test_manual_reconciliation_launches_with_web_trigger(
+        self, _lock_is_held, launch_background, _log
+    ):
+        result = web_ui.start_reconciliation_action("EXAMPLE\\alice")
+
+        self.assertEqual(result, {"accepted": True, "action": "reconciliation"})
+        launch_background.assert_called_once_with(
+            [web_ui.sys.executable, "/app/reconcile_shares.py"],
+            {"RECONCILE_TRIGGER": "web"},
+        )
+
+
+class ReportCompilerTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node.js is needed for the browser Typst smoke test")
+    def test_vendored_browser_typst_compiles_report_to_pdf(self):
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        result = subprocess.run(
+            [shutil.which("node"), os.path.join(root, "tests", "report_pdf_smoke.mjs")],
+            cwd=root,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Typst PDF smoke test passed", result.stdout)
 
 
 class DomainAuthenticationTests(unittest.TestCase):
@@ -462,6 +625,8 @@ class WebPresentationTests(unittest.TestCase):
         self.assertNotIn("nav-group", html)
         self.assertIn('>Datenbelegung</a>', html)
         self.assertIn('>Benutzerbelegung</a>', html)
+        self.assertIn('href="/reconciliation" data-route="reconciliation">Freigabenabgleich</a>', html)
+        self.assertIn('href="/report" data-route="report">PDF-Bericht</a>', html)
         self.assertNotIn("brand-mark", html)
         self.assertNotIn("eyebrow", html + script)
         self.assertIn("getUTCHours()", script)
@@ -481,6 +646,37 @@ class WebPresentationTests(unittest.TestCase):
         self.assertIn(".shares-view { display: flex; height: calc(100vh - 4.5rem);", css)
         self.assertIn(".shares-split .list", css)
         self.assertIn(".shares-split .tree", css)
+
+    def test_admin_actions_are_german_and_backup_automatic_setting_is_env_only(self):
+        script = self.asset("app.js")
+
+        self.assertIn("Sicherung jetzt starten", script)
+        self.assertIn("Freigaben jetzt abgleichen", script)
+        self.assertIn('api("/api/actions/backup"', script)
+        self.assertIn('api("/api/actions/reconciliation"', script)
+        self.assertIn('includeLog ? "/api/reconciliation"', script)
+        self.assertIn('"/api/backup?log=0"', script)
+        self.assertIn('"/api/reconciliation?log=0"', script)
+        self.assertEqual(script.count("if (active || previousActive)"), 2)
+        self.assertNotIn("BACKUP_AUTO_ENABLED", script)
+
+    def test_pdf_report_is_client_side_and_uses_only_log_free_endpoint(self):
+        script = self.asset("app.js")
+        report = self.asset("report.mjs")
+        typst = self.asset(os.path.join("vendor", "typst", "typst.mjs"))
+
+        self.assertIn('api("/api/report")', script)
+        self.assertIn('import("/assets/report.mjs")', script)
+        self.assertNotIn('api("/api/activity', report)
+        self.assertNotIn('api("/api/backup', report)
+        self.assertIn('compiler.pdf({mainContent:', report)
+        self.assertIn('/assets/vendor/typst/0.6.0-csp1/compiler.wasm', report)
+        self.assertIn("getUTCHours()", report)
+        self.assertIn("above: 1.8pt, below: 1.8pt", report)
+        self.assertIn('["Automatik", backup.automaticEnabled ? "Aktiv" : "Ausgeschaltet"]', report)
+        self.assertIn("Aktivitätsprotokoll und Sicherungsprotokoll sind nicht Bestandteil", report)
+        self.assertNotIn("new Function", typst)
+        self.assertIn("createCspSafeFunction", typst)
 
     def test_samba_audits_only_supported_file_operations(self):
         path = os.path.join(os.path.dirname(__file__), "..", "etc", "samba", "smb.conf")

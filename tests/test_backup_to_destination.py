@@ -2,6 +2,7 @@ import io
 import os
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -186,6 +187,131 @@ class ProgressParsingTests(unittest.TestCase):
 
         self.assertEqual(sizes[tmpdir], 8)
         self.assertEqual(total, 8)
+
+
+class GroupArchiveTests(unittest.TestCase):
+    def test_archive_password_is_required_and_rejects_control_characters(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "BACKUP_ARCHIVE_PASSWORD"):
+                backup.archive_password()
+
+        with mock.patch.dict(
+            os.environ, {"BACKUP_ARCHIVE_PASSWORD": "secret\nsecond-line"}, clear=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unsupported characters"):
+                backup.archive_password()
+
+    def test_groups_are_staged_as_encrypted_non_solid_archives(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_root = os.path.join(tmpdir, "groups")
+            os.makedirs(os.path.join(source_root, "data", "Finance"))
+            os.makedirs(os.path.join(source_root, "archive", "Former"))
+            os.makedirs(os.path.join(source_root, "metadata"))
+            with open(
+                os.path.join(source_root, "data", "Finance", "report.txt"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("finance")
+            with open(
+                os.path.join(source_root, "archive", "Former", "old.txt"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("former")
+            with open(
+                os.path.join(source_root, "data", "README.txt"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("preserve me")
+            with open(
+                os.path.join(source_root, "metadata", "index.txt"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("metadata")
+
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append((command, kwargs))
+                archive_path = command[-3]
+                with open(archive_path, "wb") as handle:
+                    handle.write(b"dummy-7z")
+                return backup.subprocess.CompletedProcess(command, 0, "", "")
+
+            staged_temp = None
+            try:
+                with mock.patch.object(backup, "run_command", side_effect=fake_run):
+                    staged_temp, staged_root, count = backup.prepare_group_archives(
+                        source_root, "archive secret", tmpdir
+                    )
+
+                self.assertEqual(count, 2)
+                self.assertTrue(
+                    os.path.isfile(os.path.join(staged_root, "data", "Finance.7z"))
+                )
+                self.assertTrue(
+                    os.path.isfile(os.path.join(staged_root, "archive", "Former.7z"))
+                )
+                self.assertTrue(
+                    os.path.isfile(os.path.join(staged_root, "data", "README.txt"))
+                )
+                self.assertTrue(
+                    os.path.isfile(os.path.join(staged_root, "metadata", "index.txt"))
+                )
+                self.assertFalse(
+                    os.path.exists(os.path.join(staged_root, "data", "Finance"))
+                )
+
+                self.assertEqual(len(commands), 2)
+                for command, kwargs in commands:
+                    self.assertEqual(command[:3], ["7z", "a", "-t7z"])
+                    self.assertIn("-m0=lzma2", command)
+                    self.assertIn("-mx=5", command)
+                    self.assertIn("-mmt=on", command)
+                    self.assertIn("-ms=off", command)
+                    self.assertIn("-mhe=on", command)
+                    self.assertIn("-p", command)
+                    self.assertNotIn("archive secret", command)
+                    self.assertEqual(kwargs["input_text"], "archive secret\n")
+                    self.assertFalse(kwargs["check"])
+                    self.assertTrue(os.path.isdir(kwargs["cwd"]))
+            finally:
+                if staged_temp is not None:
+                    shutil.rmtree(staged_temp, ignore_errors=True)
+
+    @unittest.skipUnless(shutil.which("7z"), "7z is needed for the archive smoke test")
+    def test_real_archive_is_encrypted_and_non_solid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = os.path.join(tmpdir, "Finance")
+            archive_path = os.path.join(tmpdir, "Finance.7z")
+            os.mkdir(source)
+            with open(os.path.join(source, "report.txt"), "w", encoding="utf-8") as handle:
+                handle.write("classified")
+
+            backup.create_group_archive(source, archive_path, "correct secret")
+
+            correct = subprocess.run(
+                [shutil.which("7z"), "l", "-slt", archive_path],
+                input="correct secret\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            wrong = subprocess.run(
+                [shutil.which("7z"), "l", "-slt", archive_path],
+                input="wrong secret\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(correct.returncode, 0, correct.stdout + correct.stderr)
+        self.assertIn("Solid = -", correct.stdout)
+        self.assertIn("Path = Finance/report.txt", correct.stdout)
+        self.assertNotEqual(wrong.returncode, 0)
 
 
 class StateSnapshotTests(unittest.TestCase):

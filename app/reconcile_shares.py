@@ -23,6 +23,8 @@ except ImportError:
 
 DB_PATH = STATE_DB_PATH
 LOCK_PATH = "/state/reconcile.lock"
+DEFAULT_RECONCILE_LOG_FILE = "/var/log/reconcile.log"
+DEFAULT_RECONCILE_STATUS_FILE = "/state/reconcile-status.json"
 GROUP_ROOT = "/data/groups/data"
 GROUP_ARCHIVE_ROOT = "/data/groups/archive"
 PRIVATE_ROOT = "/data/private"
@@ -100,8 +102,127 @@ def now_utc() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
+RECONCILE_LOG_HANDLE = None
+RECONCILE_STATUS = None
+
+
+class ReconcileStatus:
+    def __init__(self, path: str):
+        self.path = path
+        self.value: Dict[str, object] = {
+            "state": "starting",
+            "percent": 0.0,
+            "phase": "starting",
+        }
+
+    def write(self, **changes: object) -> None:
+        self.value.update(changes)
+        self.value["updatedAt"] = now_utc()
+        try:
+            status_dir = os.path.dirname(self.path)
+            if status_dir:
+                os.makedirs(status_dir, exist_ok=True)
+            temp_path = f"{self.path}.tmp"
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(self.value, handle, separators=(",", ":"), sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+        except OSError as exc:
+            print(
+                f"[reconcile] WARNING: unable to update status file {self.path}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def begin(self, trigger: str) -> None:
+        self.write(
+            state="starting",
+            trigger=trigger,
+            phase="starting",
+            percent=0.0,
+            startedAt=now_utc(),
+            finishedAt=None,
+            currentItem=None,
+            message="Starting reconciliation",
+        )
+
+    def progress(
+        self,
+        percent: float,
+        phase: str,
+        message: str,
+        current_item: Optional[str] = None,
+    ) -> None:
+        self.write(
+            state="running",
+            percent=max(0.0, min(99.0, float(percent))),
+            phase=phase,
+            message=message,
+            currentItem=current_item,
+        )
+
+    def complete(self, message: str) -> None:
+        self.write(
+            state="completed",
+            phase="completed",
+            percent=100.0,
+            finishedAt=now_utc(),
+            currentItem=None,
+            message=message,
+        )
+
+    def fail(self, message: str) -> None:
+        self.write(
+            state="failed",
+            phase="failed",
+            finishedAt=now_utc(),
+            currentItem=None,
+            message=message,
+        )
+
+
+def configure_logging() -> None:
+    global RECONCILE_LOG_HANDLE
+    path = os.getenv("RECONCILE_LOG_FILE", DEFAULT_RECONCILE_LOG_FILE).strip()
+    if not path:
+        return
+    try:
+        directory_name = os.path.dirname(path)
+        if directory_name:
+            os.makedirs(directory_name, exist_ok=True)
+        RECONCILE_LOG_HANDLE = open(path, "a", encoding="utf-8")
+    except OSError as exc:
+        print(
+            f"[reconcile] WARNING: unable to open log file {path}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def close_logging() -> None:
+    global RECONCILE_LOG_HANDLE
+    if RECONCILE_LOG_HANDLE is not None:
+        RECONCILE_LOG_HANDLE.close()
+        RECONCILE_LOG_HANDLE = None
+
+
 def log(message: str) -> None:
-    print(f"[reconcile] {message}", flush=True)
+    line = f"[reconcile] {message}"
+    print(line, flush=True)
+    if RECONCILE_LOG_HANDLE is not None:
+        RECONCILE_LOG_HANDLE.write(f"{now_utc()} {line}\n")
+        RECONCILE_LOG_HANDLE.flush()
+
+
+def status_progress(
+    percent: float,
+    phase: str,
+    message: str,
+    current_item: Optional[str] = None,
+) -> None:
+    if RECONCILE_STATUS is not None:
+        RECONCILE_STATUS.progress(percent, phase, message, current_item)
 
 
 def ensure_required_env() -> None:
@@ -1444,11 +1565,19 @@ def sync_dynamic_directory_permissions(
     if force_recursive_repair:
         log(f"Data ACL recursive repair is forced by {DATA_ACL_REPAIR_ENV}")
 
-    for row in rows:
+    row_count = len(rows)
+    for row_index, row in enumerate(rows):
         share_started = time.monotonic()
         guid = row["objectGUID"]
         sam = row["samAccountName"]
         path = row["path"]
+        progress = 34.0 + (40.0 * row_index / max(1, row_count))
+        status_progress(
+            progress,
+            "data-permissions",
+            "Syncing data folder permissions",
+            str(sam),
+        )
         ad_group = ad_groups_by_guid.get(guid)
         if ad_group is None:
             log(f"No AD data available for {sam}; leaving existing ACLs")
@@ -1562,11 +1691,16 @@ def with_lock() -> bool:
         return False
 
     try:
+        if RECONCILE_STATUS is not None:
+            RECONCILE_STATUS.begin(
+                os.getenv("RECONCILE_TRIGGER", "manual").strip() or "manual"
+            )
         ensure_required_env()
         os.makedirs(GROUP_ROOT, exist_ok=True)
         os.makedirs(GROUP_ARCHIVE_ROOT, exist_ok=True)
 
         reconcile_started = time.monotonic()
+        status_progress(2, "winbind", "Refreshing winbind cache")
         log("Refreshing winbind cache")
         phase_started = time.monotonic()
         refresh_winbind_cache()
@@ -1577,6 +1711,7 @@ def with_lock() -> bool:
 
         conn = open_db()
         try:
+            status_progress(10, "directory", "Reading data folder groups from AD")
             phase_started = time.monotonic()
             groups = fetch_fileshare_groups()
             log(
@@ -1584,6 +1719,7 @@ def with_lock() -> bool:
                 f"in {format_duration(time.monotonic() - phase_started)}"
             )
 
+            status_progress(22, "database", "Reconciling data folder database")
             log("Reconciling data folder DB")
             phase_started = time.monotonic()
             reconcile_db(conn, groups)
@@ -1592,6 +1728,7 @@ def with_lock() -> bool:
                 f"{format_duration(time.monotonic() - phase_started)}"
             )
 
+            status_progress(32, "data-permissions", "Syncing data folder permissions")
             log("Syncing data folder permissions")
             phase_started = time.monotonic()
             sync_dynamic_directory_permissions(conn, groups)
@@ -1602,6 +1739,7 @@ def with_lock() -> bool:
         finally:
             conn.close()
 
+        status_progress(76, "fslogix", "Syncing FSLogix root")
         log("Syncing FSLogix root")
         phase_started = time.monotonic()
         sync_fslogix_directory()
@@ -1610,6 +1748,7 @@ def with_lock() -> bool:
             f"{format_duration(time.monotonic() - phase_started)}"
         )
 
+        status_progress(84, "private", "Syncing private directories")
         log("Syncing private directories")
         phase_started = time.monotonic()
         sync_private_directories()
@@ -1618,6 +1757,7 @@ def with_lock() -> bool:
             f"{format_duration(time.monotonic() - phase_started)}"
         )
 
+        status_progress(96, "samba", "Reloading Samba config")
         log("Reloading Samba config")
         phase_started = time.monotonic()
         reload_samba()
@@ -1625,22 +1765,31 @@ def with_lock() -> bool:
             f"Reloaded Samba config in "
             f"{format_duration(time.monotonic() - phase_started)}"
         )
-        log(
-            f"Reconciliation completed in "
-            f"{format_duration(time.monotonic() - reconcile_started)}"
-        )
+        elapsed = format_duration(time.monotonic() - reconcile_started)
+        log(f"Reconciliation completed in {elapsed}")
+        if RECONCILE_STATUS is not None:
+            RECONCILE_STATUS.complete(f"Reconciliation completed in {elapsed}")
         return True
     finally:
         lock_file.close()
 
 
 def main() -> int:
+    global RECONCILE_STATUS
+    configure_logging()
+    RECONCILE_STATUS = ReconcileStatus(
+        os.getenv("RECONCILE_STATUS_FILE", DEFAULT_RECONCILE_STATUS_FILE).strip()
+    )
     try:
-        ok = with_lock()
-        return 0 if ok else 0
-    except Exception as exc:  # pylint: disable=broad-except
-        log(f"ERROR: {exc}")
-        return 1
+        try:
+            ok = with_lock()
+            return 0 if ok else 0
+        except Exception as exc:  # pylint: disable=broad-except
+            log(f"ERROR: {exc}")
+            RECONCILE_STATUS.fail(str(exc))
+            return 1
+    finally:
+        close_logging()
 
 
 if __name__ == "__main__":

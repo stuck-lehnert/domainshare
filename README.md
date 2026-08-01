@@ -24,16 +24,17 @@ This repository provides a production-oriented Samba file server container that 
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
 - Samba `full_audit` is restricted to successful and failed reads, writes, renames, and deletions.
 - A collector normalizes those four actions and persists them in indexed SQLite tables; activity is never automatically deleted.
-- A read-only HTTPS web console provides group membership trees, storage usage, searchable activity, live backup progress, and system health.
+- A plain HTTPS administration console provides read-only statistics and logs plus narrowly scoped actions for manual backups and share reconciliation. It also includes a fully client-side Typst PDF report.
 - Web sign-in validates the submitted username/password with Kerberos, permits only users whose winbind group SID set contains `DOMAIN_ADMINS_SID`, and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
 - HTTPS certificates are requested from a configured local Smallstep CA and renewed automatically. Pre-issued certificate files are also supported.
-- Optional remote backups run when `BACKUP_DESTINATION` is configured.
+- Optional remote backups run when `BACKUP_DESTINATION` and `BACKUP_ARCHIVE_PASSWORD` are configured; each active or archived group folder is uploaded as its own encrypted, non-solid 7z archive.
 - Private home creation skips well-known/service accounts by default (including `krbtgt`, `msol_*`, `FileShare_ServiceAcc`).
 - Reconciliation is executed:
   - once on startup
   - every 5 minutes via cron
 - Backup is executed:
-  - daily at `BACKUP_START_HOUR` in UTC (default: `2`, i.e. 02:00 UTC)
+  - manually through the Domain Admin web UI or CLI
+  - daily at `BACKUP_START_HOUR` in UTC when `BACKUP_AUTO_ENABLED=true` (default: `true`; the switch is environment-only)
 
 ## Data Folder Lifecycle
 
@@ -155,6 +156,8 @@ Useful overrides:
 | `DEV_SEED_MB` | `8` | MiB per large seed file |
 | `DEV_ACTIVITY_INTERVAL_SECONDS` | `4` | Delay between SMB activity batches |
 | `DEV_BACKUP_INTERVAL_SECONDS` | `120` | Delay between completed preview backups |
+| `DEV_ARCHIVE_PASSWORD` | `PreviewArchive123!` | Dummy password for encrypted group archives |
+| `DEV_BACKUP_AUTO_ENABLED` | `true` | Environment-only automatic-backup setting passed to the file server |
 
 `DEV_REALM`, `DEV_DNS_DOMAIN`, and `DEV_BASE_DN` describe the same domain and must be changed together.
 
@@ -175,8 +178,10 @@ The E2E suite verifies:
 - Data, Private, and FSLogix usage aggregation;
 - high-level `full_audit` ingestion for all four actions, service-account exclusion, filters, facets, and pagination;
 - shared SQLite schema, integrity, indexes, legacy-log removal, and ordered read deduplication;
-- real rsync transfer progress, completed backup status, log output, and remote snapshot marker;
-- overview and system-health aggregation.
+- real rsync transfer progress, completed backup status, log output, remote snapshot marker, and per-group encrypted non-solid 7z archives;
+- anonymous action rejection plus authenticated manual backup and reconciliation actions, terminal progress, and live reconciliation output;
+- overview and system-health aggregation;
+- the log-free PDF report snapshot plus local Typst wrapper, WebAssembly, font MIME types, and immutable caching.
 
 The runner returns non-zero on the first failed assertion, prints bounded logs from every run-scoped service, and always removes its containers, volumes, network, and temporary CA root. Set `DEV_SKIP_BUILD=1` for a fast rerun against existing local images.
 
@@ -199,7 +204,9 @@ The runner returns non-zero on the first failed assertion, prints bounded logs f
    - `DOMAIN_ADMINS_SID`
    - optional `FSLOGIX_GROUP_SID` (defaults to `DOMAIN_USERS_SID`)
    - optional `BACKUP_DESTINATION` (empty disables backup)
-   - optional `BACKUP_START_HOUR` (0-23, default `2`)
+   - `BACKUP_ARCHIVE_PASSWORD` when a backup destination is configured
+   - optional environment-only `BACKUP_AUTO_ENABLED` (`true` or `false`, default `true`)
+   - optional `BACKUP_START_HOUR` (0-23, default `2`; used only when automatic backups are enabled)
    - optional `BACKUP_RETENTION_DAILY` (default `3`)
    - optional `BACKUP_RETENTION_WEEKLY` (default `2`)
    - optional `BACKUP_RETENTION_MONTHLY` (default `2`)
@@ -275,7 +282,7 @@ The runner returns non-zero on the first failed assertion, prints bounded logs f
 - Semantics intentionally differ from `Data`: only the share root is reconciled (`03770` + ACL defaults), while user-created profile container folders/files are not recursively normalized.
 - Samba masks are profile-container oriented (`create mask = 0600`, `directory mask = 0700`) so profile payload stays user-private by default.
 
-## Read-only Web Console
+## Web Administration Console
 
 Open `https://<WEB_HOSTNAME>/` after setup. Only members of the group identified by `DOMAIN_ADMINS_SID` can sign in. The form accepts `DOMAIN\username`, `username@realm`, or an unqualified username (which is qualified with `WORKGROUP`).
 
@@ -286,10 +293,14 @@ The console is intentionally operational and plain:
 - **Data usage**: cached recursive size of every top-level `/Data` group folder.
 - **User usage**: per-user `/Private + /FSLogix` totals with component sizes.
 - **Activity**: dynamic date, user, share, action, result, and path filters with pagination.
-- **Backups**: read-only live progress, active transfer rows, snapshot name, and recent backup output.
+- **Share reconciliation**: manually force reconciliation and follow its phase, progress bar, current group, and live output.
+- **Backups**: manually start a backup and follow live progress, active transfer rows, snapshot name, trigger, and recent output.
+- **PDF report**: storage totals and every storage row, complete group/folder membership hierarchies, current backup state, system checks, and TLS certificate data.
 - **System**: domain trust, Samba configuration, TLS certificate, scanner, and activity database health.
 
-The web API has no mutation endpoint other than session login/logout. Files, groups, ACLs, backup schedules, and retention cannot be changed from the console.
+The PDF report deliberately excludes the activity log and backup log. Its dedicated snapshot endpoint removes those fields before returning data. Typst, its WebAssembly compiler, and the report fonts are shipped with the application; Typst source and PDF bytes are created only in the authenticated browser and are never uploaded to another service. The first export downloads roughly 22 MiB of compiler/font assets, which are then cached as immutable files. The CSP grants only `'wasm-unsafe-eval'` for WebAssembly compilation and does not enable JavaScript `'unsafe-eval'`.
+
+The only operational mutation endpoints start an immediate backup or share reconciliation, and both require the same Domain Admin JWT as every protected page. The console cannot edit files, groups, ACL rules, backup schedules, retention, or `BACKUP_AUTO_ENABLED`. Automatic backups can be enabled or disabled only through the environment and therefore require a redeployment/restart.
 
 ### Authentication and sessions
 
@@ -298,7 +309,7 @@ The web API has no mutation endpoint other than session login/logout. Files, gro
 - Authentication is form-based; the browser never performs NTLM, SPNEGO, or Kerberos negotiation.
 - JWTs use HMAC-SHA256, default to eight hours, and are accepted from the protected cookie or an `Authorization: Bearer` header.
 - Login attempts are rate-limited per client address.
-- Responses set HSTS, a restrictive Content Security Policy, clickjacking protection, MIME sniffing protection, and no-store caching.
+- Responses set HSTS, a restrictive Content Security Policy, clickjacking protection, and MIME sniffing protection. APIs and ordinary UI assets use no-store caching; pinned Typst compiler/font assets use immutable long-term caching.
 
 ### TLS with an internal ACME CA
 
@@ -393,12 +404,13 @@ Collection starts even when the web UI is disabled. On the first collector start
 
 ## Backups
 
-- Backups are enabled only if `BACKUP_DESTINATION` is non-empty.
+- Backups are available only if `BACKUP_DESTINATION` is non-empty and `BACKUP_ARCHIVE_PASSWORD` is set.
 - Each run creates a timestamped snapshot under `snapshots/YYYYMMDDTHHMMSSZ` at the destination.
-- Backup job is scheduled daily at `BACKUP_START_HOUR` in UTC. The container and Compose service force `TZ=Etc/UTC`.
+- `BACKUP_AUTO_ENABLED=true` schedules the job daily at `BACKUP_START_HOUR` in UTC. With `false`, no backup cron entry is installed; manual web and CLI runs remain available. This setting is environment-only and cannot be changed through the web API.
+- The container and Compose service force `TZ=Etc/UTC`.
 - Sources synced to destination on each run:
   - `/data/private` -> `data/private`
-  - `/data/groups` -> `data/groups`
+  - `/data/groups` -> `data/groups`; direct group directories below `data` and `archive` become one `<group>.7z` each
   - `/data/fslogix` -> `data/fslogix`
   - `/state` -> `state` (the live WAL database is replaced by a consistent SQLite online snapshot)
   - `/var/lib/samba/private` -> `samba/private`
@@ -408,7 +420,11 @@ Collection starts even when the web UI is disabled. On the first collector start
   - `BACKUP_RETENTION_WEEKLY=2`
   - `BACKUP_RETENTION_DAILY=3`
 - The backup script writes directly to `BACKUP_LOG_FILE` (default: `/var/log/backup.log`). Cron does not redirect backup output into the logfile.
-- Before uploading, the backup script creates a temporary, integrity-checked SQLite online snapshot of the shared state database, then measures all source files so it can report total upload progress.
+- Before uploading, the backup script creates a temporary, integrity-checked SQLite online snapshot of the shared state database.
+- Each direct active and archived group folder is then compressed with LZMA2 at level 5 and multithreading into one non-solid (`-ms=off`) 7z archive. Header/data encryption is enabled (`-mhe=on`); the password comes only from `BACKUP_ARCHIVE_PASSWORD` and is supplied to 7z through stdin, never as a process argument. Non-group entries below `/data/groups` are preserved unchanged.
+- `BACKUP_ARCHIVE_TEMP_DIR` selects the local staging directory (default `/tmp`). It must have enough free space for the compressed group archives. Staging data is removed after success or failure.
+- Losing `BACKUP_ARCHIVE_PASSWORD` makes the group archives unrecoverable; keep it in the same secret-management system as the remote-backup credentials.
+- After staging, the script measures all upload sources so it can report total transfer progress.
 - Upload progress is logged per file every `BACKUP_PROGRESS_INTERVAL_SECONDS` seconds and again when a file reaches 100%, including percentage and transferred/remaining bytes with auto-scaled units.
 - `BACKUP_PROGRESS=auto` shows an interactive multi-line progress view only for TTY/manual runs. Current file uploads are shown as separate rows, capped at 12 rows, with the total progress row at the bottom. Use `always` to force it or `never` to suppress the bar. File and total progress are still logged.
 - Every run atomically updates `BACKUP_STATUS_FILE` (default `/state/backup-status.json`) with its state, current source, active files, byte totals, percentage, snapshot, and final result for the live web view.
@@ -430,7 +446,10 @@ Collection starts even when the web UI is disabled. On the first collector start
 
   ```env
   BACKUP_DESTINATION=sftp://backupuser:StrongPassword@sftp.example.com/exports/samba
+  BACKUP_ARCHIVE_PASSWORD=use-a-long-random-secret
+  BACKUP_AUTO_ENABLED=true
   BACKUP_START_HOUR=2
+  BACKUP_ARCHIVE_TEMP_DIR=/tmp
   BACKUP_RETENTION_DAILY=3
   BACKUP_RETENTION_WEEKLY=2
   BACKUP_RETENTION_MONTHLY=2
@@ -446,12 +465,14 @@ Collection starts even when the web UI is disabled. On the first collector start
 docker compose logs -f samba
 docker compose logs -f samba | grep -E '\\[web\\]|\\[audit\\]'
 docker compose exec samba python3 /app/reconcile_shares.py
+docker compose exec samba python3 /app/backup_to_destination.py
 docker compose exec samba sqlite3 /state/shares.db 'PRAGMA quick_check;'
 docker compose exec samba sqlite3 /state/shares.db 'SELECT action, count(*) FROM audit_events GROUP BY action;'
 docker compose exec samba testparm -s
 docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
 docker compose exec samba sh -lc 'tail -n 200 /var/log/backup.log'
 docker compose exec samba python3 -m json.tool /state/backup-status.json
+docker compose exec samba python3 -m json.tool /state/reconcile-status.json
 ```
 
 ## Troubleshooting
