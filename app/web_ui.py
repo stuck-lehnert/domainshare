@@ -836,7 +836,7 @@ class App:
 
     def overview(self) -> Dict[str, object]:
         usage = self.usage.snapshot()
-        recent = query_audit({"limit": ["12"]})
+        recent = query_audit({"limit": ["12"], "facets": ["0"]})
         return {"usage": usage, "activeGroups": share_count(), "recentEvents": recent["events"], "eventCount": recent["matched"], "backup": backup_payload(), "audit": audit_archive_summary()}
 
     def system_summary(self) -> Dict[str, object]:

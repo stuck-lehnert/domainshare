@@ -54,9 +54,12 @@ The database contains:
 - `shares`: AD group-to-folder lifecycle and ACL reconciliation state;
 - `audit_events`: normalized read, write, move, and delete events;
 - `audit_sources`: Samba log inode/offset checkpoints;
+- `audit_daily_totals`, `audit_daily_counts`, and `audit_daily_facets`: compact materialized metadata for fast activity counts and filters;
+- `audit_paths`, `audit_paths_fts`, and `audit_path_events`: deduplicated trigram path search with an incrementally maintained event mapping;
+- `audit_rollup_state`: bounded legacy-event backfill progress;
 - `web_cache`: cached storage scan results.
 
-Activity lookup uses UTC epoch seconds, keyset pagination, and multi-column indexes for time, user, share, action, and result. WAL mode allows the collector, reconciler, scanner, and read-only web requests to operate concurrently.
+Activity pages use UTC epoch seconds, keyset pagination, and compact indexes for time, scalar filters, and selective substring path searches. Exact scalar-filter counts and facets read the daily rollups instead of scanning raw events. WAL mode allows the collector, reconciler, scanner, and read-only web requests to operate concurrently.
 
 Standard SQLite does not provide transparent general-purpose compression, so this project deliberately does not depend on a non-core compression VFS. Structured columns avoid repeated JSON field names and make indexed queries much cheaper; the state volume still needs capacity for retained activity.
 
@@ -396,10 +399,13 @@ Samba emits only the selected high-level `full_audit` operations, and the collec
 - each event records a UTC timestamp, user, client address/name, share, result, path, and one of `read`, `write`, `move`, or `delete`;
 - directory listings, sessions, metadata access, file-open/create noise, and all other VFS operations are discarded; users ending in a configured `AUDIT_SKIP_USER_SUFFIXES` value are also discarded;
 - immediately consecutive identical reads within the same UTC second are collapsed into one event, including across collector polling cycles; a different event interrupts the sequence and preserves later reads;
-- activity queries run directly against indexed SQLite columns and use a stable time/id cursor;
+- activity pages read only `limit + 1` indexed rows and use a stable time/id cursor;
+- exact counts for date, user, share, action, and result filters and all facet lists come from daily rollups;
+- selective substring path searches use the deduplicated trigram index and skip an expensive exact count while more pages exist;
+- collector inserts and rollup updates are batched in one transaction;
 - no activity retention deletion is performed.
 
-Collection starts even when the web UI is disabled. On the first collector start after this migration, recognized legacy daily `.jsonl`/`.jsonl.gz` files and the old collector state file under `/state/audit` are deleted without import. Existing raw Samba log content is then processed using the current action, suffix, and deduplication policy.
+Collection starts even when the web UI is disabled. Existing databases remain queryable while the collector backfills rollups, path IDs, and path-event mappings in bounded chunks after prioritizing each live append. On the first collector start after the legacy archive migration, recognized daily `.jsonl`/`.jsonl.gz` files and the old collector state file under `/state/audit` are deleted without import. Existing raw Samba log content is then processed using the current action, suffix, and deduplication policy.
 
 
 ## Backups

@@ -372,7 +372,19 @@ def main() -> int:
         ).stdout.splitlines()
     )
     check(
-        {"shares", "audit_events", "audit_sources", "web_cache"}.issubset(tables),
+        {
+            "shares",
+            "audit_events",
+            "audit_sources",
+            "audit_daily_totals",
+            "audit_daily_counts",
+            "audit_daily_facets",
+            "audit_rollup_state",
+            "audit_paths",
+            "audit_paths_fts",
+            "audit_path_events",
+            "web_cache",
+        }.issubset(tables),
         f"shared SQLite tables are incomplete: {sorted(tables)}",
     )
     indexes = set(
@@ -385,7 +397,11 @@ def main() -> int:
         ).stdout.splitlines()
     )
     check(
-        {"audit_events_time", "audit_events_user_time", "audit_events_action_time"}.issubset(indexes),
+        {
+            "audit_events_time",
+            "audit_events_user_time",
+            "audit_events_action_time",
+        }.issubset(indexes),
         f"audit indexes are incomplete: {sorted(indexes)}",
     )
     duplicate_reads = engine_run(

@@ -260,20 +260,31 @@ async function renderActivity() {
     </section>`;
   const form = document.querySelector("#activity-filter");
   let cursor = 0;
+  let loaded = 0;
+  let matched = null;
   const load = async append => {
     const params = new URLSearchParams(new FormData(form));
     params.set("limit", "100");
     if (cursor) params.set("cursor", String(cursor));
+    if (append) {
+      params.set("count", "0");
+      params.set("facets", "0");
+    }
     const result = await api(`/api/activity?${params}`);
     state.activity = result;
     const rows = document.querySelector("#activity-rows");
     if (append) rows.insertAdjacentHTML("beforeend", eventRows(result.events)); else rows.innerHTML = eventRows(result.events);
-    document.querySelector("#activity-summary").textContent = `${result.matched.toLocaleString("de-DE")} passende Ereignisse`;
+    loaded = append ? loaded + result.events.length : result.events.length;
+    if (!append) matched = result.matchedExact ? result.matched : null;
+    const shown = matched === null ? `${loaded.toLocaleString("de-DE")}${result.hasMore ? "+" : ""}` : matched.toLocaleString("de-DE");
+    document.querySelector("#activity-summary").textContent = `${shown} passende Ereignisse`;
     const more = document.querySelector("#load-more");
     cursor = result.nextCursor || 0;
-    more.hidden = !result.nextCursor;
-    for (const [id, values] of [["users-list", result.facets.users], ["shares-list", result.facets.shares]]) {
-      document.querySelector(`#${id}`).innerHTML = values.filter(Boolean).map(value => `<option value="${esc(value)}">`).join("");
+    more.hidden = !result.hasMore;
+    if (!append) {
+      for (const [id, values] of [["users-list", result.facets.users], ["shares-list", result.facets.shares]]) {
+        document.querySelector(`#${id}`).innerHTML = values.filter(Boolean).map(value => `<option value="${esc(value)}">`).join("");
+      }
     }
   };
   form.addEventListener("submit", async event => { event.preventDefault(); cursor = 0; try { await load(false); } catch (error) { notice(error.message); } });

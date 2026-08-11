@@ -165,6 +165,7 @@ def main() -> int:
                 count = collect_once(store)
                 if count:
                     log(f"Stored {count} event(s)")
+                store.backfill_rollups()
             except Exception as exc:  # pylint: disable=broad-except
                 log(f"Collector cycle failed: {exc}")
             time.sleep(POLL_SECONDS)

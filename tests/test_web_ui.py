@@ -551,7 +551,153 @@ class AuditQueryTests(unittest.TestCase):
         self.assertNotIn("robot_svc", visible["facets"]["users"])
         self.assertEqual(set(visible["facets"]["actions"]), {"read", "delete"})
 
-    def test_schema_has_filter_and_time_indexes(self):
+    def test_query_metadata_uses_rollups_instead_of_raw_event_scans(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            today = dt.datetime.now(dt.timezone.utc).date()
+            store = audit_store.AuditStore(os.path.join(tmpdir, "state.db"))
+            events = [
+                self.make_event(f"{today}T12:00:0{index}+00:00", "alice")
+                for index in range(4)
+            ]
+            store.append_batch(events, {}, set())
+            statements = []
+            store.conn.set_trace_callback(statements.append)
+            try:
+                result = audit_store.query_activity(
+                    store.conn, today, today, {"limit": ["1"]}
+                )
+            finally:
+                store.conn.set_trace_callback(None)
+                store.close()
+
+        normalized = [" ".join(statement.casefold().split()) for statement in statements]
+        self.assertEqual(result["matched"], 4)
+        self.assertTrue(result["matchedExact"])
+        self.assertTrue(result["hasMore"])
+        self.assertTrue(
+            any("from audit_daily_totals" in statement for statement in normalized)
+        )
+        self.assertTrue(
+            any("from audit_daily_facets" in statement for statement in normalized)
+        )
+        self.assertFalse(
+            any(
+                "select count(*) from audit_events" in statement
+                for statement in normalized
+            )
+        )
+        self.assertFalse(
+            any(
+                "select distinct user from audit_events" in statement
+                for statement in normalized
+            )
+        )
+
+    def test_path_query_does_not_block_on_an_exact_count(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            today = dt.datetime.now(dt.timezone.utc).date()
+            store = audit_store.AuditStore(os.path.join(tmpdir, "state.db"))
+            events = [
+                self.make_event(f"{today}T12:00:0{index}+00:00", "alice")
+                for index in range(3)
+            ]
+            store.append_batch(events, {}, set())
+            statements = []
+            store.conn.set_trace_callback(statements.append)
+            try:
+                result = audit_store.query_activity(
+                    store.conn,
+                    today,
+                    today,
+                    {"path": ["file"], "limit": ["1"], "facets": ["0"]},
+                )
+            finally:
+                store.conn.set_trace_callback(None)
+                store.close()
+
+        normalized = [" ".join(statement.casefold().split()) for statement in statements]
+        self.assertIsNone(result["matched"])
+        self.assertFalse(result["matchedExact"])
+        self.assertTrue(result["hasMore"])
+        self.assertTrue(
+            any("from audit_paths_fts" in statement for statement in normalized)
+        )
+        self.assertTrue(
+            any("from audit_path_events" in statement for statement in normalized)
+        )
+        self.assertTrue(
+            any("pe.path_id =" in statement for statement in normalized)
+        )
+        self.assertFalse(
+            any("lower(path) like" in statement for statement in normalized)
+        )
+
+        self.assertFalse(
+            any(
+                "select count(*) from audit_events" in statement
+                for statement in normalized
+            )
+        )
+
+    def test_incrementally_backfills_legacy_events_without_double_counting_live_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            today = dt.datetime.now(dt.timezone.utc).date()
+            database = os.path.join(tmpdir, "state.db")
+            store = audit_store.AuditStore(database)
+            legacy = [
+                self.make_event(f"{today}T12:00:0{index}+00:00", "alice")
+                for index in range(3)
+            ]
+            store.append_batch(legacy, {}, set())
+            store.conn.execute("UPDATE audit_events SET path_id = NULL")
+            store.conn.execute("DELETE FROM audit_path_events")
+
+            for table in (
+                "audit_daily_totals",
+                "audit_daily_counts",
+                "audit_daily_facets",
+                "audit_rollup_state",
+            ):
+                store.conn.execute(f"DELETE FROM {table}")
+            store.conn.commit()
+            store.close()
+
+            store = audit_store.AuditStore(database)
+            live = self.make_event(f"{today}T12:00:09+00:00", "bob")
+            store.append_batch([live], {}, set())
+            before = audit_store.query_activity(
+                store.conn, today, today, {"limit": ["10"]}
+            )
+            self.assertEqual(store.backfill_rollups(limit=2), 2)
+            self.assertEqual(store.backfill_rollups(limit=2), 1)
+            self.assertEqual(store.backfill_rollups(limit=2), 0)
+            after = audit_store.query_activity(
+                store.conn, today, today, {"limit": ["10"]}
+            )
+            total = store.conn.execute(
+                "SELECT sum(event_count) FROM audit_daily_totals"
+            ).fetchone()[0]
+            ready = store.conn.execute(
+                "SELECT ready FROM audit_rollup_state WHERE singleton = 1"
+            ).fetchone()[0]
+            missing_path_ids = store.conn.execute(
+                "SELECT count(*) FROM audit_events WHERE path_id IS NULL"
+            ).fetchone()[0]
+            path_event_count = store.conn.execute(
+                "SELECT count(*) FROM audit_path_events"
+            ).fetchone()[0]
+
+            store.close()
+
+        self.assertEqual(before["matched"], 4)
+        self.assertEqual(after["matched"], 4)
+        self.assertEqual(total, 4)
+        self.assertEqual(ready, 1)
+        self.assertEqual(missing_path_ids, 0)
+        self.assertEqual(path_event_count, 4)
+
+
+    def test_schema_has_filter_indexes_and_rollup_tables(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = audit_store.AuditStore(os.path.join(tmpdir, "state.db"))
             try:
@@ -559,6 +705,12 @@ class AuditQueryTests(unittest.TestCase):
                     row[0]
                     for row in store.conn.execute(
                         "SELECT name FROM sqlite_schema WHERE type = 'index'"
+                    )
+                }
+                tables = {
+                    row[0]
+                    for row in store.conn.execute(
+                        "SELECT name FROM sqlite_schema WHERE type = 'table'"
                     )
                 }
             finally:
@@ -573,6 +725,17 @@ class AuditQueryTests(unittest.TestCase):
                 "audit_events_share_time",
                 "audit_events_result_time",
             }.issubset(indexes)
+        )
+        self.assertTrue(
+            {
+                "audit_daily_totals",
+                "audit_daily_counts",
+                "audit_daily_facets",
+                "audit_rollup_state",
+                "audit_paths",
+                "audit_paths_fts",
+                "audit_path_events",
+            }.issubset(tables)
         )
 
     def test_drops_only_known_legacy_audit_files(self):
