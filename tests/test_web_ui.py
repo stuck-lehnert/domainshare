@@ -466,8 +466,9 @@ class AuditParsingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             active = os.path.join(tmpdir, "log.pc01")
             database = os.path.join(tmpdir, "state.db")
+            today = dt.datetime.now(dt.timezone.utc).strftime("%Y/%m/%d")
             read = (
-                "[2026/07/31 12:34:56.000000, 1] smbd_audit: "
+                f"[{today} 12:34:56.000000, 1] smbd_audit: "
                 "x|alice|192.0.2.5|PC01|Data|pread|OK|a.txt\n"
             )
             write = read.replace("pread|OK|a.txt", "pwrite|OK|changed.txt")
@@ -499,64 +500,86 @@ class AuditParsingTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_deduplicates_only_uninterrupted_identical_reads_in_one_second(self):
+
+    def test_deduplicates_reads_per_second_across_interleaved_events(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            active = os.path.join(tmpdir, "log.pc01")
             database = os.path.join(tmpdir, "state.db")
-
-            def line(operation, path, second="12:34:56"):
-                return (
-                    f"[2026/07/31 {second}.000000, 1] smbd_audit: "
-                    f"x|alice|192.0.2.5|PC01|Data|{operation}|OK|{path}\n"
-                )
-
-            with open(active, "w", encoding="utf-8") as handle:
-                handle.writelines(
-                    [
-                        line("pread", "a.txt"),
-                        line("pread", "a.txt"),
-                        line("pread", "b.txt"),
-                        line("pread", "a.txt"),
-                        line("pread", "a.txt"),
-                    ]
-                )
-
             store = audit_store.AuditStore(database)
-            try:
-                with mock.patch.object(
-                    audit_collector,
-                    "SAMBA_LOG_GLOB",
-                    os.path.join(tmpdir, "log.*"),
-                ):
-                    self.assertEqual(audit_collector.collect_once(store), 3)
-                    with open(active, "a", encoding="utf-8") as handle:
-                        handle.write(line("pread", "a.txt"))
-                    self.assertEqual(audit_collector.collect_once(store), 0)
-                    with open(active, "a", encoding="utf-8") as handle:
-                        handle.write(line("pwrite", "changed.txt"))
-                        handle.write(line("pread", "a.txt"))
-                    self.assertEqual(audit_collector.collect_once(store), 2)
-                    with open(active, "a", encoding="utf-8") as handle:
-                        handle.write(line("pread", "a.txt", "12:34:57"))
-                    self.assertEqual(audit_collector.collect_once(store), 1)
 
-                rows = store.conn.execute(
-                    "SELECT action, path, occurred_at FROM audit_events ORDER BY id"
-                ).fetchall()
-                self.assertEqual(
-                    [(row["action"], row["path"]) for row in rows],
+            def event(
+                action="read",
+                path="a.txt",
+                second="12:34:56",
+                share="Data",
+                source="log.pc01",
+            ):
+                timestamp = f"{dt.datetime.now(dt.timezone.utc).date()}T{second}+00:00"
+                return {
+                    "timestamp": timestamp,
+                    "ingestedAt": timestamp,
+                    "user": "LOCAL\\silvia.mueller",
+                    "clientIp": "10.100.0.22",
+                    "client": "PC01",
+                    "share": share,
+                    "operation": "pread" if action == "read" else "pwrite",
+                    "action": action,
+                    "path": path,
+                    "result": "OK",
+                    "success": True,
+                    "source": source,
+                }
+
+            try:
+                inserted = store.append_batch(
                     [
-                        ("read", "a.txt"),
-                        ("read", "b.txt"),
-                        ("read", "a.txt"),
-                        ("write", "changed.txt"),
-                        ("read", "a.txt"),
-                        ("read", "a.txt"),
+                        event(source="log.pc01"),
+                        event(path="profile.vhdx", share="FSLogix"),
+                        event(action="write", path="changed.txt"),
+                        event(action="write", path="changed.txt", source="log.pc02"),
+                        event(source="log.pc02"),
+                        event(path="b.txt"),
+                        event(source="log.pc03"),
                     ],
+                    {},
+                    set(),
                 )
-                self.assertTrue(rows[-1]["occurred_at"].endswith("12:34:57+00:00"))
+                repeated_poll = store.append_batch(
+                    [event(source="log.pc04")], {}, set()
+                )
+                next_second = store.append_batch(
+                    [event(second="12:34:57")], {}, set()
+                )
+                rows = store.conn.execute(
+                    """
+                    SELECT action, share, path, occurred_second
+                    FROM audit_events
+                    ORDER BY id
+                    """
+                ).fetchall()
+                fingerprints = store.conn.execute(
+                    """
+                    SELECT count(*) FROM audit_read_dedup
+                    """
+                ).fetchone()[0]
             finally:
                 store.close()
+
+        self.assertEqual(inserted, 5)
+        self.assertEqual(repeated_poll, 0)
+        self.assertEqual(next_second, 1)
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(fingerprints, 4)
+        self.assertEqual(
+            [(row["action"], row["share"], row["path"]) for row in rows],
+            [
+                ("read", "Data", "a.txt"),
+                ("read", "FSLogix", "profile.vhdx"),
+                ("write", "Data", "changed.txt"),
+                ("write", "Data", "changed.txt"),
+                ("read", "Data", "b.txt"),
+                ("read", "Data", "a.txt"),
+            ],
+        )
 
 
 class AuditQueryTests(unittest.TestCase):
@@ -946,7 +969,69 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(main["matched"], 1)
         self.assertEqual(fslogix["matched"], 1)
         self.assertEqual(total, 2)
-        self.assertEqual(policy_version, 3)
+        self.assertEqual(policy_version, 4)
+
+    def test_upgrade_collapses_recent_legacy_read_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            today = dt.datetime.now(dt.timezone.utc).date()
+            database = os.path.join(tmpdir, "state.db")
+            store = audit_store.AuditStore(database)
+            event = self.make_event(f"{today}T12:00:00+00:00", "alice")
+            store.append_batch([event], {}, set())
+            for source in ("log.pc02", "log.pc03"):
+                store.conn.execute(
+                    """
+                    INSERT INTO audit_events (
+                        occurred_at, occurred_second, ingested_at, user, account,
+                        client_ip, client, share, action, result, success, path,
+                        path_id, source
+                    )
+                    SELECT occurred_at, occurred_second, ingested_at, user,
+                           account, client_ip, client, share, action, result,
+                           success, path, path_id, ?
+                    FROM audit_events
+                    WHERE id = 1
+                    """,
+                    (source,),
+                )
+            store.conn.execute("DELETE FROM audit_read_dedup")
+            store.conn.execute(
+                "UPDATE audit_rollup_state SET policy_version = 3"
+            )
+            store.conn.commit()
+            store.close()
+
+            store = audit_store.AuditStore(database)
+            try:
+                live = dict(event, source="log.live")
+                live_inserted = store.append_batch([live], {}, set())
+                while store.backfill_rollups(limit=1):
+                    pass
+                event_count = store.conn.execute(
+                    "SELECT count(*) FROM audit_events"
+                ).fetchone()[0]
+                rolled_up = store.conn.execute(
+                    "SELECT sum(event_count) FROM audit_daily_totals"
+                ).fetchone()[0]
+                dedup_keys = store.conn.execute(
+                    "SELECT count(*) FROM audit_read_dedup"
+                ).fetchone()[0]
+                policy_version = store.conn.execute(
+                    "SELECT policy_version FROM audit_rollup_state"
+                ).fetchone()[0]
+                retained_source = store.conn.execute(
+                    "SELECT source FROM audit_events"
+                ).fetchone()[0]
+            finally:
+                store.close()
+
+        self.assertEqual(event_count, 1)
+        self.assertEqual(rolled_up, 1)
+        self.assertEqual(live_inserted, 1)
+        self.assertEqual(retained_source, "log.live")
+        self.assertEqual(dedup_keys, 1)
+        self.assertEqual(policy_version, 4)
+
 
     def test_schema_has_filter_indexes_and_rollup_tables(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -981,6 +1066,7 @@ class AuditQueryTests(unittest.TestCase):
                 "audit_events_fslogix_user_time",
                 "audit_events_fslogix_account_time",
                 "audit_events_fslogix_result_time",
+                "audit_read_dedup_time",
             }.issubset(indexes)
         )
         self.assertTrue(
@@ -992,6 +1078,7 @@ class AuditQueryTests(unittest.TestCase):
                 "audit_paths",
                 "audit_paths_fts",
                 "audit_path_events",
+                "audit_read_dedup",
             }.issubset(tables)
         )
 
@@ -1082,6 +1169,9 @@ class WebPresentationTests(unittest.TestCase):
         self.assertIn('"/api/backup?log=0"', script)
         self.assertIn('"/api/reconciliation?log=0"', script)
         self.assertEqual(script.count("if (active || previousActive)"), 2)
+        self.assertIn('const body = document.querySelector("#reconciliation-body")', script)
+        self.assertIn("if (!body.isConnected || !button.isConnected)", script)
+        self.assertNotIn('document.querySelector("#reconciliation-body").innerHTML', script)
         self.assertNotIn("BACKUP_AUTO_ENABLED", script)
         self.assertIn("data.interrupted", script)
 

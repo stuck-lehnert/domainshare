@@ -341,6 +341,7 @@ async function renderBackup() {
     '<button id="start-backup" type="button">Sicherung jetzt starten</button>'
   ) + '<div id="backup-body"></div>';
   const button = document.querySelector("#start-backup");
+  const body = document.querySelector("#backup-body");
   let logLines = [];
   let previousActive = false;
   let polling = false;
@@ -349,9 +350,10 @@ async function renderBackup() {
       const currentLog = document.querySelector("#backup-log");
       const previousScrollTop = currentLog?.scrollTop || 0;
       const data = await api(includeLog ? "/api/backup" : "/api/backup?log=0");
+      if (!body.isConnected || !button.isConnected) return null;
       if (Array.isArray(data.log)) logLines = data.log;
       data.log = logLines;
-      document.querySelector("#backup-body").innerHTML = backupMarkup(data);
+      body.innerHTML = backupMarkup(data);
       button.disabled = !data.manualEnabled || processIsActive(data);
       button.title = data.manualEnabled ? "" : "Es ist kein Sicherungsziel eingerichtet.";
       const logView = document.querySelector("#backup-log");
@@ -394,6 +396,7 @@ async function renderBackup() {
     }
   });
   const initial = await refresh(true);
+  if (!body.isConnected || !button.isConnected) return;
   previousActive = processIsActive(initial);
   state.timer = window.setInterval(() => { void poll(); }, 2000);
 }
@@ -449,6 +452,7 @@ async function renderReconciliation() {
     '<button id="start-reconciliation" type="button">Freigaben jetzt abgleichen</button>'
   ) + '<div id="reconciliation-body"></div>';
   const button = document.querySelector("#start-reconciliation");
+  const body = document.querySelector("#reconciliation-body");
   let logLines = [];
   let previousActive = false;
   let polling = false;
@@ -459,9 +463,10 @@ async function renderReconciliation() {
       const data = await api(
         includeLog ? "/api/reconciliation" : "/api/reconciliation?log=0"
       );
+      if (!body.isConnected || !button.isConnected) return null;
       if (Array.isArray(data.log)) logLines = data.log;
       data.log = logLines;
-      document.querySelector("#reconciliation-body").innerHTML = reconciliationMarkup(data);
+      body.innerHTML = reconciliationMarkup(data);
       button.disabled = processIsActive(data);
       const logView = document.querySelector("#reconciliation-log");
       if (logView) {
@@ -503,6 +508,7 @@ async function renderReconciliation() {
     }
   });
   const initial = await refresh(true);
+  if (!body.isConnected || !button.isConnected) return;
   previousActive = processIsActive(initial);
   state.timer = window.setInterval(() => { void poll(); }, 1500);
 }
