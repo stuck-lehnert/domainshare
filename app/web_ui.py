@@ -60,7 +60,7 @@ STATIC_ROOT = os.getenv("WEB_STATIC_DIR", "/app/web")
 STATE_DB = STATE_DB_PATH
 BACKUP_STATUS_FILE = os.getenv("BACKUP_STATUS_FILE", "/state/backup-status.json")
 BACKUP_LOG_FILE = os.getenv("BACKUP_LOG_FILE", "/var/log/backup.log")
-BACKUP_LOCK_FILE = "/state/backup.lock"
+BACKUP_LOCK_FILE = os.path.join(os.getenv("STATE_ROOT", "/state"), "backup.lock")
 RECONCILE_STATUS_FILE = os.getenv(
     "RECONCILE_STATUS_FILE", "/state/reconcile-status.json"
 )
@@ -76,6 +76,7 @@ SID_RE = re.compile(r"S-\d+(?:-\d+)+", re.IGNORECASE)
 LOGIN_LIMIT: Dict[str, deque] = {}
 LOGIN_LIMIT_LOCK = threading.Lock()
 ACTION_LAUNCH_LOCK = threading.Lock()
+ACTIVE_PROCESS_STATES = frozenset({"starting", "running"})
 
 
 def log(message: str) -> None:
@@ -174,6 +175,69 @@ def read_json(path: str, default):
             return json.load(handle)
     except (OSError, ValueError):
         return default
+
+
+def write_json_atomic(path: str, value: Dict[str, object]) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temp_path = f"{path}.recovery.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except (OSError, TypeError, ValueError):
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def reconcile_backup_process_status(value: Dict[str, object]) -> Dict[str, object]:
+    """Replace stale active state when no worker owns the backup lock."""
+    if str(value.get("state", "")) not in ACTIVE_PROCESS_STATES:
+        value["processRunning"] = False
+        return value
+
+    try:
+        lock_dir = os.path.dirname(BACKUP_LOCK_FILE)
+        if lock_dir:
+            os.makedirs(lock_dir, exist_ok=True)
+        with open(BACKUP_LOCK_FILE, "a+", encoding="utf-8") as lock_file:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                value["processRunning"] = True
+                return value
+
+            latest = read_json(BACKUP_STATUS_FILE, value)
+            if str(latest.get("state", "")) in ACTIVE_PROCESS_STATES:
+                latest.update(
+                    {
+                        "state": "failed",
+                        "finishedAt": now_utc().isoformat(timespec="seconds"),
+                        "activeFiles": [],
+                        "currentSource": None,
+                        "workerPid": None,
+                        "interrupted": True,
+                        "message": (
+                            "Backup interrupted because the worker process "
+                            "is no longer running"
+                        ),
+                    }
+                )
+                write_json_atomic(BACKUP_STATUS_FILE, latest)
+                log("Recovered stale backup status after worker interruption")
+            latest["processRunning"] = False
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            return latest
+    except OSError as exc:
+        log(f"Unable to verify backup worker state: {exc}")
+        value["processRunning"] = None
+        return value
 
 
 def base64url(value: bytes) -> str:
@@ -711,7 +775,9 @@ class DirectoryCache:
 
 
 
-def query_audit(params: Dict[str, List[str]]) -> Dict[str, object]:
+def query_audit(
+    params: Dict[str, List[str]], *, stream: str = "main"
+) -> Dict[str, object]:
     today = now_utc().date()
     default_start = today - dt.timedelta(days=1)
     try:
@@ -724,7 +790,7 @@ def query_audit(params: Dict[str, List[str]]) -> Dict[str, object]:
         raise ValueError(f"Der Datumsbereich darf höchstens {max_days} Tage umfassen")
     conn = connect_state_db(STATE_DB, read_only=True)
     try:
-        return query_activity(conn, start, end, params)
+        return query_activity(conn, start, end, params, stream=stream)
     finally:
         conn.close()
 
@@ -747,6 +813,7 @@ def tail_lines(path: str, count: int) -> List[str]:
 
 def backup_payload(include_log: bool = True) -> Dict[str, object]:
     value = read_json(BACKUP_STATUS_FILE, {})
+    value = reconcile_backup_process_status(value)
     value.pop("log", None)
     configured = bool(os.getenv("BACKUP_DESTINATION", "").strip())
     automatic = configured and env_bool("BACKUP_AUTO_ENABLED", True)
@@ -837,7 +904,17 @@ class App:
     def overview(self) -> Dict[str, object]:
         usage = self.usage.snapshot()
         recent = query_audit({"limit": ["12"], "facets": ["0"]})
-        return {"usage": usage, "activeGroups": share_count(), "recentEvents": recent["events"], "eventCount": recent["matched"], "backup": backup_payload(), "audit": audit_archive_summary()}
+        event_count = recent["matched"]
+        if event_count is None:
+            event_count = f"{len(recent['events'])}+"
+        return {
+            "usage": usage,
+            "activeGroups": share_count(),
+            "recentEvents": recent["events"],
+            "eventCount": event_count,
+            "backup": backup_payload(),
+            "audit": audit_archive_summary(),
+        }
 
     def system_summary(self) -> Dict[str, object]:
         checks = {}
@@ -1026,6 +1103,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(APP.usage.snapshot())
                 elif path == "/api/activity":
                     self.send_json(query_audit(params))
+                elif path == "/api/fslogix-activity":
+                    self.send_json(query_audit(params, stream="fslogix"))
                 elif path == "/api/backup":
                     self.send_json(
                         backup_payload(include_log=query_includes_log(params))

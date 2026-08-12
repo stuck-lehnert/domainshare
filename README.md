@@ -22,7 +22,7 @@ This repository provides a production-oriented Samba file server container that 
 - Setup prompts for well-known authorization groups by SID (`DOMAIN_USERS_SID`, `DOMAIN_ADMINS_SID`) to avoid localized group names.
 - `FSLOGIX_GROUP_SID` controls who can access the default FSLogix share (defaults to `DOMAIN_USERS_SID`).
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
-- Samba `full_audit` is restricted to successful and failed reads, writes, renames, and deletions.
+- Samba `full_audit` records successful and failed reads, writes, renames, and deletions on all three shares; FSLogix events are retained in a separate indexed activity stream.
 - A collector normalizes those four actions and persists them in indexed SQLite tables; activity is never automatically deleted.
 - A plain HTTPS administration console provides read-only statistics and logs plus narrowly scoped actions for manual backups and share reconciliation. It also includes a fully client-side Typst PDF report.
 - Web sign-in validates the submitted username/password with Kerberos, permits only users whose winbind group SID set contains `DOMAIN_ADMINS_SID`, and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
@@ -393,15 +393,17 @@ If `WEB_ENABLED` is absent on an upgraded installation and no TLS settings/certi
 
 ## Activity Database
 
-Samba emits only the selected high-level `full_audit` operations, and the collector stores them durably:
+Samba emits selected high-level `full_audit` operations for Private, Data, and FSLogix, and the collector stores them durably:
 
 - it tails every `/var/log/samba/log.*` source and stores inode/byte offsets transactionally in `audit_sources`, so source progress and inserted events commit together;
 - each event records a UTC timestamp, user, client address/name, share, result, path, and one of `read`, `write`, `move`, or `delete`;
 - directory listings, sessions, metadata access, file-open/create noise, and all other VFS operations are discarded; users ending in a configured `AUDIT_SKIP_USER_SUFFIXES` value are also discarded;
+- FSLogix profile-container events are retained and queried through their own partial indexes, API route, and UI log instead of appearing in the main activity stream;
 - immediately consecutive identical reads within the same UTC second are collapsed into one event, including across collector polling cycles; a different event interrupts the sequence and preserves later reads;
 - activity pages read only `limit + 1` indexed rows and use a stable time/id cursor;
 - exact counts for date, user, share, action, and result filters and all facet lists come from daily rollups;
 - selective substring path searches use the deduplicated trigram index and skip an expensive exact count while more pages exist;
+- while a legacy backfill is running, pages return immediately without raw-table count or facet scans and expose indexing progress;
 - collector inserts and rollup updates are batched in one transaction;
 - no activity retention deletion is performed.
 
@@ -434,6 +436,7 @@ Collection starts even when the web UI is disabled. Existing databases remain qu
 - Upload progress is logged per file every `BACKUP_PROGRESS_INTERVAL_SECONDS` seconds and again when a file reaches 100%, including percentage and transferred/remaining bytes with auto-scaled units.
 - `BACKUP_PROGRESS=auto` shows an interactive multi-line progress view only for TTY/manual runs. Current file uploads are shown as separate rows, capped at 12 rows, with the total progress row at the bottom. Use `always` to force it or `never` to suppress the bar. File and total progress are still logged.
 - Every run atomically updates `BACKUP_STATUS_FILE` (default `/state/backup-status.json`) with its state, current source, active files, byte totals, percentage, snapshot, and final result for the live web view.
+- Active status is reconciled against the kernel-held `/state/backup.lock`; if a container restart or forced termination releases the lock while status still says `starting` or `running`, the web API atomically records the run as interrupted instead of reporting a phantom backup.
 - Rclone-backed destinations cap concurrent file transfers at 12. Rsync remains single-streamed by rsync itself.
 - Retention logic:
   - daily: newest N snapshots

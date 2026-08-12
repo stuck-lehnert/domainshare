@@ -16,7 +16,11 @@ try:
     )
     from .state_db import connect_state_db
 except ImportError:
-    from audit_policy import account_name, read_deduplication_key, skipped_user_suffixes
+    from audit_policy import (
+        account_name,
+        read_deduplication_key,
+        skipped_user_suffixes,
+    )
     from state_db import connect_state_db
 
 
@@ -43,20 +47,46 @@ CREATE TABLE IF NOT EXISTS audit_sources (
     inode INTEGER NOT NULL,
     offset INTEGER NOT NULL
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS audit_events_time
-    ON audit_events (occurred_second DESC, id DESC);
-CREATE INDEX IF NOT EXISTS audit_events_action_time
-    ON audit_events (action, occurred_second DESC, id DESC);
-CREATE INDEX IF NOT EXISTS audit_events_success_time
-    ON audit_events (success, occurred_second DESC, id DESC);
-CREATE INDEX IF NOT EXISTS audit_events_user_time
-    ON audit_events (user COLLATE NOCASE, occurred_second DESC, id DESC);
-CREATE INDEX IF NOT EXISTS audit_events_account_time
-    ON audit_events (account, occurred_second DESC, id DESC);
-CREATE INDEX IF NOT EXISTS audit_events_share_time
-    ON audit_events (share COLLATE NOCASE, occurred_second DESC, id DESC);
-CREATE INDEX IF NOT EXISTS audit_events_result_time
-    ON audit_events (result COLLATE NOCASE, occurred_second DESC, id DESC);
+CREATE INDEX IF NOT EXISTS audit_events_main_time
+    ON audit_events (occurred_second DESC, id DESC)
+    WHERE share <> 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_main_action_time
+    ON audit_events (action, occurred_second DESC, id DESC)
+    WHERE share <> 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_main_success_time
+    ON audit_events (success, occurred_second DESC, id DESC)
+    WHERE share <> 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_main_user_time
+    ON audit_events (user COLLATE NOCASE, occurred_second DESC, id DESC)
+    WHERE share <> 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_main_account_time
+    ON audit_events (account, occurred_second DESC, id DESC)
+    WHERE share <> 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_main_share_time
+    ON audit_events (share COLLATE NOCASE, occurred_second DESC, id DESC)
+    WHERE share <> 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_main_result_time
+    ON audit_events (result COLLATE NOCASE, occurred_second DESC, id DESC)
+    WHERE share <> 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_fslogix_time
+    ON audit_events (occurred_second DESC, id DESC)
+    WHERE share = 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_fslogix_action_time
+    ON audit_events (action, occurred_second DESC, id DESC)
+    WHERE share = 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_fslogix_success_time
+    ON audit_events (success, occurred_second DESC, id DESC)
+    WHERE share = 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_fslogix_user_time
+    ON audit_events (user COLLATE NOCASE, occurred_second DESC, id DESC)
+    WHERE share = 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_fslogix_account_time
+    ON audit_events (account, occurred_second DESC, id DESC)
+    WHERE share = 'FSLogix' COLLATE NOCASE;
+CREATE INDEX IF NOT EXISTS audit_events_fslogix_result_time
+    ON audit_events (result COLLATE NOCASE, occurred_second DESC, id DESC)
+    WHERE share = 'FSLogix' COLLATE NOCASE;
+
 CREATE TABLE IF NOT EXISTS audit_paths (
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL UNIQUE
@@ -107,7 +137,8 @@ CREATE TABLE IF NOT EXISTS audit_rollup_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     backfill_next_id INTEGER NOT NULL,
     backfill_max_id INTEGER NOT NULL,
-    ready INTEGER NOT NULL CHECK (ready IN (0, 1))
+    ready INTEGER NOT NULL CHECK (ready IN (0, 1)),
+    policy_version INTEGER NOT NULL DEFAULT 3
 );
 
 """
@@ -135,12 +166,33 @@ VALUES (?, ?, ?, ?)
 
 def ensure_audit_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(AUDIT_SCHEMA)
+    for legacy_index in (
+        "audit_events_time",
+        "audit_events_action_time",
+        "audit_events_success_time",
+        "audit_events_user_time",
+        "audit_events_account_time",
+        "audit_events_share_time",
+        "audit_events_result_time",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {legacy_index}")
+
     columns = {
         str(row["name"])
         for row in conn.execute("PRAGMA table_info(audit_events)")
     }
     if "path_id" not in columns:
         conn.execute("ALTER TABLE audit_events ADD COLUMN path_id INTEGER")
+
+    state_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(audit_rollup_state)")
+    }
+    if "policy_version" not in state_columns:
+        conn.execute(
+            "ALTER TABLE audit_rollup_state "
+            "ADD COLUMN policy_version INTEGER NOT NULL DEFAULT 1"
+        )
 
     max_id = int(
         conn.execute("SELECT coalesce(max(id), 0) FROM audit_events").fetchone()[0]
@@ -153,6 +205,29 @@ def ensure_audit_schema(conn: sqlite3.Connection) -> None:
         """,
         (max_id, int(max_id == 0)),
     )
+    state = conn.execute(
+        """
+        SELECT ready, policy_version
+        FROM audit_rollup_state
+        WHERE singleton = 1
+        """
+    ).fetchone()
+    if state is not None and int(state["policy_version"]) < 3:
+        for table in (
+            "audit_daily_totals",
+            "audit_daily_counts",
+            "audit_daily_facets",
+        ):
+            conn.execute(f"DELETE FROM {table}")
+        conn.execute(
+            """
+            UPDATE audit_rollup_state
+            SET backfill_next_id = 1, backfill_max_id = ?, ready = ?,
+                policy_version = 3
+            WHERE singleton = 1
+            """,
+            (max_id, int(max_id == 0)),
+        )
     conn.commit()
 
 
@@ -347,7 +422,7 @@ class AuditStore:
             raise
         return len(event_rows)
 
-    def backfill_rollups(self, limit: int = 10000) -> int:
+    def backfill_rollups(self, limit: int = 50000) -> int:
         """Backfill one bounded legacy-event chunk without delaying live appends."""
         state = self.conn.execute(
             """
@@ -459,7 +534,8 @@ class AuditStore:
                     )
                     SELECT ?, occurred_second / 86400, account, {column}
                     FROM audit_events
-                    WHERE id BETWEEN ? AND ? AND {column} <> ''
+                    WHERE id BETWEEN ? AND ?
+                        AND {column} <> ''
                     GROUP BY occurred_second / 86400, account, {column}
                     """,
                     (kind, start_id, end_id),
@@ -519,15 +595,28 @@ def excluded_account_conditions() -> Tuple[List[str], List[object]]:
     return conditions, values
 
 
+def activity_stream_condition(stream: str) -> str:
+    if stream == "main":
+        return "share <> 'FSLogix' COLLATE NOCASE"
+    if stream == "fslogix":
+        return "share = 'FSLogix' COLLATE NOCASE"
+    raise ValueError("Ungültiger Aktivitätsstrom")
+
+
 def activity_conditions(
     start: dt.date,
     end: dt.date,
     params: Dict[str, List[str]],
     *,
+    stream: str,
     include_filters: bool,
     include_path: bool = True,
 ) -> Tuple[List[str], List[object]]:
-    conditions = ["occurred_second >= ?", "occurred_second < ?"]
+    conditions = [
+        "occurred_second >= ?",
+        "occurred_second < ?",
+        activity_stream_condition(stream),
+    ]
     values: List[object] = [
         date_seconds(start),
         date_seconds(end + dt.timedelta(days=1)),
@@ -568,14 +657,44 @@ def activity_conditions(
     return conditions, values
 
 
-def rollups_ready(conn: sqlite3.Connection) -> bool:
+def rollup_status(conn: sqlite3.Connection) -> Dict[str, object]:
     try:
         row = conn.execute(
-            "SELECT ready FROM audit_rollup_state WHERE singleton = 1"
+            """
+            SELECT backfill_next_id, backfill_max_id, ready
+            FROM audit_rollup_state
+            WHERE singleton = 1
+            """
         ).fetchone()
     except sqlite3.Error:
-        return False
-    return row is not None and bool(row[0])
+        row = None
+    if row is None:
+        return {
+            "ready": False,
+            "processedEvents": 0,
+            "totalEvents": 0,
+            "percent": 0.0,
+        }
+
+    total = max(0, int(row["backfill_max_id"]))
+    ready = bool(row["ready"])
+    processed = (
+        total
+        if ready
+        else min(total, max(0, int(row["backfill_next_id"]) - 1))
+    )
+    percent = (
+        100.0
+        if ready or total == 0
+        else round(processed * 100 / total, 1)
+    )
+    return {
+        "ready": ready,
+        "processedEvents": processed,
+        "totalEvents": total,
+        "percent": percent,
+    }
+
 
 
 def rollup_range(
@@ -597,44 +716,40 @@ def rollup_matched(
     start: dt.date,
     end: dt.date,
     params: Dict[str, List[str]],
+    *,
+    stream: str,
 ) -> Optional[int]:
     filters = activity_filters(params)
     if filters["path"]:
         return None
 
     conditions, values = rollup_range(start, end)
-    has_filters = any(
-        filters[name] for name in ("user", "share", "operation", "action", "result")
-    )
-    if not has_filters:
-        table = "audit_daily_totals"
-    else:
-        table = "audit_daily_counts"
-        user = filters["user"]
-        if user:
-            if "\\" in user or "@" in user:
-                conditions.append("user = ? COLLATE NOCASE")
-            else:
-                conditions.append("account = ?")
-            values.append(user)
-        if filters["share"]:
-            conditions.append("share = ? COLLATE NOCASE")
-            values.append(filters["share"])
-        action = filters["action"] or filters["operation"]
-        if action:
-            conditions.append("action = ?")
-            values.append(action)
-        result = filters["result"]
-        if result == "fail":
-            conditions.append("success = 0")
-        elif result:
-            conditions.append("result = ? COLLATE NOCASE")
-            values.append(result)
+    conditions.append(activity_stream_condition(stream))
+    user = filters["user"]
+    if user:
+        if "\\" in user or "@" in user:
+            conditions.append("user = ? COLLATE NOCASE")
+        else:
+            conditions.append("account = ?")
+        values.append(user)
+    if filters["share"]:
+        conditions.append("share = ? COLLATE NOCASE")
+        values.append(filters["share"])
+    action = filters["action"] or filters["operation"]
+    if action:
+        conditions.append("action = ?")
+        values.append(action)
+    result = filters["result"]
+    if result == "fail":
+        conditions.append("success = 0")
+    elif result:
+        conditions.append("result = ? COLLATE NOCASE")
+        values.append(result)
 
     row = conn.execute(
         f"""
         SELECT coalesce(sum(event_count), 0)
-        FROM {table}
+        FROM audit_daily_counts
         WHERE {" AND ".join(conditions)}
         """,
         values,
@@ -643,56 +758,30 @@ def rollup_matched(
 
 
 def rollup_facets(
-    conn: sqlite3.Connection, start: dt.date, end: dt.date
-) -> Dict[str, List[str]]:
-    range_conditions, range_values = rollup_range(start, end)
-
-    def distinct(kind: str) -> List[str]:
-        conditions = ["kind = ?", *range_conditions, "value <> ''"]
-        return [
-            str(row[0])
-            for row in conn.execute(
-                f"""
-                SELECT DISTINCT value
-                FROM audit_daily_facets
-                WHERE {" AND ".join(conditions)}
-                ORDER BY value COLLATE NOCASE
-                """,
-                (kind, *range_values),
-            )
-        ]
-
-    actions = distinct("action")
-    return {
-        "users": distinct("user"),
-        "shares": distinct("share"),
-        "operations": actions,
-        "actions": actions,
-    }
-
-
-def raw_facets(
     conn: sqlite3.Connection,
     start: dt.date,
     end: dt.date,
-    params: Dict[str, List[str]],
+    *,
+    stream: str,
 ) -> Dict[str, List[str]]:
-    conditions, values = activity_conditions(
-        start, end, params, include_filters=False
-    )
-    where_sql = " AND ".join(conditions)
+    range_conditions, range_values = rollup_range(start, end)
 
     def distinct(column: str) -> List[str]:
+        conditions = [
+            *range_conditions,
+            activity_stream_condition(stream),
+            f"{column} <> ?",
+        ]
         return [
             str(row[0])
             for row in conn.execute(
                 f"""
                 SELECT DISTINCT {column}
-                FROM audit_events
-                WHERE {where_sql} AND {column} <> ''
+                FROM audit_daily_counts
+                WHERE {" AND ".join(conditions)}
                 ORDER BY {column} COLLATE NOCASE
                 """,
-                values,
+                (*range_values, ""),
             )
         ]
 
@@ -764,9 +853,12 @@ def query_activity(
     start: dt.date,
     end: dt.date,
     params: Dict[str, List[str]],
+    *,
+    stream: str = "main",
 ) -> Dict[str, object]:
     limit = min(500, max(1, int(params.get("limit", ["100"])[0])))
-    ready = rollups_ready(conn)
+    indexing = rollup_status(conn)
+    ready = bool(indexing["ready"])
     path = activity_filters(params)["path"]
     path_ids = indexed_path_ids(conn, path) if ready and path else None
     if (
@@ -779,6 +871,7 @@ def query_activity(
         start,
         end,
         params,
+        stream=stream,
         include_filters=True,
         include_path=path_ids is None,
     )
@@ -854,32 +947,23 @@ def query_activity(
 
     include_count = query_flag(params, "count")
     matched: Optional[int] = None
-    if include_count:
-        if ready:
-            matched = rollup_matched(conn, start, end, params)
-        else:
-            matched = int(
-                conn.execute(
-                    f"""
-                    SELECT count(*)
-                    FROM audit_events
-                    WHERE {" AND ".join(conditions)}
-                    """,
-                    values,
-                ).fetchone()[0]
-            )
-        if matched is None and not cursor and not has_more:
-            matched = len(events)
+    if include_count and ready:
+        matched = rollup_matched(conn, start, end, params, stream=stream)
+    if include_count and matched is None and not cursor and not has_more:
+        matched = len(events)
 
+    empty_facets = {
+        "users": [],
+        "shares": [],
+        "operations": [],
+        "actions": [],
+    }
     include_facets = query_flag(params, "facets")
-    if include_facets:
-        facets = (
-            rollup_facets(conn, start, end)
-            if ready
-            else raw_facets(conn, start, end, params)
-        )
-    else:
-        facets = {"users": [], "shares": [], "operations": [], "actions": []}
+    facets = (
+        rollup_facets(conn, start, end, stream=stream)
+        if include_facets and ready
+        else empty_facets
+    )
 
     return {
         "events": events,
@@ -888,40 +972,54 @@ def query_activity(
         "matched": matched,
         "matchedExact": matched is not None,
         "facets": facets,
+        "indexing": indexing,
+        "stream": stream,
     }
 
 
 def audit_summary(conn: sqlite3.Connection, database_path: str) -> Dict[str, object]:
-    if rollups_ready(conn):
+    indexing = rollup_status(conn)
+
+    def second_day(value: object) -> Optional[str]:
+        if value is None:
+            return None
+        return dt.datetime.fromtimestamp(
+            int(value), tz=dt.timezone.utc
+        ).date().isoformat()
+
+    if indexing["ready"]:
         row = conn.execute(
             """
             SELECT count(DISTINCT day), min(day), max(day)
-            FROM audit_daily_totals
+            FROM audit_daily_counts
+            WHERE share <> 'FSLogix' COLLATE NOCASE
             """
         ).fetchone()
-
-        def day_text(value: object) -> Optional[str]:
-            if value is None:
-                return None
-            return dt.datetime.fromtimestamp(
-                int(value) * 86400, tz=dt.timezone.utc
-            ).date().isoformat()
-
         days = int(row[0] or 0)
-        oldest = day_text(row[1])
-        newest = day_text(row[2])
+        oldest = second_day(None if row[1] is None else int(row[1]) * 86400)
+        newest = second_day(None if row[2] is None else int(row[2]) * 86400)
     else:
-        row = conn.execute(
+        oldest_row = conn.execute(
             """
-            SELECT count(DISTINCT substr(occurred_at, 1, 10)),
-                   min(substr(occurred_at, 1, 10)),
-                   max(substr(occurred_at, 1, 10))
-            FROM audit_events
+            SELECT occurred_second FROM audit_events
+            WHERE share <> 'FSLogix' COLLATE NOCASE
+            ORDER BY occurred_second, id LIMIT 1
             """
         ).fetchone()
-        days = int(row[0] or 0)
-        oldest = row[1]
-        newest = row[2]
+        newest_row = conn.execute(
+            """
+            SELECT occurred_second FROM audit_events
+            WHERE share <> 'FSLogix' COLLATE NOCASE
+            ORDER BY occurred_second DESC, id DESC LIMIT 1
+            """
+        ).fetchone()
+        oldest = second_day(oldest_row[0]) if oldest_row else None
+        newest = second_day(newest_row[0]) if newest_row else None
+        days = (
+            (dt.date.fromisoformat(newest) - dt.date.fromisoformat(oldest)).days + 1
+            if oldest and newest
+            else 0
+        )
 
     database_bytes = 0
     for suffix in ("", "-wal"):
@@ -934,6 +1032,7 @@ def audit_summary(conn: sqlite3.Connection, database_path: str) -> Dict[str, obj
         "bytes": database_bytes,
         "oldest": oldest,
         "newest": newest,
+        "indexing": indexing,
     }
 
 

@@ -161,13 +161,16 @@ def main() -> int:
     log(f"Watching {SAMBA_LOG_GLOB}; storing events in SQLite")
     try:
         while not STOP:
+            backfilled = 0
             try:
                 count = collect_once(store)
                 if count:
                     log(f"Stored {count} event(s)")
-                store.backfill_rollups()
+                backfilled = store.backfill_rollups()
             except Exception as exc:  # pylint: disable=broad-except
                 log(f"Collector cycle failed: {exc}")
+            if backfilled:
+                continue
             time.sleep(POLL_SECONDS)
     finally:
         store.close()

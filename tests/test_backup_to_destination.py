@@ -32,6 +32,22 @@ class BackupLoggerTests(unittest.TestCase):
         )
 
 
+class BackupStatusTests(unittest.TestCase):
+    def test_status_records_and_clears_worker_pid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status = backup.BackupStatus(
+                os.path.join(tmpdir, "backup-status.json")
+            )
+            status.begin("rsync://backup.test/target", "manual")
+            self.assertEqual(status.value["workerPid"], os.getpid())
+
+            status.complete("done")
+
+        self.assertIsNone(status.value["workerPid"])
+        self.assertEqual(status.value["state"], "completed")
+
+
+
 class ProgressConfigTests(unittest.TestCase):
     def test_parse_progress_mode_accepts_known_values(self):
         with mock.patch.dict(os.environ, {"BACKUP_PROGRESS": "ALWAYS"}):

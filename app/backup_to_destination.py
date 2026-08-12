@@ -204,6 +204,7 @@ class BackupStatus:
         self.write(
             state="starting",
             trigger=trigger,
+            workerPid=os.getpid(),
             startedAt=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
             finishedAt=None,
             destination=destination,
@@ -241,6 +242,7 @@ class BackupStatus:
     def complete(self, message: str) -> None:
         self.write(
             state="completed",
+            workerPid=None,
             finishedAt=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
             percent=100.0,
             transferredBytes=self.value.get("totalBytes", 0),
@@ -252,6 +254,7 @@ class BackupStatus:
     def fail(self, message: str) -> None:
         self.write(
             state="failed",
+            workerPid=None,
             finishedAt=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
             activeFiles=[],
             message=message,

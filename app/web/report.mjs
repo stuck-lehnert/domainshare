@@ -102,6 +102,7 @@ function backupMessage(data) {
   if (message.startsWith("Syncing ")) return message.slice(8) + " wird synchronisiert.";
   const completed = message.match(/^Backup completed; (\d+) snapshot\(s\) retained$/);
   if (completed) return "Sicherung abgeschlossen; " + completed[1] + " Sicherungsstände werden aufbewahrt.";
+  if (data.interrupted) return "Sicherung wurde durch einen Neustart oder Prozessabbruch unterbrochen.";
   if (data.state === "failed") return "Sicherung fehlgeschlagen.";
   if (data.state === "completed") return "Sicherung abgeschlossen.";
   if (data.state === "running") return "Sicherung läuft.";

@@ -102,6 +102,77 @@ class AdministrationActionTests(unittest.TestCase):
         self.assertEqual(payload["state"], "waiting")
         self.assertEqual(payload["log"], ["backup log"])
 
+    @mock.patch("app.web_ui.tail_lines", return_value=[])
+    def test_backup_payload_marks_unowned_active_status_interrupted(
+        self, _tail_lines
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "backup-status.json")
+            lock_path = os.path.join(tmpdir, "backup.lock")
+            web_ui.write_json_atomic(
+                status_path,
+                {
+                    "state": "running",
+                    "workerPid": 4242,
+                    "currentSource": "data/fslogix",
+                    "activeFiles": [{"path": "profile.vhdx"}],
+                },
+            )
+            with (
+                mock.patch.object(web_ui, "BACKUP_STATUS_FILE", status_path),
+                mock.patch.object(web_ui, "BACKUP_LOCK_FILE", lock_path),
+                mock.patch.dict(
+                    os.environ,
+                    {"BACKUP_DESTINATION": "rsync://backup.test/target"},
+                    clear=True,
+                ),
+            ):
+                payload = web_ui.backup_payload()
+                persisted = web_ui.read_json(status_path, {})
+
+        self.assertEqual(payload["state"], "failed")
+        self.assertFalse(payload["processRunning"])
+        self.assertTrue(payload["interrupted"])
+        self.assertIsNone(payload["workerPid"])
+        self.assertIsNone(payload["currentSource"])
+        self.assertEqual(payload["activeFiles"], [])
+        self.assertIsNotNone(payload["finishedAt"])
+        self.assertEqual(persisted["state"], "failed")
+        self.assertTrue(persisted["interrupted"])
+
+    @mock.patch("app.web_ui.tail_lines", return_value=[])
+    def test_backup_payload_keeps_status_active_while_lock_is_owned(
+        self, _tail_lines
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "backup-status.json")
+            lock_path = os.path.join(tmpdir, "backup.lock")
+            web_ui.write_json_atomic(
+                status_path, {"state": "running", "workerPid": 4242}
+            )
+            with open(lock_path, "w", encoding="utf-8") as lock_file:
+                web_ui.fcntl.flock(lock_file, web_ui.fcntl.LOCK_EX)
+                with (
+                    mock.patch.object(
+                        web_ui, "BACKUP_STATUS_FILE", status_path
+                    ),
+                    mock.patch.object(web_ui, "BACKUP_LOCK_FILE", lock_path),
+                    mock.patch.dict(
+                        os.environ,
+                        {"BACKUP_DESTINATION": "rsync://backup.test/target"},
+                        clear=True,
+                    ),
+                ):
+                    payload = web_ui.backup_payload()
+                web_ui.fcntl.flock(lock_file, web_ui.fcntl.LOCK_UN)
+
+            persisted = web_ui.read_json(status_path, {})
+
+        self.assertEqual(payload["state"], "running")
+        self.assertTrue(payload["processRunning"])
+        self.assertEqual(persisted["state"], "running")
+
+
     @mock.patch("app.web_ui.tail_lines", return_value=["reconcile log"])
     @mock.patch("app.web_ui.read_json", return_value={})
     def test_reconciliation_payload_has_progress_schedule_and_log(
@@ -343,6 +414,20 @@ class AuditParsingTests(unittest.TestCase):
                 audit_collector.parse_audit_line(line, "/var/log/samba/log.pc01")
             )
 
+    def test_parses_fslogix_activity_for_separate_storage(self):
+        line = (
+            "smbd_audit: x|alice|192.0.2.5|PC01|"
+            "fSlOgIx|pwrite|OK|profile.vhdx\n"
+        )
+
+        event = audit_collector.parse_audit_line(
+            line, "/var/log/samba/log.pc01"
+        )
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event["share"], "fSlOgIx")
+        self.assertEqual(event["path"], "profile.vhdx")
+
     def test_tracks_rotated_file_by_inode_without_reingesting_it(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             active = os.path.join(tmpdir, "log.pc01")
@@ -551,6 +636,57 @@ class AuditQueryTests(unittest.TestCase):
         self.assertNotIn("robot_svc", visible["facets"]["users"])
         self.assertEqual(set(visible["facets"]["actions"]), {"read", "delete"})
 
+    def test_store_separates_main_and_fslogix_streams(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            today = dt.datetime.now(dt.timezone.utc).date()
+            store = audit_store.AuditStore(os.path.join(tmpdir, "state.db"))
+            main_event = self.make_event(f"{today}T12:00:00+00:00", "alice")
+            fslogix_event = dict(main_event, share="FSLogix", path="profile.vhdx")
+            try:
+                inserted = store.append_batch(
+                    [fslogix_event, main_event], {}, set()
+                )
+                main = audit_store.query_activity(
+                    store.conn, today, today, {"limit": ["100"]}
+                )
+                fslogix = audit_store.query_activity(
+                    store.conn,
+                    today,
+                    today,
+                    {"limit": ["100"]},
+                    stream="fslogix",
+                )
+                plans = {}
+                for stream, operator, index in (
+                    ("main", "<>", "audit_events_main_time"),
+                    ("fslogix", "=", "audit_events_fslogix_time"),
+                ):
+                    plans[stream] = " ".join(
+                        row["detail"]
+                        for row in store.conn.execute(
+                            f"""
+                            EXPLAIN QUERY PLAN
+                            SELECT id FROM audit_events
+                            WHERE occurred_second >= ? AND occurred_second < ?
+                              AND share {operator} 'FSLogix' COLLATE NOCASE
+                            ORDER BY occurred_second DESC, id DESC
+                            LIMIT 101
+                            """,
+                            (0, 9999999999),
+                        )
+                    )
+                    self.assertIn(index, plans[stream])
+            finally:
+                store.close()
+
+        self.assertEqual(inserted, 2)
+        self.assertEqual(main["matched"], 1)
+        self.assertEqual(main["events"][0]["share"], "Data")
+        self.assertEqual(main["stream"], "main")
+        self.assertEqual(fslogix["matched"], 1)
+        self.assertEqual(fslogix["events"][0]["share"], "FSLogix")
+        self.assertEqual(fslogix["stream"], "fslogix")
+
     def test_query_metadata_uses_rollups_instead_of_raw_event_scans(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             today = dt.datetime.now(dt.timezone.utc).date()
@@ -575,10 +711,10 @@ class AuditQueryTests(unittest.TestCase):
         self.assertTrue(result["matchedExact"])
         self.assertTrue(result["hasMore"])
         self.assertTrue(
-            any("from audit_daily_totals" in statement for statement in normalized)
+            any("from audit_daily_counts" in statement for statement in normalized)
         )
         self.assertTrue(
-            any("from audit_daily_facets" in statement for statement in normalized)
+            any("from audit_daily_counts" in statement for statement in normalized)
         )
         self.assertFalse(
             any(
@@ -592,6 +728,62 @@ class AuditQueryTests(unittest.TestCase):
                 for statement in normalized
             )
         )
+
+    def test_pending_rollups_never_scan_raw_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            today = dt.datetime.now(dt.timezone.utc).date()
+            database = os.path.join(tmpdir, "state.db")
+            store = audit_store.AuditStore(database)
+            events = [
+                self.make_event(f"{today}T12:00:0{index}+00:00", "alice")
+                for index in range(4)
+            ]
+            store.append_batch(events, {}, set())
+            for table in (
+                "audit_daily_totals",
+                "audit_daily_counts",
+                "audit_daily_facets",
+                "audit_rollup_state",
+            ):
+                store.conn.execute(f"DELETE FROM {table}")
+            store.conn.commit()
+            store.close()
+
+            store = audit_store.AuditStore(database)
+            statements = []
+            store.conn.set_trace_callback(statements.append)
+            try:
+                result = audit_store.query_activity(
+                    store.conn, today, today, {"limit": ["1"]}
+                )
+                summary = audit_store.audit_summary(store.conn, database)
+            finally:
+                store.conn.set_trace_callback(None)
+                store.close()
+
+        normalized = [
+            " ".join(statement.casefold().split())
+            for statement in statements
+        ]
+        self.assertTrue(result["hasMore"])
+        self.assertIsNone(result["matched"])
+        self.assertFalse(result["matchedExact"])
+        self.assertEqual(result["facets"]["users"], [])
+        self.assertFalse(result["indexing"]["ready"])
+        self.assertFalse(summary["indexing"]["ready"])
+        self.assertFalse(
+            any(
+                "select count(*) from audit_events" in statement
+                for statement in normalized
+            )
+        )
+        self.assertFalse(
+            any(
+                "select distinct" in statement and "from audit_events" in statement
+                for statement in normalized
+            )
+        )
+
 
     def test_path_query_does_not_block_on_an_exact_count(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -697,6 +889,65 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(path_event_count, 4)
 
 
+    def test_upgrade_rebuilds_main_and_fslogix_rollups(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            today = dt.datetime.now(dt.timezone.utc).date()
+            database = os.path.join(tmpdir, "state.db")
+            store = audit_store.AuditStore(database)
+            main_event = self.make_event(f"{today}T12:00:00+00:00", "alice")
+            fslogix_event = dict(
+                main_event, share="FSLogix", path="profile.vhdx"
+            )
+            store.append_batch([main_event, fslogix_event], {}, set())
+            store.conn.execute("DROP TABLE audit_rollup_state")
+            store.conn.execute(
+                """
+                CREATE TABLE audit_rollup_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    backfill_next_id INTEGER NOT NULL,
+                    backfill_max_id INTEGER NOT NULL,
+                    ready INTEGER NOT NULL CHECK (ready IN (0, 1))
+                )
+                """
+            )
+            store.conn.execute(
+                "INSERT INTO audit_rollup_state VALUES (1, 3, 2, 1)"
+            )
+            store.conn.commit()
+            store.close()
+
+            store = audit_store.AuditStore(database)
+            try:
+                self.assertEqual(store.backfill_rollups(limit=1), 1)
+                self.assertEqual(store.backfill_rollups(limit=1), 1)
+                self.assertEqual(store.backfill_rollups(limit=1), 0)
+                main = audit_store.query_activity(
+                    store.conn, today, today, {"limit": ["1"]}
+                )
+                fslogix = audit_store.query_activity(
+                    store.conn,
+                    today,
+                    today,
+                    {"limit": ["1"]},
+                    stream="fslogix",
+                )
+                total = store.conn.execute(
+                    "SELECT sum(event_count) FROM audit_daily_totals"
+                ).fetchone()[0]
+                policy_version = store.conn.execute(
+                    """
+                    SELECT policy_version FROM audit_rollup_state
+                    WHERE singleton = 1
+                    """
+                ).fetchone()[0]
+            finally:
+                store.close()
+
+        self.assertEqual(main["matched"], 1)
+        self.assertEqual(fslogix["matched"], 1)
+        self.assertEqual(total, 2)
+        self.assertEqual(policy_version, 3)
+
     def test_schema_has_filter_indexes_and_rollup_tables(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = audit_store.AuditStore(os.path.join(tmpdir, "state.db"))
@@ -717,13 +968,19 @@ class AuditQueryTests(unittest.TestCase):
                 store.close()
         self.assertTrue(
             {
-                "audit_events_time",
-                "audit_events_action_time",
-                "audit_events_success_time",
-                "audit_events_user_time",
-                "audit_events_account_time",
-                "audit_events_share_time",
-                "audit_events_result_time",
+                "audit_events_main_time",
+                "audit_events_main_action_time",
+                "audit_events_main_success_time",
+                "audit_events_main_user_time",
+                "audit_events_main_account_time",
+                "audit_events_main_share_time",
+                "audit_events_main_result_time",
+                "audit_events_fslogix_time",
+                "audit_events_fslogix_action_time",
+                "audit_events_fslogix_success_time",
+                "audit_events_fslogix_user_time",
+                "audit_events_fslogix_account_time",
+                "audit_events_fslogix_result_time",
             }.issubset(indexes)
         )
         self.assertTrue(
@@ -800,6 +1057,10 @@ class WebPresentationTests(unittest.TestCase):
         self.assertIn("Umbenennen", script)
         self.assertNotIn("Umbenennen/Verschieben", script)
         self.assertIn("Löschen", script)
+        self.assertIn("Indexaufbau", script)
+        self.assertIn("/activity/fslogix", html)
+        self.assertIn("/api/fslogix-activity", script)
+        self.assertIn('renderActivity("fslogix")', script)
         self.assertNotIn(">Auflisten<", script)
         self.assertNotIn(">Metadaten<", script)
         self.assertNotIn(">Sitzung<", script)
@@ -822,6 +1083,7 @@ class WebPresentationTests(unittest.TestCase):
         self.assertIn('"/api/reconciliation?log=0"', script)
         self.assertEqual(script.count("if (active || previousActive)"), 2)
         self.assertNotIn("BACKUP_AUTO_ENABLED", script)
+        self.assertIn("data.interrupted", script)
 
     def test_pdf_report_is_client_side_and_uses_only_log_free_endpoint(self):
         script = self.asset("app.js")
@@ -861,6 +1123,8 @@ class WebPresentationTests(unittest.TestCase):
         ]
         self.assertEqual(len(success_lines), 3)
         self.assertEqual(len(failure_lines), 3)
+        fslogix_config = config.split("[FSLogix]", 1)[1]
+        self.assertIn("full_audit", fslogix_config)
         for line in success_lines + failure_lines:
             self.assertEqual(set(line.split("=", 1)[1].split()), expected)
 

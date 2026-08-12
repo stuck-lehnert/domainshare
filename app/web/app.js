@@ -43,6 +43,7 @@ function backupMessage(data) {
   if (message.startsWith("Syncing ")) return `${message.slice(8)} wird synchronisiert.`;
   const completed = message.match(/^Backup completed; (\d+) snapshot\(s\) retained$/);
   if (completed) return `Sicherung abgeschlossen; ${completed[1]} Sicherungsstände werden aufbewahrt.`;
+  if (data.interrupted) return "Sicherung wurde durch einen Neustart oder Prozessabbruch unterbrochen.";
   if (data.state === "failed") return "Sicherung fehlgeschlagen. Einzelheiten stehen im Sicherungsprotokoll.";
   if (data.state === "completed") return "Sicherung abgeschlossen.";
   if (data.state === "running") return "Sicherung läuft.";
@@ -102,6 +103,7 @@ function routeFor(path) {
   if (path.startsWith("/storage/users")) return "storage-users";
   if (path.startsWith("/shares")) return "shares";
   if (path.startsWith("/reconciliation")) return "reconciliation";
+  if (path.startsWith("/activity/fslogix")) return "activity-fslogix";
   if (path.startsWith("/activity")) return "activity";
   if (path.startsWith("/backup")) return "backup";
   if (path.startsWith("/report")) return "report";
@@ -124,6 +126,7 @@ async function navigate(path, replace = false) {
     if (route === "storage-data") await renderStorage("data");
     if (route === "storage-users") await renderStorage("users");
     if (route === "activity") await renderActivity();
+    if (route === "activity-fslogix") await renderActivity("fslogix");
     if (route === "backup") await renderBackup();
     if (route === "report") await renderReport();
     if (route === "system") await renderSystem();
@@ -238,10 +241,17 @@ async function renderStorage(type) {
   draw();
 }
 
-async function renderActivity() {
+async function renderActivity(stream = "main") {
   const today = new Date();
   const yesterday = new Date(Date.now() - 86400000);
-  content.innerHTML = pageHead("Aktivitätsprotokoll", "Lese-, Schreib-, Umbenennungs- und Löschvorgänge nach Datum, Identität, Freigabe, Ergebnis oder Pfad durchsuchen.") + `
+  const fslogix = stream === "fslogix";
+  const endpoint = fslogix ? "/api/fslogix-activity" : "/api/activity";
+  content.innerHTML = pageHead(
+    fslogix ? "FSLogix-Protokoll" : "Aktivitätsprotokoll",
+    fslogix
+      ? "FSLogix-Profilcontainer-Aktivitäten getrennt vom regulären Dateiprotokoll durchsuchen."
+      : "Lese-, Schreib-, Umbenennungs- und Löschvorgänge nach Datum, Identität, Freigabe, Ergebnis oder Pfad durchsuchen.",
+  ) + `
     <section class="panel">
       <form id="activity-filter" class="filters">
         <label>Von (UTC)<input name="from" type="date" value="${isoDay(yesterday)}" required></label>
@@ -270,14 +280,15 @@ async function renderActivity() {
       params.set("count", "0");
       params.set("facets", "0");
     }
-    const result = await api(`/api/activity?${params}`);
+    const result = await api(`${endpoint}?${params}`);
     state.activity = result;
     const rows = document.querySelector("#activity-rows");
     if (append) rows.insertAdjacentHTML("beforeend", eventRows(result.events)); else rows.innerHTML = eventRows(result.events);
     loaded = append ? loaded + result.events.length : result.events.length;
     if (!append) matched = result.matchedExact ? result.matched : null;
     const shown = matched === null ? `${loaded.toLocaleString("de-DE")}${result.hasMore ? "+" : ""}` : matched.toLocaleString("de-DE");
-    document.querySelector("#activity-summary").textContent = `${shown} passende Ereignisse`;
+    const indexNote = result.indexing?.ready === false ? ` · Indexaufbau ${Number(result.indexing.percent || 0).toLocaleString("de-DE")} %` : "";
+    document.querySelector("#activity-summary").textContent = `${shown} passende Ereignisse${indexNote}`;
     const more = document.querySelector("#load-more");
     cursor = result.nextCursor || 0;
     more.hidden = !result.hasMore;
