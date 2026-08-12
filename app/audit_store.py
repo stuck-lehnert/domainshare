@@ -11,16 +11,16 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 try:
     from .audit_policy import (
         account_name,
-        read_deduplication_fingerprint,
-        read_deduplication_fingerprint_values,
+        deduplication_fingerprint,
+        deduplication_fingerprint_values,
         skipped_user_suffixes,
     )
     from .state_db import connect_state_db
 except ImportError:
     from audit_policy import (
         account_name,
-        read_deduplication_fingerprint,
-        read_deduplication_fingerprint_values,
+        deduplication_fingerprint,
+        deduplication_fingerprint_values,
         skipped_user_suffixes,
     )
     from state_db import connect_state_db
@@ -49,13 +49,13 @@ CREATE TABLE IF NOT EXISTS audit_sources (
     inode INTEGER NOT NULL,
     offset INTEGER NOT NULL
 ) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS audit_read_dedup (
+CREATE TABLE IF NOT EXISTS audit_event_dedup (
     fingerprint BLOB PRIMARY KEY,
     occurred_second INTEGER NOT NULL,
     event_id INTEGER
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS audit_read_dedup_time
-    ON audit_read_dedup (occurred_second);
+CREATE INDEX IF NOT EXISTS audit_event_dedup_time
+    ON audit_event_dedup (occurred_second);
 CREATE INDEX IF NOT EXISTS audit_events_main_time
     ON audit_events (occurred_second DESC, id DESC)
     WHERE share <> 'FSLogix' COLLATE NOCASE;
@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS audit_rollup_state (
     backfill_next_id INTEGER NOT NULL,
     backfill_max_id INTEGER NOT NULL,
     ready INTEGER NOT NULL CHECK (ready IN (0, 1)),
-    policy_version INTEGER NOT NULL DEFAULT 4
+    policy_version INTEGER NOT NULL DEFAULT 5
 );
 
 """
@@ -174,6 +174,7 @@ VALUES (?, ?, ?, ?)
 
 
 def ensure_audit_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS audit_read_dedup")
     conn.executescript(AUDIT_SCHEMA)
     for legacy_index in (
         "audit_events_time",
@@ -221,7 +222,8 @@ def ensure_audit_schema(conn: sqlite3.Connection) -> None:
         WHERE singleton = 1
         """
     ).fetchone()
-    if state is not None and int(state["policy_version"]) < 4:
+    if state is not None and int(state["policy_version"]) < 5:
+        conn.execute("DELETE FROM audit_event_dedup")
         for table in (
             "audit_daily_totals",
             "audit_daily_counts",
@@ -232,7 +234,7 @@ def ensure_audit_schema(conn: sqlite3.Connection) -> None:
             """
             UPDATE audit_rollup_state
             SET backfill_next_id = 1, backfill_max_id = ?, ready = ?,
-                policy_version = 4
+                policy_version = 5
             WHERE singleton = 1
             """,
             (max_id, int(max_id == 0)),
@@ -240,17 +242,21 @@ def ensure_audit_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-READ_DEDUP_DEFAULT_WINDOW_SECONDS = 2 * 86400
+DEDUP_DEFAULT_WINDOW_SECONDS = 2 * 86400
 
 
-def read_deduplication_cutoff() -> int:
-    try:
-        window = int(os.getenv(
+def deduplication_cutoff() -> int:
+    configured = os.getenv(
+        "AUDIT_DEDUP_WINDOW_SECONDS",
+        os.getenv(
             "AUDIT_READ_DEDUP_WINDOW_SECONDS",
-            str(READ_DEDUP_DEFAULT_WINDOW_SECONDS),
-        ))
+            str(DEDUP_DEFAULT_WINDOW_SECONDS),
+        ),
+    )
+    try:
+        window = int(configured)
     except ValueError:
-        window = READ_DEDUP_DEFAULT_WINDOW_SECONDS
+        window = DEDUP_DEFAULT_WINDOW_SECONDS
     now = int(dt.datetime.now(dt.timezone.utc).timestamp())
     return now - max(1, window)
 
@@ -285,8 +291,8 @@ class AuditStore:
     def __init__(self, database_path: Optional[str] = None):
         self.conn = connect_state_db(database_path)
         self.conn.create_function(
-            "audit_read_fingerprint", 7,
-            read_deduplication_fingerprint_values, deterministic=True,
+            "audit_event_fingerprint", 8,
+            deduplication_fingerprint_values, deterministic=True,
         )
         ensure_audit_schema(self.conn)
 
@@ -314,12 +320,12 @@ class AuditStore:
         totals = Counter()
         counts = Counter()
         facets = set()
-        seen_read_fingerprints = set()
+        seen_fingerprints = set()
         for event in events:
-            read_fingerprint = read_deduplication_fingerprint(event)
+            fingerprint = deduplication_fingerprint(event)
             if (
-                read_fingerprint is not None
-                and read_fingerprint in seen_read_fingerprints
+                fingerprint is not None
+                and fingerprint in seen_fingerprints
             ):
                 continue
             occurred_second = parse_event_second(event["timestamp"])
@@ -344,11 +350,11 @@ class AuditStore:
                     success,
                     str(event["path"]),
                     str(event["source"]),
-                    read_fingerprint,
+                    fingerprint,
                 )
             )
-            if read_fingerprint is not None:
-                seen_read_fingerprints.add(read_fingerprint)
+            if fingerprint is not None:
+                seen_fingerprints.add(fingerprint)
 
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -364,7 +370,7 @@ class AuditStore:
                     for row in self.conn.execute(
                         f"""
                         SELECT fingerprint
-                        FROM audit_read_dedup
+                        FROM audit_event_dedup
                         WHERE fingerprint IN ({placeholders})
                         """,
                         chunk,
@@ -453,7 +459,7 @@ class AuditStore:
                 first_inserted_id = last_inserted_id - len(event_rows) + 1
                 self.conn.executemany(
                     """
-                    INSERT INTO audit_read_dedup (
+                    INSERT INTO audit_event_dedup (
                         fingerprint, occurred_second, event_id
                     ) VALUES (?, ?, ?)
                     """,
@@ -474,8 +480,8 @@ class AuditStore:
                 self.conn.executemany(ROLLUP_FACET_SQL, facets)
 
             self.conn.execute(
-                "DELETE FROM audit_read_dedup WHERE occurred_second < ?",
-                (read_deduplication_cutoff(),),
+                "DELETE FROM audit_event_dedup WHERE occurred_second < ?",
+                (deduplication_cutoff(),),
             )
 
             if source_updates:
@@ -544,53 +550,53 @@ class AuditStore:
         end_id = int(chunk[1])
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            dedup_cutoff = read_deduplication_cutoff()
+            dedup_cutoff = deduplication_cutoff()
             self.conn.execute(
-                "DELETE FROM audit_read_dedup WHERE occurred_second < ?",
+                "DELETE FROM audit_event_dedup WHERE occurred_second < ?",
                 (dedup_cutoff,),
             )
             self.conn.execute(
                 """
-                INSERT INTO audit_read_dedup (
+                INSERT INTO audit_event_dedup (
                     fingerprint, occurred_second, event_id
                 )
-                SELECT audit_read_fingerprint(
-                           e.occurred_at, e.user, e.client_ip, e.share, e.path,
+                SELECT audit_event_fingerprint(
+                           e.occurred_at, e.action, e.user, e.client_ip, e.share, e.path,
                            e.success, e.result
                        ), e.occurred_second, e.id
                 FROM audit_events AS e
                 WHERE e.id BETWEEN ? AND ?
-                    AND e.action = 'read'
+                    AND (e.action = 'read' OR e.share = 'FSLogix' COLLATE NOCASE)
                     AND e.occurred_second >= ?
                 ORDER BY e.id
                 ON CONFLICT (fingerprint) DO UPDATE SET
                     event_id = coalesce(
-                        audit_read_dedup.event_id, excluded.event_id
+                        audit_event_dedup.event_id, excluded.event_id
                     )
                 """,
                 (start_id, end_id, dedup_cutoff),
             )
-            duplicate_read_sql = """
+            duplicate_event_sql = """
                 SELECT e.id
                 FROM audit_events AS e
-                JOIN audit_read_dedup AS d
-                  ON d.fingerprint = audit_read_fingerprint(
-                      e.occurred_at, e.user, e.client_ip, e.share, e.path,
+                JOIN audit_event_dedup AS d
+                  ON d.fingerprint = audit_event_fingerprint(
+                      e.occurred_at, e.action, e.user, e.client_ip, e.share, e.path,
                       e.success, e.result
                   )
                 WHERE e.id BETWEEN ? AND ?
-                    AND e.action = 'read'
+                    AND (e.action = 'read' OR e.share = 'FSLogix' COLLATE NOCASE)
                     AND e.occurred_second >= ?
                     AND (d.event_id IS NULL OR d.event_id <> e.id)
             """
             self.conn.execute(
                 f"DELETE FROM audit_path_events "
-                f"WHERE event_id IN ({duplicate_read_sql})",
+                f"WHERE event_id IN ({duplicate_event_sql})",
                 (start_id, end_id, dedup_cutoff),
             )
             self.conn.execute(
                 f"DELETE FROM audit_events "
-                f"WHERE id IN ({duplicate_read_sql})",
+                f"WHERE id IN ({duplicate_event_sql})",
                 (start_id, end_id, dedup_cutoff),
             )
             self.conn.execute(

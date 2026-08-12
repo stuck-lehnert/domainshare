@@ -1,6 +1,6 @@
-FROM smallstep/step-cli:0.30.2 AS step-cli
+FROM docker.io/smallstep/step-cli:0.30.2 AS step-cli
 
-FROM debian:12-slim
+FROM docker.io/library/debian:12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC
 
@@ -33,6 +33,7 @@ COPY app/audit_policy.py /app/audit_policy.py
 COPY app/state_db.py /app/state_db.py
 COPY app/audit_store.py /app/audit_store.py
 COPY app/audit_collector.py /app/audit_collector.py
+COPY app/trash.py /app/trash.py
 COPY app/web_ui.py /app/web_ui.py
 COPY app/web /app/web
 COPY app/init.sh /app/init.sh

@@ -32,7 +32,7 @@ require_vfs_modules() {
 
   local missing=0
   local module
-  for module in acl_xattr full_audit; do
+  for module in acl_xattr recycle full_audit; do
     if [[ ! -f "$modules_dir/vfs/${module}.so" ]]; then
       printf '[init] ERROR: missing VFS module %s at %s/vfs/%s.so\n' "$module" "$modules_dir" "$module" >&2
       missing=1
@@ -251,6 +251,10 @@ write_runtime_env_file() {
     if [[ -n "${LDAP_BASE_DN:-}" ]]; then
       printf 'export LDAP_BASE_DN=%q\n' "$LDAP_BASE_DN"
     fi
+    printf 'export TRASH_RETENTION_DAYS=%q\n' "${TRASH_RETENTION_DAYS:-7}"
+    if [[ -n "${GROUP_ROOT:-}" ]]; then printf 'export GROUP_ROOT=%q\n' "$GROUP_ROOT"; fi
+    if [[ -n "${PRIVATE_ROOT:-}" ]]; then printf 'export PRIVATE_ROOT=%q\n' "$PRIVATE_ROOT"; fi
+    if [[ -n "${FSLOGIX_ROOT:-}" ]]; then printf 'export FSLOGIX_ROOT=%q\n' "$FSLOGIX_ROOT"; fi
   } > /app/runtime.env
   chmod 600 /app/runtime.env
 }
@@ -567,6 +571,7 @@ install_cron_job() {
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 */5 * * * * root source /app/runtime.env && RECONCILE_TRIGGER=automatic /usr/bin/python3 /app/reconcile_shares.py
+17 * * * * root source /app/runtime.env && /usr/bin/python3 /app/trash.py --cleanup
 EOF
 
   if [[ -n "${BACKUP_DESTINATION:-}" ]] && env_is_true "${BACKUP_AUTO_ENABLED:-true}"; then
@@ -621,6 +626,9 @@ write_runtime_env_file
 
 log 'Running startup reconciliation'
 RECONCILE_TRIGGER=startup python3 /app/reconcile_shares.py
+
+log 'Preparing seven-day trash repositories'
+python3 /app/trash.py --cleanup
 
 start_observability_services
 

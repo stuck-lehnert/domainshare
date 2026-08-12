@@ -27,8 +27,10 @@ from typing import Dict, List, Optional, Tuple
 
 try:
     from app import reconcile_shares as directory
+    from app import trash
 except ImportError:  # Container execution uses /app as the import root.
     import reconcile_shares as directory
+    import trash
 
 try:
     from app.audit_store import (
@@ -460,6 +462,8 @@ def scan_children(root: str) -> List[Dict[str, object]]:
     except OSError:
         return rows
     for entry in entries:
+        if entry.name == trash.TRASH_DIRECTORY:
+            continue
         try:
             if not entry.is_dir(follow_symlinks=False):
                 continue
@@ -1032,6 +1036,43 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Ein JSON-Objekt ist erforderlich")
         return value
 
+    def send_trash_download(self, params: Dict[str, List[str]]) -> None:
+        item_id = params.get("id", [""])[0]
+        try:
+            handle, item = trash.open_download(item_id)
+        except FileNotFoundError:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "Datei nicht gefunden oder abgelaufen")
+            return
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except OSError as exc:
+            log(f"Trash download failed: {exc}")
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "Download konnte nicht geöffnet werden")
+            return
+
+        filename = str(item["name"])
+        encoded_name = urllib.parse.quote(filename, safe="")
+        with handle:
+            self.send_response(HTTPStatus.OK)
+            self.security_headers()
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(item["size"]))
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename*=UTF-8{chr(39) * 2}{encoded_name}",
+            )
+            self.end_headers()
+            try:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+
     def do_POST(self) -> None:  # pylint: disable=invalid-name
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/login":
@@ -1060,6 +1101,42 @@ class Handler(BaseHTTPRequestHandler):
             cookie = f"{JWT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
             self.send_json({"ok": True}, cookie=cookie)
             return
+        if parsed.path == "/api/trash/restore":
+            user = self.require_user()
+            if user is None:
+                return
+            try:
+                body = self.read_json_body()
+                result = trash.restore_item(str(body.get("id", "")))
+            except FileExistsError:
+                self.send_error_json(
+                    HTTPStatus.CONFLICT,
+                    "Am Originalpfad existiert bereits eine Datei",
+                )
+                return
+            except FileNotFoundError:
+                self.send_error_json(
+                    HTTPStatus.NOT_FOUND,
+                    "Datei nicht gefunden oder abgelaufen",
+                )
+                return
+            except ValueError as exc:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            except (OSError, RuntimeError) as exc:
+                log(f"Trash restore failed: {exc}")
+                self.send_error_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "Datei konnte nicht wiederhergestellt werden",
+                )
+                return
+            log(
+                f"{user['sub']} restored "
+                f"{result['share']}:{result['path']}"
+            )
+            self.send_json(result)
+            return
+
         if parsed.path.startswith("/api/actions/"):
             user = self.require_user()
             if user is None:
@@ -1105,6 +1182,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(query_audit(params))
                 elif path == "/api/fslogix-activity":
                     self.send_json(query_audit(params, stream="fslogix"))
+                elif path == "/api/trash/download":
+                    self.send_trash_download(params)
+                elif path == "/api/trash":
+                    self.send_json(
+                        trash.list_items(
+                            share=params.get("share", [""])[0],
+                            path=params.get("path", [""])[0],
+                            limit=int(params.get("limit", ["200"])[0]),
+                        )
+                    )
                 elif path == "/api/backup":
                     self.send_json(
                         backup_payload(include_log=query_includes_log(params))

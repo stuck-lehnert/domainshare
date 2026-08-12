@@ -105,6 +105,7 @@ function routeFor(path) {
   if (path.startsWith("/reconciliation")) return "reconciliation";
   if (path.startsWith("/activity/fslogix")) return "activity-fslogix";
   if (path.startsWith("/activity")) return "activity";
+  if (path.startsWith("/trash")) return "trash";
   if (path.startsWith("/backup")) return "backup";
   if (path.startsWith("/report")) return "report";
   if (path.startsWith("/system")) return "system";
@@ -127,6 +128,7 @@ async function navigate(path, replace = false) {
     if (route === "storage-users") await renderStorage("users");
     if (route === "activity") await renderActivity();
     if (route === "activity-fslogix") await renderActivity("fslogix");
+    if (route === "trash") await renderTrash();
     if (route === "backup") await renderBackup();
     if (route === "report") await renderReport();
     if (route === "system") await renderSystem();
@@ -301,6 +303,68 @@ async function renderActivity(stream = "main") {
   form.addEventListener("submit", async event => { event.preventDefault(); cursor = 0; try { await load(false); } catch (error) { notice(error.message); } });
   document.querySelector("#load-more").addEventListener("click", async () => { try { await load(true); } catch (error) { notice(error.message); } });
   await load(false);
+}
+
+async function renderTrash() {
+  content.innerHTML = pageHead(
+    "Papierkorb",
+    "Gelöschte Dateien sieben Tage lang herunterladen oder am Originalpfad wiederherstellen.",
+  ) + `
+    <section class="panel">
+      <form id="trash-filter" class="filters">
+        <label>Freigabe<select name="share"><option value="">Alle Freigaben</option><option>Data</option><option>Private</option><option>FSLogix</option></select></label>
+        <label class="wide">Pfad enthält<input name="path" placeholder="Ordner oder Dateiname"></label>
+        <button type="submit">Aktualisieren</button>
+      </form>
+      <p id="trash-summary" class="muted"></p>
+      <div class="table-wrap"><table><thead><tr><th>Gelöscht (UTC)</th><th>Benutzer</th><th>Freigabe</th><th>Originalpfad</th><th>Größe</th><th>Verfügbar bis</th><th>Aktionen</th></tr></thead><tbody id="trash-rows"></tbody></table></div>
+    </section>`;
+  const form = document.querySelector("#trash-filter");
+  const load = async () => {
+    const params = new URLSearchParams(new FormData(form));
+    params.set("limit", "500");
+    const result = await api(`/api/trash?${params}`);
+    const body = document.querySelector("#trash-rows");
+    if (!result.items.length) {
+      body.innerHTML = '<tr><td colspan="7" class="empty">Keine gelöschten Dateien</td></tr>';
+    } else {
+      body.innerHTML = result.items.map(item => `<tr>
+        <td class="timestamp">${esc(utcTime(item.deletedAt))}</td>
+        <td>${esc(item.deletedBy)}</td>
+        <td>${esc(item.share)}</td>
+        <td class="path">${esc(item.path)}</td>
+        <td class="numeric">${bytes(item.size)}</td>
+        <td class="timestamp">${esc(utcTime(item.expiresAt))}</td>
+        <td><div class="row-actions"><a class="button" href="/api/trash/download?id=${encodeURIComponent(item.id)}" download>Herunterladen</a><button type="button" data-restore="${esc(item.id)}">Wiederherstellen</button></div></td>
+      </tr>`).join("");
+    }
+    const shown = result.items.length.toLocaleString("de-DE");
+    const total = Number(result.matched || 0).toLocaleString("de-DE");
+    const suffix = result.truncated ? ` · ${shown} von ${total} angezeigt` : "";
+    document.querySelector("#trash-summary").textContent = `${total} Dateien · Aufbewahrung ${result.retentionDays} Tage${suffix}`;
+  };
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    try { await load(); } catch (error) { notice(error.message); }
+  });
+  document.querySelector("#trash-rows").addEventListener("click", async event => {
+    const button = event.target.closest("button[data-restore]");
+    if (!button) return;
+    if (!window.confirm("Datei am Originalpfad wiederherstellen?")) return;
+    button.disabled = true;
+    try {
+      const result = await api("/api/trash/restore", {
+        method: "POST",
+        body: JSON.stringify({id: button.dataset.restore}),
+      });
+      notice(`${result.share}: ${result.path} wurde wiederhergestellt.`);
+      await load();
+    } catch (error) {
+      notice(error.message);
+      button.disabled = false;
+    }
+  });
+  await load();
 }
 
 function triggerLabel(value) {

@@ -24,7 +24,8 @@ This repository provides a production-oriented Samba file server container that 
 - Startup resolves those SIDs to NSS group names via winbind, then uses those resolved groups in Samba `valid users` rules.
 - Samba `full_audit` records successful and failed reads, writes, renames, and deletions on all three shares; FSLogix events are retained in a separate indexed activity stream.
 - A collector normalizes those four actions and persists them in indexed SQLite tables; activity is never automatically deleted.
-- A plain HTTPS administration console provides read-only statistics and logs plus narrowly scoped actions for manual backups and share reconciliation. It also includes a fully client-side Typst PDF report.
+- Samba retains deleted files for seven days in per-user recycle repositories on the same data volumes.
+- A plain HTTPS administration console provides statistics and logs plus narrowly scoped actions for trash downloads/restores, manual backups, and share reconciliation. It also includes a fully client-side Typst PDF report.
 - Web sign-in validates the submitted username/password with Kerberos, permits only users whose winbind group SID set contains `DOMAIN_ADMINS_SID`, and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
 - HTTPS certificates are requested from a configured local Smallstep CA and renewed automatically. Pre-issued certificate files are also supported.
 - Optional remote backups run when `BACKUP_DESTINATION` and `BACKUP_ARCHIVE_PASSWORD` are configured; each active or archived group folder is uploaded as its own encrypted, non-solid 7z archive.
@@ -54,7 +55,7 @@ The database contains:
 - `shares`: AD group-to-folder lifecycle and ACL reconciliation state;
 - `audit_events`: normalized read, write, move, and delete events;
 - `audit_sources`: Samba log inode/offset checkpoints;
-- `audit_read_dedup`: bounded, persistent fingerprints for restart-safe read deduplication;
+- `audit_event_dedup`: bounded, persistent fingerprints for restart-safe main-read and FSLogix-event deduplication;
 - `audit_daily_totals`, `audit_daily_counts`, and `audit_daily_facets`: compact materialized metadata for fast activity counts and filters;
 - `audit_paths`, `audit_paths_fts`, and `audit_path_events`: deduplicated trigram path search with an incrementally maintained event mapping;
 - `audit_rollup_state`: bounded legacy-event backfill progress;
@@ -181,7 +182,8 @@ The E2E suite verifies:
 - SMB allow/deny behavior and real file operations;
 - Data, Private, and FSLogix usage aggregation;
 - high-level `full_audit` ingestion for all four actions, service-account exclusion, filters, facets, and pagination;
-- shared SQLite schema, integrity, indexes, legacy-log removal, and read deduplication across interleaved events and collector polls;
+- shared SQLite schema, integrity, indexes, legacy-log removal, and main-read and FSLogix-event deduplication across interleaved events and collector polls;
+- real Samba recycle handling plus authenticated trash listing, streamed download, and restore;
 - real rsync transfer progress, completed backup status, log output, remote snapshot marker, and per-group encrypted non-solid 7z archives;
 - anonymous action rejection plus authenticated manual backup and reconciliation actions, terminal progress, and live reconciliation output;
 - overview and system-health aggregation;
@@ -286,6 +288,14 @@ The runner returns non-zero on the first failed assertion, prints bounded logs f
 - Semantics intentionally differ from `Data`: only the share root is reconciled (`03770` + ACL defaults), while user-created profile container folders/files are not recursively normalized.
 - Samba masks are profile-container oriented (`create mask = 0600`, `directory mask = 0700`) so profile payload stays user-private by default.
 
+## Seven-Day Trash
+
+Deletes through the `Private`, `Data`, and `FSLogix` SMB shares are intercepted by Samba's recycle VFS and moved into `.trash/<user>` on the same source volume. Moving on the same filesystem avoids copying even large profile containers. The original directory tree is retained, repeated deletions receive versioned names, and the deletion time is stored as the recycled file's modification time.
+
+The repository root is owned by root, vetoed from SMB access, and not included in per-user/per-group usage rows. Every hour—and once during container startup—the cleanup job permanently removes entries older than seven days. `TRASH_RETENTION_DAYS` defaults to `7` and may be set from `1` to `365`.
+
+Domain Admins can use **Papierkorb** in the web console to filter and list retained files, stream-download them, or restore them to their original path. Restore is a same-filesystem link/unlink operation, so it is fast for large files and preserves file metadata. It never overwrites an existing file; a conflict is reported and the retained copy remains in the bin.
+
 ## Web Administration Console
 
 Open `https://<WEB_HOSTNAME>/` after setup. Only members of the group identified by `DOMAIN_ADMINS_SID` can sign in. The form accepts `DOMAIN\username`, `username@realm`, or an unqualified username (which is qualified with `WORKGROUP`).
@@ -297,6 +307,7 @@ The console is intentionally operational and plain:
 - **Data usage**: cached recursive size of every top-level `/Data` group folder.
 - **User usage**: per-user `/Private + /FSLogix` totals with component sizes.
 - **Activity**: dynamic date, user, share, action, result, and path filters with pagination.
+- **Trash**: list seven-day recycle entries across all shares, download a retained file, or restore it without overwriting an existing path.
 - **Share reconciliation**: manually force reconciliation and follow its phase, progress bar, current group, and live output.
 - **Backups**: manually start a backup and follow live progress, active transfer rows, snapshot name, trigger, and recent output.
 - **PDF report**: storage totals and every storage row, complete group/folder membership hierarchies, current backup state, system checks, and TLS certificate data.
@@ -304,7 +315,7 @@ The console is intentionally operational and plain:
 
 The PDF report deliberately excludes the activity log and backup log. Its dedicated snapshot endpoint removes those fields before returning data. Typst, its WebAssembly compiler, and the report fonts are shipped with the application; Typst source and PDF bytes are created only in the authenticated browser and are never uploaded to another service. The first export downloads roughly 22 MiB of compiler/font assets, which are then cached as immutable files. The CSP grants only `'wasm-unsafe-eval'` for WebAssembly compilation and does not enable JavaScript `'unsafe-eval'`.
 
-The only operational mutation endpoints start an immediate backup or share reconciliation, and both require the same Domain Admin JWT as every protected page. The console cannot edit files, groups, ACL rules, backup schedules, retention, or `BACKUP_AUTO_ENABLED`. Automatic backups can be enabled or disabled only through the environment and therefore require a redeployment/restart.
+The operational mutation endpoints restore a retained file or start an immediate backup/share reconciliation; all require the same Domain Admin JWT as every protected page. Restore cannot overwrite a live file. The console cannot otherwise edit files, groups, ACL rules, backup schedules, retention, or `BACKUP_AUTO_ENABLED`. Automatic backups can be enabled or disabled only through the environment and therefore require a redeployment/restart.
 
 ### Authentication and sessions
 
@@ -386,6 +397,7 @@ Useful optional settings:
 | `WEB_USAGE_SCAN_INTERVAL_SECONDS` | `900` | Recursive storage scan interval |
 | `WEB_DIRECTORY_CACHE_SECONDS` | `300` | AD membership tree cache time |
 | `WEB_MAX_GROUP_NODES` | `10000` | Membership expansion safety limit |
+| `TRASH_RETENTION_DAYS` | `7` | Recycled-file lifetime; cleanup accepts 1 to 365 days |
 | `STATE_DB_PATH` | `/state/shares.db` | Shared SQLite database for shares, activity, collector offsets, and caches |
 | `AUDIT_QUERY_MAX_DAYS` | `31` | Largest activity query window |
 | `AUDIT_SKIP_USER_SUFFIXES` | `_svc,_ServiceAcc` | Case-insensitive account suffixes excluded from collection and queries; set empty to disable |
@@ -400,7 +412,7 @@ Samba emits selected high-level `full_audit` operations for Private, Data, and F
 - each event records a UTC timestamp, user, client address/name, share, result, path, and one of `read`, `write`, `move`, or `delete`;
 - directory listings, sessions, metadata access, file-open/create noise, and all other VFS operations are discarded; users ending in a configured `AUDIT_SKIP_USER_SUFFIXES` value are also discarded;
 - FSLogix profile-container events are retained and queried through their own partial indexes, API route, and UI log instead of appearing in the main activity stream;
-- identical reads within the same UTC second are collapsed into one event regardless of intervening events, log source, or collector polling cycle; the persistent fingerprint cache covers the latest 48 hours and can be tuned with `AUDIT_READ_DEDUP_WINDOW_SECONDS`;
+- identical main-stream reads and identical FSLogix events within the same UTC second are collapsed regardless of intervening events, log source, or collector polling cycle; Data/Private writes remain distinct, and the 48-hour fingerprint window can be tuned with `AUDIT_DEDUP_WINDOW_SECONDS`;
 - activity pages read only `limit + 1` indexed rows and use a stable time/id cursor;
 - exact counts for date, user, share, action, and result filters and all facet lists come from daily rollups;
 - selective substring path searches use the deduplicated trigram index and skip an expensive exact count while more pages exist;
@@ -408,7 +420,7 @@ Samba emits selected high-level `full_audit` operations for Private, Data, and F
 - collector inserts and rollup updates are batched in one transaction;
 - no activity retention deletion is performed.
 
-Collection starts even when the web UI is disabled. Existing databases remain queryable while the collector backfills rollups, path IDs, path-event mappings, and recent read deduplication in bounded chunks after prioritizing each live append. On the first collector start after the legacy archive migration, recognized daily `.jsonl`/`.jsonl.gz` files and the old collector state file under `/state/audit` are deleted without import. Existing raw Samba log content is then processed using the current action, suffix, and deduplication policy.
+Collection starts even when the web UI is disabled. Existing databases remain queryable while the collector backfills rollups, path IDs, path-event mappings, and recent main-read and FSLogix-event deduplication in bounded chunks after prioritizing each live append. On the first collector start after the legacy archive migration, recognized daily `.jsonl`/`.jsonl.gz` files and the old collector state file under `/state/audit` are deleted without import. Existing raw Samba log content is then processed using the current action, suffix, and deduplication policy.
 
 
 ## Backups

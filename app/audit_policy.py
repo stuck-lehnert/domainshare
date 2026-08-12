@@ -49,10 +49,12 @@ def skip_user(user: str) -> bool:
     account = account_name(user).casefold()
     return any(account.endswith(suffix) for suffix in skipped_user_suffixes())
 
-ReadEventKey = Tuple[str, ...]
+DeduplicationKey = Tuple[str, ...]
 
-def read_deduplication_key(event: Mapping[str, object]) -> Optional[ReadEventKey]:
-    if str(event.get("action", "")).casefold() != "read":
+def deduplication_key(event: Mapping[str, object]) -> Optional[DeduplicationKey]:
+    action = str(event.get("action", "")).casefold()
+    share = str(event.get("share", ""))
+    if action != "read" and share.casefold() != "fslogix":
         return None
     try:
         timestamp = dt.datetime.fromisoformat(
@@ -71,18 +73,19 @@ def read_deduplication_key(event: Mapping[str, object]) -> Optional[ReadEventKey
     success = bool(event.get("success", False))
     return (
         second,
+        action,
         str(event.get("user", "")),
         str(event.get("clientIp", "")),
-        str(event.get("share", "")),
+        share,
         str(event.get("path", "")),
         "success" if success else "failure",
         "" if success else str(event.get("result", "")),
     )
 
-def read_deduplication_fingerprint(
+def deduplication_fingerprint(
     event: Mapping[str, object]
 ) -> Optional[bytes]:
-    key = read_deduplication_key(event)
+    key = deduplication_key(event)
     if key is None:
         return None
     digest = hashlib.blake2b(digest_size=16)
@@ -92,8 +95,9 @@ def read_deduplication_fingerprint(
         digest.update(encoded)
     return digest.digest()
 
-def read_deduplication_fingerprint_values(
+def deduplication_fingerprint_values(
     timestamp: object,
+    action: object,
     user: object,
     client_ip: object,
     share: object,
@@ -101,9 +105,9 @@ def read_deduplication_fingerprint_values(
     success: object,
     result: object,
 ) -> bytes:
-    """Fingerprint legacy SQLite columns with the live-ingest policy."""
-    fingerprint = read_deduplication_fingerprint({
-        "action": "read",
+    """Fingerprint SQLite columns with the live-ingest policy."""
+    fingerprint = deduplication_fingerprint({
+        "action": action,
         "timestamp": timestamp,
         "user": user,
         "clientIp": client_ip,

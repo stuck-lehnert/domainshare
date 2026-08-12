@@ -558,7 +558,7 @@ class AuditParsingTests(unittest.TestCase):
                 ).fetchall()
                 fingerprints = store.conn.execute(
                     """
-                    SELECT count(*) FROM audit_read_dedup
+                    SELECT count(*) FROM audit_event_dedup
                     """
                 ).fetchone()[0]
             finally:
@@ -578,6 +578,85 @@ class AuditParsingTests(unittest.TestCase):
                 ("write", "Data", "changed.txt"),
                 ("read", "Data", "b.txt"),
                 ("read", "Data", "a.txt"),
+            ],
+        )
+
+
+    def test_deduplicates_fslogix_writes_but_preserves_private_writes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = os.path.join(tmpdir, "state.db")
+            store = audit_store.AuditStore(database)
+            day = dt.datetime.now(dt.timezone.utc).date()
+            timestamp = f"{day}T13:39:23+00:00"
+            fslogix_write = {
+                "timestamp": timestamp,
+                "ingestedAt": timestamp,
+                "user": "LOCAL\\ralf.schwientek",
+                "clientIp": "10.100.0.21",
+                "client": "PC01",
+                "share": "FSLogix",
+                "operation": "pwrite",
+                "action": "write",
+                "path": "/data/fslogix/profile.vhd",
+                "result": "OK",
+                "success": True,
+                "source": "log.pc01",
+            }
+            private_write = dict(
+                fslogix_write,
+                share="Private",
+                path="/data/private/file.txt",
+            )
+            fslogix_read = dict(
+                fslogix_write, operation="pread", action="read"
+            )
+            try:
+                inserted = store.append_batch(
+                    [
+                        fslogix_write,
+                        dict(fslogix_write, source="log.pc02"),
+                        private_write,
+                        dict(private_write, source="log.pc02"),
+                        fslogix_read,
+                    ],
+                    {},
+                    set(),
+                )
+                repeated_poll = store.append_batch(
+                    [dict(fslogix_write, source="log.pc03")], {}, set()
+                )
+                next_timestamp = f"{day}T13:39:24+00:00"
+                next_second = store.append_batch(
+                    [dict(
+                        fslogix_write,
+                        timestamp=next_timestamp,
+                        ingestedAt=next_timestamp,
+                        source="log.pc04",
+                    )],
+                    {},
+                    set(),
+                )
+                rows = store.conn.execute(
+                    "SELECT action, share FROM audit_events ORDER BY id"
+                ).fetchall()
+                fingerprints = store.conn.execute(
+                    "SELECT count(*) FROM audit_event_dedup"
+                ).fetchone()[0]
+            finally:
+                store.close()
+
+        self.assertEqual(inserted, 4)
+        self.assertEqual(repeated_poll, 0)
+        self.assertEqual(next_second, 1)
+        self.assertEqual(fingerprints, 3)
+        self.assertEqual(
+            [(row["action"], row["share"]) for row in rows],
+            [
+                ("write", "FSLogix"),
+                ("write", "Private"),
+                ("write", "Private"),
+                ("read", "FSLogix"),
+                ("write", "FSLogix"),
             ],
         )
 
@@ -969,14 +1048,21 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(main["matched"], 1)
         self.assertEqual(fslogix["matched"], 1)
         self.assertEqual(total, 2)
-        self.assertEqual(policy_version, 4)
+        self.assertEqual(policy_version, 5)
 
-    def test_upgrade_collapses_recent_legacy_read_duplicates(self):
+    def test_upgrade_collapses_recent_fslogix_write_duplicates(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             today = dt.datetime.now(dt.timezone.utc).date()
             database = os.path.join(tmpdir, "state.db")
             store = audit_store.AuditStore(database)
             event = self.make_event(f"{today}T12:00:00+00:00", "alice")
+            event = dict(
+                event,
+                share="FSLogix",
+                operation="pwrite",
+                action="write",
+                path="/data/fslogix/profile.vhd",
+            )
             store.append_batch([event], {}, set())
             for source in ("log.pc02", "log.pc03"):
                 store.conn.execute(
@@ -994,9 +1080,11 @@ class AuditQueryTests(unittest.TestCase):
                     """,
                     (source,),
                 )
-            store.conn.execute("DELETE FROM audit_read_dedup")
             store.conn.execute(
-                "UPDATE audit_rollup_state SET policy_version = 3"
+                "ALTER TABLE audit_event_dedup RENAME TO audit_read_dedup"
+            )
+            store.conn.execute(
+                "UPDATE audit_rollup_state SET policy_version = 4"
             )
             store.conn.commit()
             store.close()
@@ -1014,7 +1102,7 @@ class AuditQueryTests(unittest.TestCase):
                     "SELECT sum(event_count) FROM audit_daily_totals"
                 ).fetchone()[0]
                 dedup_keys = store.conn.execute(
-                    "SELECT count(*) FROM audit_read_dedup"
+                    "SELECT count(*) FROM audit_event_dedup"
                 ).fetchone()[0]
                 policy_version = store.conn.execute(
                     "SELECT policy_version FROM audit_rollup_state"
@@ -1030,7 +1118,7 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(live_inserted, 1)
         self.assertEqual(retained_source, "log.live")
         self.assertEqual(dedup_keys, 1)
-        self.assertEqual(policy_version, 4)
+        self.assertEqual(policy_version, 5)
 
 
     def test_schema_has_filter_indexes_and_rollup_tables(self):
@@ -1066,7 +1154,7 @@ class AuditQueryTests(unittest.TestCase):
                 "audit_events_fslogix_user_time",
                 "audit_events_fslogix_account_time",
                 "audit_events_fslogix_result_time",
-                "audit_read_dedup_time",
+                "audit_event_dedup_time",
             }.issubset(indexes)
         )
         self.assertTrue(
@@ -1078,7 +1166,7 @@ class AuditQueryTests(unittest.TestCase):
                 "audit_paths",
                 "audit_paths_fts",
                 "audit_path_events",
-                "audit_read_dedup",
+                "audit_event_dedup",
             }.issubset(tables)
         )
 
@@ -1148,6 +1236,12 @@ class WebPresentationTests(unittest.TestCase):
         self.assertIn("/activity/fslogix", html)
         self.assertIn("/api/fslogix-activity", script)
         self.assertIn('renderActivity("fslogix")', script)
+        self.assertIn('href="/trash" data-route="trash">Papierkorb</a>', html)
+        self.assertIn("/api/trash?", script)
+        self.assertIn("/api/trash/download?id=", script)
+        self.assertIn('api("/api/trash/restore"', script)
+        self.assertIn("Herunterladen", script)
+        self.assertIn("Wiederherstellen", script)
         self.assertNotIn(">Auflisten<", script)
         self.assertNotIn(">Metadaten<", script)
         self.assertNotIn(">Sitzung<", script)
@@ -1218,6 +1312,39 @@ class WebPresentationTests(unittest.TestCase):
         for line in success_lines + failure_lines:
             self.assertEqual(set(line.split("=", 1)[1].split()), expected)
 
+    def test_samba_recycles_all_three_shares_for_seven_day_cleanup(self):
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(
+            os.path.join(root, "etc", "samba", "smb.conf"),
+            encoding="utf-8",
+        ) as handle:
+            config = handle.read()
+        with open(os.path.join(root, "app", "init.sh"), encoding="utf-8") as handle:
+            init_script = handle.read()
+        with open(os.path.join(root, "Dockerfile"), encoding="utf-8") as handle:
+            dockerfile = handle.read()
+
+        for share, next_share in (
+            ("Private", "Data"),
+            ("Data", "FSLogix"),
+            ("FSLogix", None),
+        ):
+            share_config = config.split(f"[{share}]", 1)[1]
+            if next_share:
+                share_config = share_config.split(f"[{next_share}]", 1)[0]
+            self.assertIn("vfs objects = acl_xattr recycle full_audit", share_config)
+            self.assertIn("recycle:repository = .trash/%U", share_config)
+            self.assertIn("recycle:keeptree = yes", share_config)
+            self.assertIn("recycle:versions = yes", share_config)
+            self.assertIn("recycle:touch_mtime = yes", share_config)
+            self.assertIn("recycle:exclude_dir = .trash", share_config)
+            self.assertIn("veto files = /.trash/", share_config)
+
+        self.assertIn("acl_xattr recycle full_audit", init_script)
+        self.assertIn("/app/trash.py --cleanup", init_script)
+        self.assertIn("TRASH_RETENTION_DAYS", init_script)
+        self.assertIn("COPY app/trash.py /app/trash.py", dockerfile)
+
 
 class TlsSummaryTests(unittest.TestCase):
     @mock.patch("app.web_ui.ssl._ssl._test_decode_cert")
@@ -1236,12 +1363,21 @@ class UsageScannerTests(unittest.TestCase):
             os.makedirs(os.path.join(group_root, "Finance"))
             os.makedirs(os.path.join(private_root, "alice"))
             os.makedirs(os.path.join(fslogix_root, "alice_S-1-5-21-1-2-3-1001"))
+            os.makedirs(os.path.join(group_root, ".trash", "alice"))
+            os.makedirs(os.path.join(private_root, ".trash", "alice"))
+            os.makedirs(os.path.join(fslogix_root, ".trash", "alice"))
             with open(os.path.join(group_root, "Finance", "a"), "wb") as handle:
                 handle.write(b"a" * 7)
             with open(os.path.join(private_root, "alice", "b"), "wb") as handle:
                 handle.write(b"b" * 3)
             with open(os.path.join(fslogix_root, "alice_S-1-5-21-1-2-3-1001", "c"), "wb") as handle:
                 handle.write(b"c" * 5)
+            for root in (group_root, private_root, fslogix_root):
+                with open(
+                    os.path.join(root, ".trash", "alice", "deleted"),
+                    "wb",
+                ) as handle:
+                    handle.write(b"x" * 100)
             database = os.path.join(tmpdir, "state.db")
 
             env = {"GROUP_ROOT": group_root, "PRIVATE_ROOT": private_root, "FSLOGIX_ROOT": fslogix_root}

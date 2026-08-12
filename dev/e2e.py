@@ -222,6 +222,16 @@ def main() -> int:
         http("/api/actions/reconciliation", method="POST", value={}).status == 401,
         "anonymous reconciliation action was accepted",
     )
+    check(http("/api/trash").status == 401, "anonymous trash listing was accepted")
+    check(
+        http(
+            "/api/trash/restore",
+            method="POST",
+            value={"id": "invalid"},
+        ).status
+        == 401,
+        "anonymous trash restore was accepted",
+    )
     non_admin = http(
         "/api/login",
         method="POST",
@@ -304,6 +314,84 @@ def main() -> int:
         check_result=False,
     )
     check(admin_access.returncode == 0, "Domain Admin cannot inspect Finance")
+    direct_trash_access = engine_run(
+        "exec",
+        CLIENT_CONTAINER,
+        "smbclient",
+        f"//files.{DNS_DOMAIN}/Data",
+        "-m",
+        "SMB3",
+        "-U",
+        f"{WORKGROUP}\\alice%{USER_PASSWORD}",
+        "-c",
+        "cd .trash; ls",
+        check_result=False,
+    )
+    check(
+        direct_trash_access.returncode != 0,
+        "ordinary SMB user can browse the admin-managed trash repository",
+    )
+
+    announce("real Samba recycle, admin download, and conflict-safe restore")
+    trash_response = eventually(
+        "deleted SMB file in the seven-day trash",
+        lambda: http(
+            query_path(
+                "/api/trash",
+                {"share": "Data", "path": "audit-moved.txt", "limit": "10"},
+            ),
+            token=token,
+        ),
+        lambda response: (
+            response.status == 200
+            and any(
+                item.get("path") == "Finance/Reports/audit-moved.txt"
+                for item in response.json().get("items", [])
+            )
+        ),
+        timeout=30,
+    )
+    trash_items = trash_response.json().get("items", [])
+    trash_item = next(
+        item
+        for item in trash_items
+        if item.get("path") == "Finance/Reports/audit-moved.txt"
+    )
+    trash_download = http(
+        query_path("/api/trash/download", {"id": str(trash_item["id"])}),
+        token=token,
+    )
+    check(
+        trash_download.status == 200
+        and len(trash_download.body) == int(trash_item["size"])
+        and "attachment" in trash_download.headers.get("Content-Disposition", ""),
+        "trash download is missing, truncated, or not an attachment",
+    )
+    restored = http(
+        "/api/trash/restore",
+        method="POST",
+        value={"id": trash_item["id"]},
+        token=token,
+    )
+    check(
+        restored.status == 200
+        and restored.json().get("path") == "Finance/Reports/audit-moved.txt",
+        f"trash restore failed: {restored.body!r}",
+    )
+    restored_read = engine_run(
+        "exec",
+        CLIENT_CONTAINER,
+        "smbclient",
+        f"//files.{DNS_DOMAIN}/Data",
+        "-m",
+        "SMB3",
+        "-U",
+        f"{WORKGROUP}\\alice%{USER_PASSWORD}",
+        "-c",
+        "cd Finance; cd Reports; get audit-moved.txt /tmp/restored-trash-file.txt",
+        check_result=False,
+    )
+    check(restored_read.returncode == 0, "restored file is not readable over SMB")
 
     announce("group, Private, and FSLogix size accounting")
     storage = http("/api/storage", token=token)
