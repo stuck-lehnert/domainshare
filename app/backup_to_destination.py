@@ -27,6 +27,10 @@ DEFAULT_BACKUP_STATUS_FILE = "/state/backup-status.json"
 DEFAULT_ARCHIVE_TEMP_DIR = "/tmp"
 GROUPS_SOURCE_PATH = "/data/groups"
 GROUP_ARCHIVE_CATEGORIES = ("data", "archive")
+TRASH_DIRECTORY = ".trash"
+TRASH_EXCLUDED_DESTINATIONS = frozenset(
+    {"data/private", "data/groups", "data/fslogix"}
+)
 DEFAULT_PROGRESS_MODE = "auto"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 10
 PROGRESS_BAR_WIDTH = 28
@@ -422,17 +426,23 @@ def parse_data_size(raw_value: str) -> Optional[int]:
     return int(round(normalize_size_number(match.group("value")) * multiplier))
 
 
-def measure_path_bytes(path: str) -> int:
+def measure_path_bytes(path: str, *, exclude_root_trash: bool = False) -> int:
     total = 0
-    stack = [path]
+    stack = [(path, True)]
     while stack:
-        current = stack.pop()
+        current, is_root = stack.pop()
         try:
             with os.scandir(current) as entries:
                 for entry in entries:
                     try:
+                        if (
+                            exclude_root_trash
+                            and is_root
+                            and entry.name == TRASH_DIRECTORY
+                        ):
+                            continue
                         if entry.is_dir(follow_symlinks=False):
-                            stack.append(entry.path)
+                            stack.append((entry.path, False))
                         elif entry.is_file(follow_symlinks=False):
                             total += entry.stat(follow_symlinks=False).st_size
                     except OSError as exc:
@@ -445,8 +455,11 @@ def measure_path_bytes(path: str) -> int:
 def measure_backup_payload(sources: List[Tuple[str, str]]) -> Tuple[Dict[str, int], int]:
     source_sizes: Dict[str, int] = {}
     total = 0
-    for source_path, _destination_path in sources:
-        size = measure_path_bytes(source_path)
+    for source_path, destination_path in sources:
+        size = measure_path_bytes(
+            source_path,
+            exclude_root_trash=destination_path in TRASH_EXCLUDED_DESTINATIONS,
+        )
         source_sizes[source_path] = size
         total += size
     return source_sizes, total
@@ -1082,6 +1095,9 @@ def prepare_group_archives(
                 key=lambda entry: entry.name.casefold(),
             )
             for entry in members:
+                if entry.name == TRASH_DIRECTORY:
+                    log(f"Excluding retained trash from backup source {category}")
+                    continue
                 target = os.path.join(target_category, entry.name)
                 if entry.is_dir(follow_symlinks=False) and not entry.is_symlink():
                     relative_name = f"{category}/{entry.name}"
@@ -1407,25 +1423,25 @@ class RcloneBackend:
             interval_seconds=progress_interval_seconds,
             interactive=interactive_progress,
         )
-        run_streaming_command(
-            [
-                "rclone",
-                "sync",
-                f"{source_path}/",
-                f"backup:{remote_path}",
-                "--create-empty-src-dirs",
-                "--progress",
-                "--stats",
-                f"{progress_interval_seconds}s",
-                "--transfers",
-                str(MAX_PARALLEL_FILE_UPLOADS),
-                "--log-level",
-                "INFO",
-                "--config",
-                self.config_path,
-            ],
-            progress=progress,
-        )
+        command = [
+            "rclone",
+            "sync",
+            f"{source_path}/",
+            f"backup:{remote_path}",
+            "--create-empty-src-dirs",
+            "--progress",
+            "--stats",
+            f"{progress_interval_seconds}s",
+            "--transfers",
+            str(MAX_PARALLEL_FILE_UPLOADS),
+            "--log-level",
+            "INFO",
+            "--config",
+            self.config_path,
+        ]
+        if destination_path in TRASH_EXCLUDED_DESTINATIONS:
+            command.extend(["--exclude", f"/{TRASH_DIRECTORY}/**"])
+        run_streaming_command(command, progress=progress)
 
     def write_marker(self, snapshot_name: str) -> None:
         marker_path = join_path(self._snapshot_root(snapshot_name), ".backup_complete")
@@ -1532,17 +1548,19 @@ class RsyncBackend:
             interval_seconds=progress_interval_seconds,
             interactive=interactive_progress,
         )
+        command = [
+            "rsync",
+            "-a",
+            "--delete",
+            "--mkpath",
+            "--progress",
+            "--outbuf=L",
+        ]
+        if destination_path in TRASH_EXCLUDED_DESTINATIONS:
+            command.append(f"--exclude=/{TRASH_DIRECTORY}/")
+        command.extend([f"{source_path}/", f"{target}/"])
         run_streaming_command(
-            [
-                "rsync",
-                "-a",
-                "--delete",
-                "--mkpath",
-                "--progress",
-                "--outbuf=L",
-                f"{source_path}/",
-                f"{target}/",
-            ],
+            command,
             env=self.command_env,
             progress=progress,
         )

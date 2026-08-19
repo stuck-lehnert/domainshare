@@ -15,6 +15,13 @@ DEFAULT_RETENTION_DAYS = 7
 VERSION_PREFIX_RE = re.compile(r"^Copy #\d+ of ", re.IGNORECASE)
 
 
+def excluded_filename(filename: str) -> bool:
+    """Return whether a transient file must never be retained."""
+    unversioned = VERSION_PREFIX_RE.sub("", filename, count=1)
+    folded = unversioned.casefold()
+    return folded.endswith(".tmp") or folded.startswith("~$")
+
+
 def retention_days() -> int:
     try:
         value = int(os.getenv("TRASH_RETENTION_DAYS", str(DEFAULT_RETENTION_DAYS)))
@@ -147,6 +154,8 @@ def _resolved_item(item_id: str) -> Tuple[str, str, str, List[str], os.stat_resu
     share_root = share_roots()[share]
     repository = trash_root(share_root)
     parts = _relative_parts(relative_path)
+    if excluded_filename(parts[-1]):
+        raise FileNotFoundError("Papierkorbeintrag ist ausgeschlossen")
     parent_fd = _open_directory_chain(repository, parts[:-1])
     try:
         info = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
@@ -217,6 +226,8 @@ def list_items(
                         continue
                 subdirectories[:] = safe_subdirectories
                 for filename in filenames:
+                    if excluded_filename(filename):
+                        continue
                     candidate = os.path.join(directory, filename)
                     try:
                         info = os.lstat(candidate)
@@ -370,7 +381,7 @@ def cleanup_expired(now: Optional[dt.datetime] = None) -> Dict[str, int]:
                 candidate = os.path.join(directory, filename)
                 try:
                     info = os.lstat(candidate)
-                    if info.st_mtime >= cutoff:
+                    if info.st_mtime >= cutoff and not excluded_filename(filename):
                         continue
                     if not (
                         stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
@@ -405,7 +416,7 @@ def main() -> int:
         parser.error("--cleanup is required")
     result = cleanup_expired()
     print(
-        f"[trash] Removed {result['removed']} expired item(s) "
+        f"[trash] Removed {result['removed']} expired or excluded item(s) "
         f"({result['removedBytes']} bytes)",
         flush=True,
     )

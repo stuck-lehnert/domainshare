@@ -1221,7 +1221,6 @@ class Handler(BaseHTTPRequestHandler):
             "/assets/vendor/typst/0.6.0-csp1/compiler.wasm": ("vendor/typst/compiler.wasm", "application/wasm"),
             "/assets/vendor/typst/0.6.0-csp1/LibertinusSerif-Regular.otf": ("vendor/typst/LibertinusSerif-Regular.otf", "font/otf"),
             "/assets/vendor/typst/0.6.0-csp1/LibertinusSerif-Semibold.otf": ("vendor/typst/LibertinusSerif-Semibold.otf", "font/otf"),
-            "/favicon.svg": ("favicon.svg", "image/svg+xml"),
         }
         if path in files:
             filename, content_type = files[path]

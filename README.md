@@ -128,6 +128,8 @@ The launcher builds the current application and starts an isolated, run-scoped n
 - the actual file-server image, joined to the dummy domain;
 - a continuous SMB client that exercises reads, writes, renames, and deletions, including activity from an excluded dummy service account.
 
+The disposable AD DC is compatible with rootless Podman: its development-only internal ID range stays inside the standard 65,536-entry user namespace, and SYSVOL ACL metadata is stored in `xattr_tdb` because an unprivileged container cannot write the `security.NTACL` namespace. These compatibility settings apply only to `dev/ad-dc.Dockerfile`; the production file-server image and real AD remain unchanged.
+
 The preview starts with group, Private, and FSLogix data. The client keeps current activity moving, while a real backup runs immediately and repeats in the background. Open the URL and use the credentials printed by the launcher. Defaults are:
 
 ```text
@@ -138,7 +140,7 @@ Password: PreviewAdmin123!
 
 The generated CA is intentionally disposable. `scripts/dev` prints the temporary root certificate path so it can be trusted only for the duration of that run. Ctrl-C stops and removes all run-scoped containers, volumes, the network, and the temporary root. A watchdog performs the same cleanup if the parent script is killed.
 
-The dummy DC alone receives `SYS_ADMIN`, which Samba needs to write Windows ACL xattrs while provisioning `SYSVOL`; the application container receives no extra capability.
+Neither the dummy DC nor the application container receives extra capabilities.
 
 Useful overrides:
 
@@ -292,7 +294,7 @@ The runner returns non-zero on the first failed assertion, prints bounded logs f
 
 Deletes through the `Private`, `Data`, and `FSLogix` SMB shares are intercepted by Samba's recycle VFS and moved into `.trash/<user>` on the same source volume. Moving on the same filesystem avoids copying even large profile containers. The original directory tree is retained, repeated deletions receive versioned names, and the deletion time is stored as the recycled file's modification time.
 
-The repository root is owned by root, vetoed from SMB access, and not included in per-user/per-group usage rows. Every hour—and once during container startup—the cleanup job permanently removes entries older than seven days. `TRASH_RETENTION_DAYS` defaults to `7` and may be set from `1` to `365`.
+The repository root is owned by root, vetoed from SMB access, and excluded from usage accounting and remote backup snapshots. Temporary `*.tmp` files and document lock files beginning with `~$` are deleted normally instead of being retained; cleanup also purges any such entries left by an older configuration. Every hour—and once during container startup—the cleanup job permanently removes entries older than seven days. `TRASH_RETENTION_DAYS` defaults to `7` and may be set from `1` to `365`.
 
 Domain Admins can use **Papierkorb** in the web console to filter and list retained files, stream-download them, or restore them to their original path. Restore is a same-filesystem link/unlink operation, so it is fast for large files and preserves file metadata. It never overwrites an existing file; a conflict is reported and the retained copy remains in the bin.
 

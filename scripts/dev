@@ -260,7 +260,6 @@ printf 'starting disposable Samba AD DC: %s\n' "$dev_realm"
 "$engine" run -d \
   --name "$dc_container" \
   --hostname "dc.${dev_dns_domain}" \
-  --cap-add SYS_ADMIN \
   --network "$network_name" \
   --ip "$dc_ip" \
   -e "AD_REALM=${dev_realm}" \

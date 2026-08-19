@@ -198,6 +198,11 @@ class ProgressParsingTests(unittest.TestCase):
                 handle.write(b"a" * 3)
             with open(os.path.join(nested, "two.bin"), "wb") as handle:
                 handle.write(b"b" * 5)
+            os.makedirs(os.path.join(tmpdir, ".trash", "alice"))
+            with open(
+                os.path.join(tmpdir, ".trash", "alice", "deleted.bin"), "wb"
+            ) as handle:
+                handle.write(b"x" * 100)
 
             sizes, total = backup.measure_backup_payload([(tmpdir, "data/private")])
 
@@ -222,6 +227,7 @@ class GroupArchiveTests(unittest.TestCase):
             source_root = os.path.join(tmpdir, "groups")
             os.makedirs(os.path.join(source_root, "data", "Finance"))
             os.makedirs(os.path.join(source_root, "archive", "Former"))
+            os.makedirs(os.path.join(source_root, "data", ".trash", "alice"))
             os.makedirs(os.path.join(source_root, "metadata"))
             with open(
                 os.path.join(source_root, "data", "Finance", "report.txt"),
@@ -241,6 +247,12 @@ class GroupArchiveTests(unittest.TestCase):
                 encoding="utf-8",
             ) as handle:
                 handle.write("preserve me")
+            with open(
+                os.path.join(source_root, "data", ".trash", "alice", "deleted.txt"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("retained deletion")
             with open(
                 os.path.join(source_root, "metadata", "index.txt"),
                 "w",
@@ -279,6 +291,9 @@ class GroupArchiveTests(unittest.TestCase):
                 )
                 self.assertFalse(
                     os.path.exists(os.path.join(staged_root, "data", "Finance"))
+                )
+                self.assertFalse(
+                    os.path.exists(os.path.join(staged_root, "data", ".trash"))
                 )
 
                 self.assertEqual(len(commands), 2)
@@ -405,6 +420,8 @@ class BackendProgressCommandTests(unittest.TestCase):
             self.assertIn("--log-level", command)
             self.assertIn("INFO", command)
             self.assertIn("--config", command)
+            self.assertIn("--exclude", command)
+            self.assertIn("/.trash/**", command)
             self.assertEqual(
                 run_streaming.call_args.kwargs["progress"].backend_name, "rclone"
             )
@@ -430,6 +447,7 @@ class BackendProgressCommandTests(unittest.TestCase):
         self.assertIn("--mkpath", command)
         self.assertIn("--progress", command)
         self.assertIn("--outbuf=L", command)
+        self.assertIn("--exclude=/.trash/", command)
         self.assertEqual(
             run_streaming.call_args.kwargs["progress"].backend_name, "rsync"
         )

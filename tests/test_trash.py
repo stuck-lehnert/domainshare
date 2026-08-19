@@ -142,6 +142,52 @@ class TrashTests(unittest.TestCase):
                 self.assertTrue(os.path.isfile(recent))
                 self.assertEqual(trash.list_items(now=now)["matched"], 1)
 
+    def test_temporary_and_document_lock_files_are_never_exposed_or_retained(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self.roots(tmpdir)
+            with mock.patch.dict(os.environ, env):
+                trash.ensure_trash_roots()
+                temporary = self.recycled_file(
+                    env["GROUP_ROOT"], "alice/Finance/713A292F.tmp", b"temp"
+                )
+                versioned_temporary = self.recycled_file(
+                    env["GROUP_ROOT"],
+                    "alice/Finance/Copy #2 of 713A292F.TMP",
+                    b"versioned temp",
+                )
+                document_lock = self.recycled_file(
+                    env["GROUP_ROOT"],
+                    "alice/Finance/~$RG Eingang 2026.xlsx",
+                    b"lock",
+                )
+                versioned_lock = self.recycled_file(
+                    env["GROUP_ROOT"],
+                    "alice/Finance/Copy #3 of ~$RG Eingang 2026.xlsx",
+                    b"versioned lock",
+                )
+
+                self.assertEqual(trash.list_items()["matched"], 0)
+                with self.assertRaises(FileNotFoundError):
+                    trash.open_download(
+                        trash.encode_item_id(
+                            "Data", "alice/Finance/713A292F.tmp"
+                        )
+                    )
+
+                result = trash.cleanup_expired()
+
+                self.assertEqual(
+                    result,
+                    {"removed": 4, "removedBytes": 36},
+                )
+                for path in (
+                    temporary,
+                    versioned_temporary,
+                    document_lock,
+                    versioned_lock,
+                ):
+                    self.assertFalse(os.path.exists(path))
+
     def test_cleanup_removes_expired_symlinks_without_following_them(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self.roots(tmpdir)

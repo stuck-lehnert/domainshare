@@ -324,12 +324,54 @@ def main() -> int:
         "-U",
         f"{WORKGROUP}\\alice%{USER_PASSWORD}",
         "-c",
-        "cd .trash; ls",
+        "cd .trash",
         check_result=False,
     )
     check(
         direct_trash_access.returncode != 0,
         "ordinary SMB user can browse the admin-managed trash repository",
+    )
+
+    announce("temporary and document-lock files bypass the recycle repository")
+    transient_delete = engine_run(
+        "exec",
+        CLIENT_CONTAINER,
+        "smbclient",
+        f"//files.{DNS_DOMAIN}/Data",
+        "-m",
+        "SMB3",
+        "-U",
+        f"{WORKGROUP}\\alice%{USER_PASSWORD}",
+        "-c",
+        (
+            "cd Finance; cd Reports; "
+            "put /tmp/live-note.txt 713A292F.tmp; del 713A292F.tmp; "
+            'put /tmp/live-note.txt "~$RG Eingang 2026.xlsx"; '
+            'del "~$RG Eingang 2026.xlsx"'
+        ),
+        check_result=False,
+    )
+    check(
+        transient_delete.returncode == 0,
+        "temporary/document-lock deletion over SMB failed: "
+        + (transient_delete.stderr.strip() or transient_delete.stdout.strip()),
+    )
+    transient_absent = engine_run(
+        "exec",
+        FILES_CONTAINER,
+        "sh",
+        "-ec",
+        (
+            "test ! -e '/data/groups/data/Finance/Reports/713A292F.tmp'; "
+            "test ! -e '/data/groups/data/Finance/Reports/~$RG Eingang 2026.xlsx'; "
+            "test -z \"$(find /data/groups/data/.trash -type f "
+            "\\( -iname '*.tmp' -o -name '~$*' \\) -print -quit)\""
+        ),
+        check_result=False,
+    )
+    check(
+        transient_absent.returncode == 0,
+        "temporary or document-lock file was retained in the trash repository",
     )
 
     announce("real Samba recycle, admin download, and conflict-safe restore")
@@ -486,9 +528,19 @@ def main() -> int:
     )
     check(
         {
-            "audit_events_time",
-            "audit_events_user_time",
-            "audit_events_action_time",
+            "audit_events_main_time",
+            "audit_events_main_action_time",
+            "audit_events_main_success_time",
+            "audit_events_main_user_time",
+            "audit_events_main_account_time",
+            "audit_events_main_share_time",
+            "audit_events_main_result_time",
+            "audit_events_fslogix_time",
+            "audit_events_fslogix_action_time",
+            "audit_events_fslogix_success_time",
+            "audit_events_fslogix_user_time",
+            "audit_events_fslogix_account_time",
+            "audit_events_fslogix_result_time",
         }.issubset(indexes),
         f"audit indexes are incomplete: {sorted(indexes)}",
     )

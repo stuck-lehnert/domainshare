@@ -1332,18 +1332,56 @@ class WebPresentationTests(unittest.TestCase):
             share_config = config.split(f"[{share}]", 1)[1]
             if next_share:
                 share_config = share_config.split(f"[{next_share}]", 1)[0]
-            self.assertIn("vfs objects = acl_xattr recycle full_audit", share_config)
+            # Audit must wrap recycle so an SMB deletion remains unlinkat in the
+            # activity log instead of becoming the recycle module's renameat.
+            self.assertIn("vfs objects = acl_xattr full_audit recycle", share_config)
             self.assertIn("recycle:repository = .trash/%U", share_config)
             self.assertIn("recycle:keeptree = yes", share_config)
             self.assertIn("recycle:versions = yes", share_config)
             self.assertIn("recycle:touch_mtime = yes", share_config)
+            self.assertIn("recycle:exclude = *.tmp,*.TMP,~$*", share_config)
             self.assertIn("recycle:exclude_dir = .trash", share_config)
             self.assertIn("veto files = /.trash/", share_config)
 
-        self.assertIn("acl_xattr recycle full_audit", init_script)
+        for module in ("acl_xattr", "recycle", "full_audit"):
+            self.assertIn(module, init_script)
         self.assertIn("/app/trash.py --cleanup", init_script)
         self.assertIn("TRASH_RETENTION_DAYS", init_script)
         self.assertIn("COPY app/trash.py /app/trash.py", dockerfile)
+
+    def test_application_has_no_favicon(self):
+        root = os.path.join(os.path.dirname(__file__), "..")
+        web_root = os.path.join(root, "app", "web")
+        with open(os.path.join(web_root, "index.html"), encoding="utf-8") as handle:
+            index = handle.read()
+        with open(os.path.join(root, "app", "web_ui.py"), encoding="utf-8") as handle:
+            server = handle.read()
+
+        self.assertNotIn("favicon", index.casefold())
+        self.assertNotIn("favicon", server.casefold())
+        self.assertFalse(os.path.exists(os.path.join(web_root, "favicon.svg")))
+
+    def test_disposable_dc_is_compatible_with_rootless_podman(self):
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(
+            os.path.join(root, "dev", "ad-dc.Dockerfile"),
+            encoding="utf-8",
+        ) as handle:
+            dockerfile = handle.read()
+        with open(
+            os.path.join(root, "dev", "ad-entrypoint.sh"),
+            encoding="utf-8",
+        ) as handle:
+            entrypoint = handle.read()
+        with open(os.path.join(root, "scripts", "dev"), encoding="utf-8") as handle:
+            launcher = handle.read()
+
+        self.assertIn("lowerBound: 10000", dockerfile)
+        self.assertIn("upperBound: 60000", dockerfile)
+        self.assertIn("xattr_tdb:file = /var/lib/samba/state/xattr.tdb", entrypoint)
+        self.assertIn("samba-tool ntacl sysvolcheck", entrypoint)
+        self.assertNotIn("--use-rfc2307", entrypoint)
+        self.assertNotIn("--cap-add SYS_ADMIN", launcher)
 
 
 class TlsSummaryTests(unittest.TestCase):

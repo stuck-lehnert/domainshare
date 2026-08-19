@@ -21,14 +21,32 @@ done
 
 if [[ ! -s /var/lib/samba/private/sam.ldb ]]; then
   log "Provisioning disposable ${AD_REALM} domain"
-  rm -f /etc/samba/smb.conf
+  netbios_name=${HOSTNAME%%.*}
+  netbios_name=${netbios_name^^}
+  mkdir -p /var/lib/samba/state
+  cat > /etc/samba/smb.conf <<EOF
+[global]
+ netbios name = ${netbios_name}
+ realm = ${AD_REALM}
+ workgroup = ${AD_DOMAIN}
+ server role = active directory domain controller
+ xattr_tdb:file = /var/lib/samba/state/xattr.tdb
+
+[sysvol]
+ path = /var/lib/samba/sysvol
+ read only = no
+
+[netlogon]
+ path = /var/lib/samba/sysvol/${AD_DNS_DOMAIN}/scripts
+ read only = no
+EOF
   samba-tool domain provision \
     --server-role=dc \
-    --use-rfc2307 \
     --dns-backend=SAMBA_INTERNAL \
     --realm="$AD_REALM" \
     --domain="$AD_DOMAIN" \
     --adminpass="$AD_ADMIN_PASSWORD"
+  samba-tool ntacl sysvolcheck
 fi
 
 ln -sf /var/lib/samba/private/krb5.conf /etc/krb5.conf
