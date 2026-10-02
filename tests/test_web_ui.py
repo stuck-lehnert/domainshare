@@ -299,53 +299,21 @@ class DomainAuthenticationTests(unittest.TestCase):
         self.assertNotIn("p@ss word", run.call_args_list[0].args[0])
 
 
-class DirectoryPrimaryGroupTests(unittest.TestCase):
-    def test_tree_expands_users_whose_primary_group_is_nested(self):
-        domain_users_dn = "CN=Domänen-Benutzer,CN=Users,DC=example,DC=com"
-        frank_dn = "CN=Frank,CN=Users,DC=example,DC=com"
-        root = {
-            "objectGUID": "root-guid",
-            "objectSid": "S-1-5-21-111-222-333-1200",
-            "samAccountName": "FS_Alle",
-            "shareName": "Alle",
-            "distinguishedName": "CN=FS_Alle,CN=Users,DC=example,DC=com",
-            "memberDns": [domain_users_dn],
-            "objectClasses": {"group"},
-        }
-        domain_users = {
-            "distinguishedname": [(domain_users_dn, False)],
-            "objectsid": [("S-1-5-21-111-222-333-513", False)],
-            "samaccountname": [("Domänen-Benutzer", False)],
-            "displayname": [("Domänen-Benutzer", False)],
-            "objectclass": [("group", False)],
-        }
-        frank = {
-            "distinguishedname": [(frank_dn, False)],
-            "samaccountname": [("frank", False)],
-            "displayname": [("Frank", False)],
-            "primarygroupid": [("513", False)],
-            "objectclass": [("user", False)],
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(
-            web_ui, "STATE_DB", os.path.join(tmpdir, "missing.db")
-        ), mock.patch.object(
-            web_ui.directory, "fetch_fileshare_groups", return_value=[root]
-        ), mock.patch.object(
-            web_ui.directory,
-            "search_directory_entries",
-            side_effect=[[domain_users], [frank]],
-        ):
-            result = web_ui.DirectoryCache().fetch()
-
-        nested_group = result["groups"][0]["members"][0]
-        self.assertEqual(nested_group["sam"], "Domänen-Benutzer")
-        self.assertEqual(
-            [member["sam"] for member in nested_group["members"]],
-            ["frank"],
-        )
-        self.assertEqual(result["groups"][0]["userCount"], 1)
-        self.assertFalse(result["truncated"])
+class DirectoryManagedFolderTests(unittest.TestCase):
+    def test_tree_reads_individual_assignments_without_ad_group_queries(self):
+        connection = mock.Mock()
+        payload = {"groups": [{"folder": "Finance", "userCount": 2}], "truncated": False}
+        with mock.patch.object(web_ui.directory, "open_db", return_value=connection), mock.patch.object(
+            web_ui.access_control, "ensure_schema"
+        ), mock.patch.object(web_ui.access_control, "report_folders", return_value=payload) as report, mock.patch.object(
+            web_ui.directory, "fetch_fileshare_groups"
+        ) as ad_groups:
+            cache = web_ui.DirectoryCache()
+            self.assertEqual(cache.get(), payload)
+            self.assertEqual(cache.get(), payload)
+        report.assert_called_once_with(connection)
+        connection.close.assert_called_once()
+        ad_groups.assert_not_called()
 
 
 class AuditParsingTests(unittest.TestCase):
@@ -1334,7 +1302,7 @@ class WebPresentationTests(unittest.TestCase):
                 share_config = share_config.split(f"[{next_share}]", 1)[0]
             # Audit must wrap recycle so an SMB deletion remains unlinkat in the
             # activity log instead of becoming the recycle module's renameat.
-            self.assertIn("vfs objects = acl_xattr full_audit recycle", share_config)
+            self.assertIn("vfs objects = acl_xattr xattr_tdb full_audit recycle" if share == "Data" else "vfs objects = acl_xattr full_audit recycle", share_config)
             self.assertIn("recycle:repository = .trash/%U", share_config)
             self.assertIn("recycle:keeptree = yes", share_config)
             self.assertIn("recycle:versions = yes", share_config)

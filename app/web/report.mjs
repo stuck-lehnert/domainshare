@@ -184,7 +184,7 @@ export function buildReportSource(data) {
       ["Server", system.hostname || "—"],
       ["Erstellt", formatUtc(generatedAt)],
       ["Verzeichnisstand", formatUtc(groupsSnapshot.fetchedAt)],
-      ["Dateifreigabegruppen", String(groups.length)],
+      ["Datenordner", String(groups.length)],
       ["Verzeichnisabfrage gekürzt", groupsSnapshot.truncated ? "Ja" : "Nein"],
       ["Speicherstand", formatUtc(storage.scannedAt)],
       ["Serverzeit", formatUtc(system.serverTime)],
@@ -203,12 +203,12 @@ export function buildReportSource(data) {
       ["Prüfdauer", formatDecimal(storage.scanSeconds, 3) + " s"],
     ]),
     "",
-    "== Datenbelegung je Gruppenordner",
+    "== Datenbelegung je Datenordner",
     (storage.groups || []).length
       ? reportTable(
         ["1fr", "auto"],
         ["left", "right"],
-        ["Gruppenordner", "Belegung"],
+        ["Datenordner", "Belegung"],
         storage.groups.map(row => [row.name || "—", formatBytes(row.bytes)])
       )
       : "Noch keine Speicherprüfung vorhanden.",
@@ -228,10 +228,10 @@ export function buildReportSource(data) {
       )
       : "Noch keine Speicherprüfung vorhanden.",
     "",
-    "= Dateifreigaben und Mitgliedschaften",
+    "= Dateifreigaben und Benutzerrechte",
     groupsSnapshot.truncated
       ? "#text(weight: \"semibold\")[Hinweis: Die Verzeichnisabfrage wurde gekürzt; die nachfolgende Hierarchie ist nicht vollständig.]"
-      : "Die nachfolgenden Hierarchien zeigen alle wirksamen verschachtelten Mitgliedschaften.",
+      : "Die nachfolgenden Listen zeigen die individuell berechtigten Benutzer je Ordner.",
   ];
 
   for (const group of groups) {
@@ -240,14 +240,12 @@ export function buildReportSource(data) {
     parts.push(keyValueTable([
       ["Freigabename", group.name || "—"],
       ["Ordner", group.folder || "—"],
-      ["Ordnergruppe", group.sam || "—"],
       ["Objekt-GUID", group.guid || "—"],
       ["Status", group.active ? "Aktiv" : "Archiviert"],
       ["Wirksame Benutzer", String(group.userCount || 0)],
-      ["Enthaltene Gruppen", String(group.groupCount || 0)],
     ]));
     const rows = treeRows(group.members || []);
-    parts.push(rows.length ? rows.join("\n") : "Keine direkten Mitglieder.");
+    parts.push(rows.length ? rows.join("\n") : "Keine Benutzer mit Zugriff.");
   }
 
   const backupState = backupLabel(backup.state, backup.enabled);

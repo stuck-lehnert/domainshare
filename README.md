@@ -9,12 +9,12 @@ This repository provides a production-oriented Samba file server container that 
   - `\\server\Private` -> `/data/private`
   - `\\server\Data` -> `/data/groups/data`
   - `\\server\FSLogix` -> `/data/fslogix`
-- FS_* groups are projected as folders inside the Data share (`/data/groups/data/<groupName>`).
-- Data folder ACLs expand nested AD group membership recursively, resolve groups by SID, include `primaryGroupID` membership, and detect group cycles.
-- Group records, normalized activity events, collector offsets, and web caches share one SQLite database at `/state/shares.db`.
-- Group folders are name-based while active and moved to archive on deactivation:
-  - active: `/data/groups/data/<groupName>`
-  - inactive/deleted groups: `/data/groups/archive/<groupName>`
+- Data folders and individual user permissions are managed in the admin web UI. AD remains the source of user identities and authentication.
+- Data access uses Windows ACLs stored in Samba’s protected `/state/data-xattrs.tdb`, with separate read, modify, and delete permissions.
+- Folder and permission records, normalized activity events, collector offsets, and web caches share one SQLite database at `/state/shares.db`.
+- Managed folders are name-based while active and moved to archive through the admin UI:
+  - active: `/data/groups/data/<folderName>`
+  - archived folders: `/data/groups/archive/<folderName>`
 - Samba machine trust/key material is persisted in `/var/lib/samba` to survive container recreation.
 - Container hostname is fixed (`SAMBA_HOSTNAME`) to keep AD computer identity stable.
 - In bridge-mode Docker networking, startup can publish the host LAN IP in AD DNS with `AD_DNS_IP`/`AD_DNS_NAME` instead of the container bridge IP.
@@ -25,7 +25,7 @@ This repository provides a production-oriented Samba file server container that 
 - Samba `full_audit` records successful and failed reads, writes, renames, and deletions on all three shares; FSLogix events are retained in a separate indexed activity stream.
 - A collector normalizes those four actions and persists them in indexed SQLite tables; activity is never automatically deleted.
 - Samba retains deleted files for seven days in per-user recycle repositories on the same data volumes.
-- A plain HTTPS administration console provides statistics and logs plus narrowly scoped actions for trash downloads/restores, manual backups, and share reconciliation. It also includes a fully client-side Typst PDF report.
+- A plain HTTPS administration console manages Data folders and individual user access, and provides statistics, logs, trash downloads/restores, manual backups, and share reconciliation. It also includes a fully client-side Typst PDF report.
 - Web sign-in validates the submitted username/password with Kerberos, permits only users whose winbind group SID set contains `DOMAIN_ADMINS_SID`, and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
 - HTTPS certificates are requested from a configured local Smallstep CA and renewed automatically. Pre-issued certificate files are also supported.
 - Optional remote backups run when `BACKUP_DESTINATION` and `BACKUP_ARCHIVE_PASSWORD` are configured; each active or archived group folder is uploaded as its own encrypted, non-solid 7z archive.
@@ -39,12 +39,32 @@ This repository provides a production-oriented Samba file server container that 
 
 ## Data Folder Lifecycle
 
-The reconciliation script (`/app/reconcile_shares.py`) enforces these rules:
+The **Zugriffsverwaltung** page creates top-level Data folders, assigns a permission level to each existing AD user individually per folder. It can archive folders and restore them without deleting their contents. AD accounts and passwords continue to be administered in AD.
 
-1. New matching `FS_*` group -> insert DB row and create `/data/groups/data/<groupName>`.
-2. Group rename while still matching `FS_*` -> rename/update folder path.
-3. Group removed or no longer matching `FS_*` -> set `isActive=0` and move folder to `/data/groups/archive/...`.
-4. Previously inactive group returns -> set `isActive=1`, move back into `/data/groups/data/...`.
+| Level | Access |
+| --- | --- |
+| 0 | No access; folder hidden |
+| 1 | Read only |
+| 2 | Read, create, and edit; no delete |
+| 3 | Read, create, edit, and delete |
+
+No assignment means no access. Each user has an independent level per folder; level 0 revokes access. There are no access groups. Domain Admins retain full access. Only admins can rename or delete a top-level managed folder.
+
+Level 2 blocks renaming and moving files or directories because SMB requires delete permission for those operations. Applications that save by deleting/replacing a file or renaming a temporary file require level 3. Level 2 still permits overwriting a file’s contents in place.
+
+Saving applies ACL changes recursively when the effective policy changes and disconnects existing Data connections so clients reopen with the new permissions. Changes record the administrator, timestamp, action, and submitted policy in `access_changes`. The five-minute reconciler repairs folder roots and recovers interrupted access updates; `REPAIR_DATA_ACLS=1` forces a full repair.
+
+### Upgrading from FS_* groups
+
+On the first startup, existing active `shares` records are retained. Nested and primary-group memberships are expanded into a snapshot of individual user SIDs, each receiving level 3 on its existing folders. Paths and data are retained. An unresolved group or member stops migration with an error so an incomplete import cannot silently remove access.
+
+After import, AD group renames, membership changes, deletion, and new `FS_*` groups do not change Data folders or access. Manage subsequent changes in the web UI. User assignments are keyed by SID, so renaming an AD account retains its assignments; recreating an account under the same username does not inherit them.
+
+Installations using the previous app-local group model are upgraded atomically to individual assignments. The highest prior group grant is retained per user and folder, with existing direct assignments taking precedence, including level 0. Archived folder assignments are preserved. Group tables and group mutation actions are removed.
+
+A new installation starts without assignments. Existing untracked Data directories are adopted with admin-only access. Previously archived folders remain archived and need explicit permissions before users can access them after restoration.
+
+The Data share uses Samba Windows ACL checks instead of POSIX ACLs. Keep its data volumes private to the container; direct local or NFS access is outside this permission model. The protected TDB store avoids requiring extra container capabilities. After restoring Data to different filesystem inodes, run reconciliation with `REPAIR_DATA_ACLS=1` to rebuild ACL records. Trash restoration applies the current folder policy before exposing the restored file.
 
 ## Shared SQLite State Database
 
@@ -52,7 +72,8 @@ The default database path is `/state/shares.db`; `STATE_DB_PATH` can override it
 
 The database contains:
 
-- `shares`: AD group-to-folder lifecycle and ACL reconciliation state;
+- `shares`: managed folder lifecycle and ACL reconciliation state;
+- `access_users`, `folder_permissions`, `access_settings`, and `access_changes`: managed access rules, cached AD identities, migration state, and administrative change history;
 - `audit_events`: normalized read, write, move, and delete events;
 - `audit_sources`: Samba log inode/offset checkpoints;
 - `audit_event_dedup`: bounded, persistent fingerprints for restart-safe main-read and FSLogix-event deduplication;
@@ -70,10 +91,9 @@ Standard SQLite does not provide transparent general-purpose compression, so thi
 - Existing AD DS domain reachable from the Docker host.
 - Initial admin credentials with rights to create/reset `FileShare_ServiceAccount` during `./setup`.
 - `FileShare_ServiceAccount` must be allowed to join computers to the domain (`net ads join`) in your AD policy.
-- Dynamic group discovery primarily uses machine-account LDAP (`net ads search -P`); join credentials are only used as a fallback LDAP bind path.
-- Group naming convention for Data folder eligibility:
-  - `FS_<Anything>`
-- Folder names use AD group display names (`displayName`, then `name`/`cn` fallback), not pre-2000 (`sAMAccountName`) names.
+- Directory reads use machine-account LDAP (`net ads search -P`); join credentials are only used as a fallback LDAP bind path.
+- Existing AD users are selectable by the administrator; no AD group naming convention is required for new Data folders.
+- Machine-account LDAP reads provide the user list and the one-time legacy membership import.
 
 ## DNS Requirements
 
@@ -101,6 +121,7 @@ Kerberos requires close time alignment.
 - `README.md`
 - `app/init.sh`
 - `app/reconcile_shares.py`
+- `app/access_control.py`
 - `app/backup_to_destination.py`
 - `app/audit_collector.py`
 - `app/audit_store.py`
@@ -180,7 +201,8 @@ The E2E suite verifies:
 
 - CA-issued TLS, hostname validation, HSTS, and CSP;
 - anonymous rejection, bad credentials, valid non-admin rejection, real Domain Admin login, JWT claims, bearer use, cookie flags, tamper rejection, and logout;
-- domain trust, group-to-folder mapping, nested and transitive group trees;
+- domain trust, one-time legacy folder/membership migration, and individual folder assignments;
+- admin-managed membership, all four SMB access levels, hidden-folder behavior, inheritance, ACL-edit rejection, revocation, and archive/restore;
 - SMB allow/deny behavior and real file operations;
 - Data, Private, and FSLogix usage aggregation;
 - high-level `full_audit` ingestion for all four actions, service-account exclusion, filters, facets, and pagination;
@@ -192,6 +214,18 @@ The E2E suite verifies:
 - the log-free PDF report snapshot plus local Typst wrapper, WebAssembly, font MIME types, and immutable caching.
 
 The runner returns non-zero on the first failed assertion, prints bounded logs from every run-scoped service, and always removes its containers, volumes, network, and temporary CA root. Set `DEV_SKIP_BUILD=1` for a fast rerun against existing local images.
+
+### Browser checks for access administration
+
+`tests/access_ui_smoke.mjs` drives Chromium with Playwright against the real frontend and a simulated API containing representative folders and 80 AD users. It checks individual permission editing, user search and access filters, unsaved-change protection, failed saves and retries, preserved selection, folder creation, archive/restore, layouts from 390 to 1500 pixels wide, and consistency with the existing admin control styles. It writes desktop and mobile screenshots for visual review.
+
+With Playwright available to Node:
+
+```bash
+node tests/access_ui_smoke.mjs
+```
+
+`PLAYWRIGHT_MODULE` can point to an external Playwright installation; `PLAYWRIGHT_BROWSERS_PATH` selects its browser cache. `SCREENSHOT_DIR` chooses the screenshot destination; otherwise the runner creates a temporary directory and prints its path. These browser checks use fixture data; `scripts/test-e2e` verifies the real AD/SMB backend.
 
 ## Setup
 
@@ -274,12 +308,12 @@ The runner returns non-zero on the first failed assertion, prints bounded logs f
 
 - Share: `\\server\Data`
 - Path: `/data/groups/data`
-- Contains one folder per active `FS_*` AD group.
-- Root is discoverable as one share, while access to each group folder is enforced via POSIX/ACL group permissions.
-- `FS_*` groups may contain other AD groups; reconciliation recursively grants ACLs to nested groups and logs detected cycles.
-- Samba blocks SMB-side ACL edits on Data and forces new items to inherit the group folder owner, group, mode, and default ACLs.
-- Normal reconciliation refreshes each group folder root; recursive subtree repair runs only when the resolved ACL signature changes, is missing, or `REPAIR_DATA_ACLS=1` is set.
-- Dot-prefixed group folder names are allowed and are not hidden over SMB.
+- Contains the active top-level folders created or imported into the admin UI.
+- Windows ACLs enforce each user’s effective level, including separate delete rights.
+- Samba’s `acl_xattr` and `xattr_tdb` modules retain the ACLs in a protected store. Local access to the underlying volumes must remain restricted.
+- New files and directories inherit the managed ACL. Users cannot change ACLs or take ownership to grant themselves more access.
+- Normal reconciliation refreshes each folder root; recursive repair runs when its effective permission signature changes, is missing, or `REPAIR_DATA_ACLS=1` is set.
+- Dot-prefixed folder names are allowed and are not hidden over SMB.
 - No guest access.
 
 ### FSLogix
@@ -304,20 +338,21 @@ Open `https://<WEB_HOSTNAME>/` after setup. Only members of the group identified
 
 The console is intentionally operational and plain:
 
-- **Overview**: current capacity totals, active group count, recent activity, and backup state.
-- **File shares**: one selectable tree per active `FS_*` group/folder with recursively expanded user, nested-group, and AD primary-group membership, cycle markers, and a live filter.
+- **Overview**: current capacity totals, active folder count, recent activity, and backup state.
+- **File shares**: one selectable tree per active managed folder with its individually assigned users.
+- **Zugriffsverwaltung**: create/archive/restore Data folders and assign levels 0–3 to existing AD users individually per folder.
 - **Data usage**: cached recursive size of every top-level `/Data` group folder.
 - **User usage**: per-user `/Private + /FSLogix` totals with component sizes.
 - **Activity**: dynamic date, user, share, action, result, and path filters with pagination.
 - **Trash**: list seven-day recycle entries across all shares, download a retained file, or restore it without overwriting an existing path.
 - **Share reconciliation**: manually force reconciliation and follow its phase, progress bar, current group, and live output.
 - **Backups**: manually start a backup and follow live progress, active transfer rows, snapshot name, trigger, and recent output.
-- **PDF report**: storage totals and every storage row, complete group/folder membership hierarchies, current backup state, system checks, and TLS certificate data.
+- **PDF report**: storage totals and every storage row, individual folder/user assignments, current backup state, system checks, and TLS certificate data.
 - **System**: domain trust, Samba configuration, TLS certificate, scanner, and activity database health.
 
 The PDF report deliberately excludes the activity log and backup log. Its dedicated snapshot endpoint removes those fields before returning data. Typst, its WebAssembly compiler, and the report fonts are shipped with the application; Typst source and PDF bytes are created only in the authenticated browser and are never uploaded to another service. The first export downloads roughly 22 MiB of compiler/font assets, which are then cached as immutable files. The CSP grants only `'wasm-unsafe-eval'` for WebAssembly compilation and does not enable JavaScript `'unsafe-eval'`.
 
-The operational mutation endpoints restore a retained file or start an immediate backup/share reconciliation; all require the same Domain Admin JWT as every protected page. Restore cannot overwrite a live file. The console cannot otherwise edit files, groups, ACL rules, backup schedules, retention, or `BACKUP_AUTO_ENABLED`. Automatic backups can be enabled or disabled only through the environment and therefore require a redeployment/restart.
+The mutation endpoints manage Data access (`POST /api/access`), restore retained files, or start an immediate backup/share reconciliation; all require the same Domain Admin JWT as every protected page. Restore cannot overwrite a live file. Backup schedules, retention, and `BACKUP_AUTO_ENABLED` are configured through the environment. Automatic backups can be enabled or disabled only through the environment and therefore require a redeployment/restart.
 
 ### Authentication and sessions
 
@@ -398,7 +433,6 @@ Useful optional settings:
 | `WEB_LOGIN_ATTEMPTS_PER_5_MIN` | `10` | Per-address login attempt limit |
 | `WEB_USAGE_SCAN_INTERVAL_SECONDS` | `900` | Recursive storage scan interval |
 | `WEB_DIRECTORY_CACHE_SECONDS` | `300` | AD membership tree cache time |
-| `WEB_MAX_GROUP_NODES` | `10000` | Membership expansion safety limit |
 | `TRASH_RETENTION_DAYS` | `7` | Recycled-file lifetime; cleanup accepts 1 to 365 days |
 | `STATE_DB_PATH` | `/state/shares.db` | Shared SQLite database for shares, activity, collector offsets, and caches |
 | `AUDIT_QUERY_MAX_DAYS` | `31` | Largest activity query window |
@@ -542,30 +576,18 @@ docker compose exec samba python3 -m json.tool /state/reconcile-status.json
   docker compose exec samba wbinfo -g
   ```
 
-### Data folders not appearing
+### Data folders or access missing
 
-- Confirm AD groups match `FS_*`.
-- Run manual reconciliation and inspect logs:
+- Check **Zugriffsverwaltung**: the folder must be active, and the user must have an individual assignment.
+- Level 0 revokes access. Changes to AD `FS_*` membership do not change imported individual assignments.
+- Check the reconciliation status and logs if the one-time import or an ACL update fails:
 
   ```bash
   docker compose exec samba python3 /app/reconcile_shares.py
   docker compose exec samba tail -n 100 /var/log/reconcile.log
   ```
 
-### Nested or primary Data group access fails
-
-- Check reconciliation logs for detected group cycles or unresolved nested members.
-- The reconciler resolves group SIDs to GIDs first, so localized names such as `Domänen-Benutzer` do not affect ACL generation.
-- Verify the SID mapping, the user's primary/supplementary groups, and the resulting ACL:
-
-  ```bash
-  docker compose exec samba wbinfo --name-to-sid 'EXAMPLE\Domänen-Benutzer'
-  docker compose exec samba wbinfo --sid-to-gid S-1-5-21-...-513
-  docker compose exec samba id 'EXAMPLE\alice'
-  docker compose exec samba getfacl /data/groups/data/<groupName>
-  ```
-
-Users whose group is represented only by AD `primaryGroupID` are included automatically; they do not need to appear in the group's LDAP `member` attribute.
+- Inspect Windows ACLs with `smbcacls //server/Data '<folder>' -U 'DOMAIN\admin'`; `getfacl` does not show the enforced Data permissions.
 
 ### Data folder permissions are incorrect
 
@@ -611,5 +633,5 @@ Users whose group is represented only by AD `primaryGroupID` are included automa
 ## Notes
 
 - User data is never automatically deleted.
-- Inactive/deleted FS_* groups are moved to `/data/groups/archive`.
+- Folders archived in the admin UI are moved to `/data/groups/archive`; AD group deletion does not move folders.
 - Data and state survive container restarts via named Docker volumes (`/data/*`, `/state`, `/var/lib/samba`).

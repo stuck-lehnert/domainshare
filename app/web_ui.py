@@ -27,10 +27,10 @@ from typing import Dict, List, Optional, Tuple
 
 try:
     from app import reconcile_shares as directory
-    from app import trash
+    from app import trash, access_control
 except ImportError:  # Container execution uses /app as the import root.
     import reconcile_shares as directory
-    import trash
+    import trash, access_control
 
 try:
     from app.audit_store import (
@@ -577,25 +577,9 @@ class UsageScanner:
             self.stop.wait(self.interval)
 
 
-def display_name(entry) -> str:
-    return (
-        directory.ldap_first(entry, "displayName")
-        or directory.ldap_first(entry, "sAMAccountName")
-        or directory.ldap_first(entry, "cn")
-        or directory.entry_dn(entry).split(",", 1)[0].removeprefix("CN=")
-        or "Unbekannt"
-    )
-
-
 class DirectoryCache:
-    ATTRS = [
-        "objectGUID", "objectSid", "distinguishedName", "sAMAccountName",
-        "displayName", "cn", "objectClass", "member", "primaryGroupID",
-    ]
-
     def __init__(self):
         self.ttl = env_int("WEB_DIRECTORY_CACHE_SECONDS", 300, 30, 3600)
-        self.max_nodes = env_int("WEB_MAX_GROUP_NODES", 10000, 100, 100000)
         self.lock = threading.Lock()
         self.cached_at = 0.0
         self.value: Dict[str, object] = {"groups": [], "fetchedAt": None}
@@ -609,173 +593,12 @@ class DirectoryCache:
             return self.value
 
     def fetch(self) -> Dict[str, object]:
-        roots = directory.fetch_fileshare_groups()
-        entries: Dict[str, object] = {}
-        pending = deque()
-        for root in roots:
-            for dn in root.get("memberDns", []):
-                pending.append(str(dn))
-        requested = set()
-        while pending and len(entries) < self.max_nodes:
-            batch = []
-            while pending and len(batch) < 100:
-                dn = pending.popleft()
-                key = directory.normalize_dn(dn)
-                if not key or key in requested:
-                    continue
-                requested.add(key)
-                batch.append(dn)
-            if not batch:
-                continue
-            for entry in directory.search_directory_entries(
-                directory.build_distinguished_name_filter(batch), self.ATTRS
-            ):
-                key = directory.normalize_dn(directory.entry_dn(entry))
-                if not key:
-                    continue
-                entries[key] = entry
-                classes = {value.lower() for value in directory.ldap_values(entry, "objectClass")}
-                if "group" in classes:
-                    pending.extend(directory.ldap_values(entry, "member"))
-
-        group_keys_by_primary_rid: Dict[int, List[str]] = {}
-        for root in roots:
-            root_key = directory.normalize_dn(str(root.get("distinguishedName") or ""))
-            rid = directory.sid_rid(str(root.get("objectSid") or ""))
-            if root_key and rid is not None:
-                group_keys_by_primary_rid.setdefault(rid, []).append(root_key)
-        for key, entry in entries.items():
-            classes = {
-                value.lower()
-                for value in directory.ldap_values(entry, "objectClass")
-            }
-            if "group" not in classes:
-                continue
-            principal = directory.parse_principal_from_entry(entry)
-            rid = directory.sid_rid(
-                str(principal.get("objectSid") or "") if principal else ""
-            )
-            if rid is not None:
-                group_keys_by_primary_rid.setdefault(rid, []).append(key)
-
-        primary_members: Dict[str, List[str]] = {}
-        primary_members_truncated = False
-        if group_keys_by_primary_rid and len(entries) < self.max_nodes:
-            primary_entries = directory.search_directory_entries(
-                directory.build_primary_group_users_filter(
-                    group_keys_by_primary_rid.keys()
-                ),
-                self.ATTRS,
-            )
-            for entry in primary_entries:
-                key = directory.normalize_dn(directory.entry_dn(entry))
-                rid = directory.parse_int(
-                    directory.ldap_first(entry, "primaryGroupID") or "",
-                    -1,
-                )
-                if not key or rid not in group_keys_by_primary_rid:
-                    continue
-                if key not in entries and len(entries) >= self.max_nodes:
-                    primary_members_truncated = True
-                    continue
-                entries[key] = entry
-                for group_key in group_keys_by_primary_rid[rid]:
-                    primary_members.setdefault(group_key, []).append(
-                        directory.entry_dn(entry)
-                    )
-        elif group_keys_by_primary_rid:
-            primary_members_truncated = True
-
-        def effective_members(group_key: str, explicit_dns) -> List[str]:
-            result = []
-            seen = set()
-            for dn in [*explicit_dns, *primary_members.get(group_key, [])]:
-                key = directory.normalize_dn(str(dn))
-                if key and key not in seen:
-                    seen.add(key)
-                    result.append(str(dn))
-            return result
-
-        folder_map = {}
+        conn = directory.open_db()
         try:
-            conn = connect_state_db(STATE_DB, read_only=True)
-            try:
-                folder_map = {
-                    row[0]: {"folder": os.path.basename(row[1]), "active": bool(row[2])}
-                    for row in conn.execute("SELECT objectGUID, path, isActive FROM shares")
-                }
-            finally:
-                conn.close()
-        except sqlite3.Error:
-            pass
-
-        def make_node(dn: str, ancestors: set) -> Dict[str, object]:
-            key = directory.normalize_dn(dn)
-            entry = entries.get(key)
-            if entry is None:
-                return {"id": dn, "name": dn, "sam": "", "type": "unknown", "members": []}
-            classes = {value.lower() for value in directory.ldap_values(entry, "objectClass")}
-            node_type = "group" if "group" in classes else "computer" if "computer" in classes else "user"
-            node = {
-                "id": directory.entry_dn(entry),
-                "name": display_name(entry),
-                "sam": directory.ldap_first(entry, "sAMAccountName") or "",
-                "type": node_type,
-                "members": [],
-            }
-            if key in ancestors:
-                node["cycle"] = True
-                return node
-            if node_type == "group":
-                next_ancestors = {*ancestors, key}
-                node["members"] = [
-                    make_node(child, next_ancestors)
-                    for child in effective_members(
-                        key,
-                        directory.ldap_values(entry, "member"),
-                    )
-                ]
-            return node
-
-        group_rows = []
-        for root in sorted(roots, key=lambda item: str(item["shareName"]).casefold()):
-            root_key = directory.normalize_dn(
-                str(root.get("distinguishedName") or "")
-            )
-            members = [
-                make_node(dn, set())
-                for dn in effective_members(root_key, root.get("memberDns", []))
-            ]
-            flat_users = set()
-            flat_groups = set()
-
-            def count_nodes(nodes):
-                for node in nodes:
-                    target = flat_groups if node["type"] == "group" else flat_users if node["type"] == "user" else None
-                    if target is not None:
-                        target.add(str(node.get("sam") or node["id"]).casefold())
-                    count_nodes(node.get("members", []))
-
-            count_nodes(members)
-            folder = folder_map.get(str(root["objectGUID"]), {})
-            group_rows.append(
-                {
-                    "guid": root["objectGUID"],
-                    "name": root["shareName"],
-                    "sam": root["samAccountName"],
-                    "folder": folder.get("folder", root["shareName"]),
-                    "active": folder.get("active", True),
-                    "userCount": len(flat_users),
-                    "groupCount": len(flat_groups),
-                    "members": members,
-                }
-            )
-        return {
-            "groups": group_rows,
-            "fetchedAt": now_utc().isoformat(timespec="seconds"),
-            "truncated": bool(pending) or primary_members_truncated,
-        }
-
+            access_control.ensure_schema(conn)
+            return access_control.report_folders(conn)
+        finally:
+            conn.close()
 
 
 
@@ -1021,12 +844,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.UNAUTHORIZED, "Anmeldung erforderlich")
         return value
 
-    def read_json_body(self) -> Dict[str, object]:
+    def read_json_body(self, maximum: int = 16384) -> Dict[str, object]:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
             raise ValueError("Ungültige Anfragelänge") from exc
-        if length <= 0 or length > 16384:
+        if length <= 0 or length > maximum:
             raise ValueError("Ungültiger Anfrageinhalt")
         try:
             value = json.loads(self.rfile.read(length))
@@ -1101,13 +924,53 @@ class Handler(BaseHTTPRequestHandler):
             cookie = f"{JWT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
             self.send_json({"ok": True}, cookie=cookie)
             return
+        if parsed.path == "/api/access":
+            user = self.require_user()
+            if user is None:
+                return
+            try:
+                body = self.read_json_body(1024 * 1024)
+                with access_control.mutation_lock():
+                    conn = directory.open_db()
+                    try:
+                        access_control.migrate(conn)
+                        users, _ = access_control.read_directory()
+                        result = access_control.apply_change(conn, body, str(user["sub"]), users)
+                    finally:
+                        conn.close()
+                with APP.directory.lock:
+                    APP.directory.cached_at = 0
+                log(f"{user['sub']} changed folder access: {body.get('action')}")
+                self.send_json(result)
+            except access_control.AccessConflict as exc:
+                self.send_error_json(HTTPStatus.CONFLICT, str(exc))
+            except (ValueError, sqlite3.IntegrityError) as exc:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            except (OSError, RuntimeError) as exc:
+                log(f"Access management failed: {exc}")
+                self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            return
+
         if parsed.path == "/api/trash/restore":
             user = self.require_user()
             if user is None:
                 return
             try:
                 body = self.read_json_body()
-                result = trash.restore_item(str(body.get("id", "")))
+                item_id = str(body.get("id", ""))
+                share, _ = trash.decode_item_id(item_id)
+                if share == "Data":
+                    with access_control.mutation_lock():
+                        conn = directory.open_db()
+                        try:
+                            result = trash.restore_item(item_id, prepare=lambda path, fd: access_control.prepare_data_restore(conn, path, fd))
+                        finally:
+                            conn.close()
+                else:
+                    result = trash.restore_item(item_id)
+            except access_control.AccessConflict as exc:
+                self.send_error_json(HTTPStatus.CONFLICT, str(exc))
+                return
             except FileExistsError:
                 self.send_error_json(
                     HTTPStatus.CONFLICT,
@@ -1174,6 +1037,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"user": user["sub"], "expiresAt": user["exp"]})
                 elif path == "/api/overview":
                     self.send_json(APP.overview())
+                elif path == "/api/access":
+                    conn = directory.open_db()
+                    try:
+                        access_control.ensure_schema(conn)
+                        users, _ = access_control.read_directory()
+                        access_control.cache_users(conn, users)
+                        conn.commit()
+                        self.send_json(access_control.snapshot(conn, users))
+                    finally:
+                        conn.close()
                 elif path == "/api/groups":
                     self.send_json(APP.directory.get())
                 elif path == "/api/storage":

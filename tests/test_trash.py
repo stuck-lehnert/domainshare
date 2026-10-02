@@ -74,6 +74,25 @@ class TrashTests(unittest.TestCase):
                     self.assertEqual(handle.read(), b"spreadsheet")
                 self.assertEqual(os.stat(destination).st_ino, before.st_ino)
 
+    def test_restore_prepares_current_acl_before_destination_becomes_visible(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self.roots(tmpdir)
+            with mock.patch.dict(os.environ, env):
+                trash.ensure_trash_roots()
+                source = self.recycled_file(env["GROUP_ROOT"], "alice/Finance/report.txt")
+                destination = os.path.join(env["GROUP_ROOT"], "Finance", "report.txt")
+                called = []
+
+                def prepare(path, fd):
+                    self.assertEqual(path, "Finance/report.txt")
+                    self.assertFalse(os.path.exists(destination))
+                    self.assertEqual(os.fstat(fd).st_ino, os.stat(source).st_ino)
+                    called.append(True)
+
+                trash.restore_item(trash.encode_item_id("Data", "alice/Finance/report.txt"), prepare=prepare)
+                self.assertEqual(called, [True])
+                self.assertTrue(os.path.exists(destination))
+
     def test_restore_never_overwrites_existing_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             env = self.roots(tmpdir)

@@ -76,6 +76,7 @@ function notice(message) {
 }
 
 function showLogin() {
+  state.accessDirty = false;
   clearInterval(state.timer);
   state.session = null;
   appView.hidden = true;
@@ -101,6 +102,7 @@ function badge(text, kind = "") { return `<span class="badge ${kind}">${esc(text
 function routeFor(path) {
   if (path.startsWith("/storage/data")) return "storage-data";
   if (path.startsWith("/storage/users")) return "storage-users";
+  if (path.startsWith("/access")) return "access";
   if (path.startsWith("/shares")) return "shares";
   if (path.startsWith("/reconciliation")) return "reconciliation";
   if (path.startsWith("/activity/fslogix")) return "activity-fslogix";
@@ -113,6 +115,12 @@ function routeFor(path) {
 }
 
 async function navigate(path, replace = false) {
+  if (state.accessDirty && !window.confirm("Ungespeicherte Änderungen verwerfen?")) {
+    if (replace && state.currentPath) history.replaceState({}, "", state.currentPath);
+    return;
+  }
+  state.accessDirty = false;
+  state.currentPath = path;
   clearInterval(state.timer);
   state.timer = null;
   const route = routeFor(path);
@@ -123,6 +131,7 @@ async function navigate(path, replace = false) {
   try {
     if (route === "overview") await renderOverview();
     if (route === "shares") await renderShares();
+    if (route === "access") await renderAccess();
     if (route === "reconciliation") await renderReconciliation();
     if (route === "storage-data") await renderStorage("data");
     if (route === "storage-users") await renderStorage("users");
@@ -158,7 +167,7 @@ async function renderOverview() {
     <section class="cards">
       <article class="card"><span class="label">Daten</span><span class="value">${bytes(totals.dataBytes)}</span></article>
       <article class="card"><span class="label">Private + FSLogix</span><span class="value">${bytes(Number(totals.privateBytes || 0) + Number(totals.fslogixBytes || 0))}</span></article>
-      <article class="card"><span class="label">Aktive Gruppen</span><span class="value">${esc(data.activeGroups)}</span></article>
+      <article class="card"><span class="label">Aktive Datenordner</span><span class="value">${esc(data.activeGroups)}</span></article>
       <article class="card"><span class="label">Ereignisse · 48 Std.</span><span class="value">${esc(data.eventCount)}</span></article>
     </section>
     <section class="split">
@@ -178,7 +187,7 @@ async function renderOverview() {
 function usageTable(rows, type) {
   if (!rows.length) return empty("Die erste Speicherprüfung ist noch nicht abgeschlossen.");
   const maximum = Math.max(...rows.map(row => Number(type === "group" ? row.bytes : row.totalBytes)), 1);
-  return `<div class="table-wrap"><table><thead><tr><th>${type === "group" ? "Gruppenordner" : "Benutzer"}</th>${type === "user" ? "<th>Private</th><th>FSLogix</th>" : ""}<th>Belegung</th><th></th></tr></thead><tbody>${rows.map(row => {
+  return `<div class="table-wrap"><table><thead><tr><th>${type === "group" ? "Datenordner" : "Benutzer"}</th>${type === "user" ? "<th>Private</th><th>FSLogix</th>" : ""}<th>Belegung</th><th></th></tr></thead><tbody>${rows.map(row => {
     const value = Number(type === "group" ? row.bytes : row.totalBytes);
     return `<tr><td><strong>${esc(row.name)}</strong></td>${type === "user" ? `<td class="numeric">${bytes(row.privateBytes)}</td><td class="numeric">${bytes(row.fslogixBytes)}</td>` : ""}<td class="numeric">${bytes(value)}</td><td class="usage-bar"><progress max="${maximum}" value="${value}"></progress></td></tr>`;
   }).join("")}</tbody></table></div>`;
@@ -202,10 +211,10 @@ async function renderShares() {
   const data = await api("/api/groups");
   state.groups = data;
   const groups = data.groups || [];
-  content.innerHTML = `<div class="shares-view">` + pageHead("Dateifreigaben", "FS_*-Ordnergruppen und ihre wirksamen verschachtelten Mitgliedschaften.", `<span class="muted">Verzeichnisstand ${esc(utcTime(data.fetchedAt))}</span>`) + `
-    ${data.truncated ? `<p>${badge("Ergebnis gekürzt", "warn")} WEB_MAX_GROUP_NODES erhöhen, um alle Mitglieder anzuzeigen.</p>` : ""}
+  content.innerHTML = `<div class="shares-view">` + pageHead("Dateifreigaben", "Verwaltete Ordner und ihre individuellen Benutzerberechtigungen.", `<span class="muted">Verzeichnisstand ${esc(utcTime(data.fetchedAt))}</span>`) + `
+    ${data.truncated ? `<p>${badge("Ergebnis gekürzt", "warn")} Mitgliedschaftsliste ist unvollständig.</p>` : ""}
     <section class="split shares-split">
-      <article class="panel"><div class="panel-head"><h2>Gruppenordner</h2><span>${groups.length}</span></div><input id="group-filter" type="search" placeholder="Gruppen oder Mitglieder filtern"><ul id="group-list" class="list"></ul></article>
+      <article class="panel"><div class="panel-head"><h2>Datenordner</h2><span>${groups.length}</span></div><input id="group-filter" type="search" placeholder="Ordner oder Benutzer filtern"><ul id="group-list" class="list"></ul></article>
       <article class="panel"><div id="tree-panel"></div></article>
     </section></div>`;
   const list = document.querySelector("#group-list");
@@ -215,13 +224,193 @@ async function renderShares() {
   const draw = () => {
     const visible = groups.filter(group => `${group.name} ${group.sam} ${group.folder}`.toLowerCase().includes(query) || group.members.some(node => nodeMatches(node, query)));
     if (selected && !visible.includes(selected)) selected = visible[0] || null;
-    list.innerHTML = visible.length ? visible.map(group => `<li><button class="select-row ${group === selected ? "active" : ""}" data-guid="${esc(group.guid)}"><span><strong>${esc(group.folder)}</strong><br><span class="muted">${esc(group.sam)}</span></span><span>${group.userCount} Benutzer<br>${group.groupCount} Gruppen</span></button></li>`).join("") : empty("Keine Gruppe entspricht dem Filter.");
-    if (!selected) tree.innerHTML = empty("Gruppenordner auswählen.");
-    else tree.innerHTML = `<div class="panel-head"><div><h2>${esc(selected.folder)}</h2><span class="muted">${esc(selected.sam)} · ${selected.userCount} wirksame Benutzer</span></div>${selected.active ? badge("Aktiv") : badge("Archiviert", "warn")}</div><div class="tree">${treeNodes(selected.members, query) || empty("Keine direkten Mitglieder")}</div>`;
+    list.innerHTML = visible.length ? visible.map(group => `<li><button class="select-row ${group === selected ? "active" : ""}" data-guid="${esc(group.guid)}"><span><strong>${esc(group.folder)}</strong><br><span class="muted">${esc(group.sam)}</span></span><span>${group.userCount} Benutzer</span></button></li>`).join("") : empty("Kein Ordner entspricht dem Filter.");
+    if (!selected) tree.innerHTML = empty("Datenordner auswählen.");
+    else tree.innerHTML = `<div class="panel-head"><div><h2>${esc(selected.folder)}</h2><span class="muted">${esc(selected.sam)} · ${selected.userCount} wirksame Benutzer</span></div>${selected.active ? badge("Aktiv") : badge("Archiviert", "warn")}</div><div class="tree">${treeNodes(selected.members, query) || empty("Keine Benutzer mit Zugriff")}</div>`;
     list.querySelectorAll("button[data-guid]").forEach(button => button.addEventListener("click", () => { selected = groups.find(group => group.guid === button.dataset.guid); draw(); }));
   };
   document.querySelector("#group-filter").addEventListener("input", event => { query = event.target.value.trim().toLowerCase(); draw(); });
   draw();
+}
+
+const permissionLabels = ["Kein Zugriff", "Lesen", "Lesen + Ändern", "Lesen + Ändern + Löschen"];
+
+async function renderAccess() {
+  let data = await api("/api/access");
+  let folderId = data.folders.find(folder => folder.active)?.id || data.folders[0]?.id;
+  let rules = [], query = "", userQuery = "", userFilter = "all", busy = false;
+  let folderFilter = data.folders.length && !data.folders.some(item => item.active) ? "archived" : "active";
+  const folder = () => data.folders.find(item => item.id === folderId);
+  const normalizedRules = value => JSON.stringify(value.filter(rule => rule.level > 0).map(rule => [rule.principalId, rule.level]).sort((a, b) => a[0].localeCompare(b[0])));
+  const loadDraft = () => {
+    rules = (folder()?.permissions || []).filter(rule => rule.level > 0).map(rule => ({...rule}));
+    state.accessDirty = false;
+  };
+  const dirty = () => normalizedRules(rules) !== normalizedRules(folder()?.permissions || []);
+  const canLeave = () => !dirty() || window.confirm("Ungespeicherte Änderungen verwerfen?");
+  const levelFor = sid => rules.find(rule => rule.principalId === sid)?.level || 0;
+  content.innerHTML = `<div class="access-view">${pageHead("Zugriffsverwaltung", "Individuelle Benutzerrechte je Datenordner festlegen.")}
+    <div id="access-message" role="status" hidden></div>
+    <div class="access-workspace">
+      <aside class="access-browser" aria-label="Ordnerauswahl">
+        <div class="access-browser-head"><h2>Datenordner</h2><button type="button" id="access-create">Neuer Ordner</button></div>
+        <label class="access-search"><span class="sr-only">Ordner suchen</span><input id="access-search" type="search" placeholder="Ordner suchen"></label>
+        <label class="access-status-filter"><span class="sr-only">Ordnerstatus</span><select id="folder-status"><option value="active">Aktive Ordner</option><option value="archived">Archivierte Ordner</option><option value="all">Alle Ordner</option></select></label>
+        <div id="access-list" class="access-list"></div>
+      </aside>
+      <section id="access-detail" class="access-detail" aria-labelledby="access-folder-title"></section>
+    </div>
+  </div>`;
+  const root = content.querySelector(".access-view");
+  const detail = root.querySelector("#access-detail");
+  const message = root.querySelector("#access-message");
+
+  function updateDirty() {
+    state.accessDirty = dirty();
+    const status = detail.querySelector("#access-save-state");
+    if (status) status.textContent = busy ? "Änderungen werden angewendet…" : dirty() ? "Ungespeicherte Änderungen" : "Alle Änderungen gespeichert";
+    const save = detail.querySelector("#access-save");
+    if (save) save.disabled = busy || !dirty() || !folder()?.active;
+    const discard = detail.querySelector("#access-discard");
+    if (discard) discard.hidden = !dirty();
+  }
+
+  async function save(body) {
+    if (busy) return;
+    busy = true;
+    message.hidden = true;
+    root.querySelectorAll("button,input,select").forEach(input => { input.disabled = true; });
+    updateDirty();
+    try {
+      data = await api("/api/access", {method: "POST", body: JSON.stringify(body)});
+      if (body.action === "create-folder") {
+        folderFilter = "active"; query = ""; userQuery = ""; userFilter = "all";
+        folderId = data.folders.find(item => item.name === body.name.trim())?.id;
+      }
+      if (body.action === "archive-folder") folderFilter = "archived";
+      if (body.action === "restore-folder") folderFilter = "active";
+      if (!root.isConnected) return;
+      loadDraft(); draw();
+      message.className = "access-message success";
+      message.textContent = "Gespeichert. Die Änderungen sind wirksam.";
+      message.hidden = false;
+    } catch (error) {
+      if (!root.isConnected) return;
+      message.className = "access-message failure";
+      message.textContent = error.message;
+      message.hidden = false;
+      message.scrollIntoView({block: "nearest"});
+    } finally {
+      busy = false;
+      if (root.isConnected) {
+        root.querySelectorAll("button,input,select").forEach(input => { input.disabled = false; });
+        detail.querySelectorAll("[data-unavailable]").forEach(input => { input.disabled = true; });
+        updateDirty();
+      }
+    }
+  }
+
+  function dialog(title, explanation, label, action, initial = null, danger = false) {
+    const modal = document.createElement("dialog");
+    modal.className = "access-dialog";
+    modal.setAttribute("aria-label", title);
+    modal.innerHTML = `<form><h2>${esc(title)}</h2><p>${esc(explanation)}</p>${initial !== null ? `<label>Name<input value="${esc(initial)}" maxlength="120" required autofocus></label>` : ""}<div class="access-dialog-actions"><button type="button" data-cancel>Abbrechen</button><button type="submit" class="${danger ? "access-danger" : ""}">${esc(label)}</button></div></form>`;
+    document.body.append(modal);
+    modal.querySelector("[data-cancel]").addEventListener("click", () => modal.close());
+    modal.addEventListener("close", () => modal.remove());
+    modal.querySelector("form").addEventListener("submit", event => {
+      event.preventDefault();
+      const input = modal.querySelector("input"), name = input?.value.trim();
+      if (initial !== null && !name) { input.setCustomValidity("Bitte einen Namen eingeben."); input.reportValidity(); return; }
+      modal.close(); action(name);
+    });
+    modal.querySelector("input")?.addEventListener("input", event => event.target.setCustomValidity(""));
+    modal.showModal(); modal.querySelector("input")?.focus();
+  }
+
+  function drawList() {
+    const items = data.folders.filter(item => folderFilter === "all" || item.active === (folderFilter === "active"))
+      .filter(item => item.name.toLocaleLowerCase("de").includes(query.toLocaleLowerCase("de")))
+      .sort((a, b) => a.name.localeCompare(b.name, "de"));
+    root.querySelector("#access-list").innerHTML = items.length ? items.map(item => {
+      const count = item.permissions.filter(rule => rule.level > 0).length;
+      const subtitle = item.active ? `${count} Benutzer` : "Archiviert";
+      return `<button type="button" class="select-row access-list-item ${item.id === folderId ? "active" : ""}" data-select="${esc(item.id)}" aria-pressed="${item.id === folderId}"><strong>${esc(item.name)}</strong><small>${esc(subtitle)}</small></button>`;
+    }).join("") : `<div class="access-empty">${query ? "Keine Treffer. Suchbegriff ändern." : "Keine Ordner in dieser Ansicht."}</div>`;
+    root.querySelectorAll("[data-select]").forEach(button => button.addEventListener("click", () => {
+      if (button.dataset.select === folderId || !canLeave()) return;
+      folderId = button.dataset.select; userQuery = ""; userFilter = "all";
+      loadDraft(); drawList(); drawDetail();
+    }));
+  }
+
+  function drawUsers() {
+    const users = data.users.filter(item => item.available !== false || (folder()?.permissions || []).some(rule => rule.principalId === item.sid))
+      .sort((a, b) => a.name.localeCompare(b.name, "de", {numeric: true}) || a.sam.localeCompare(b.sam, "de"));
+    const visible = users.filter(item => `${item.sam} ${item.name}`.toLocaleLowerCase("de").includes(userQuery.toLocaleLowerCase("de")))
+      .filter(item => userFilter === "all" || (userFilter === "granted" ? levelFor(item.sid) > 0 : levelFor(item.sid) === 0));
+    detail.querySelector("#access-users").innerHTML = visible.length ? visible.map(item => `<div class="access-matrix-row"><div><strong>${esc(item.name)}</strong><small>${esc(item.sam)}${item.available === false ? " · Nicht mehr im AD" : ""}</small></div><div class="access-level-options" role="group" aria-label="Zugriff für ${esc(item.name)}">${permissionLabels.map((label, level) => `<button type="button" data-user-rule="${esc(item.sid)}" data-level="${level}" aria-pressed="${levelFor(item.sid) === level}" aria-label="${esc(item.name)}: ${level} · ${esc(label)}" ${folder()?.active ? "" : "disabled data-unavailable"}><span class="access-level-number">${level}</span><span class="access-level-caption">${esc(label)}</span></button>`).join("")}</div></div>`).join("") : '<div class="access-empty">Keine Benutzer für diesen Filter.</div>';
+    detail.querySelectorAll("[data-user-rule]").forEach(button => button.addEventListener("click", () => {
+      const sid = button.dataset.userRule, level = Number(button.dataset.level);
+      rules = rules.filter(rule => rule.principalId !== sid);
+      if (level) rules.push({kind: "user", principalId: sid, level});
+      if (userFilter !== "all") drawUsers();
+      else {
+        button.closest(".access-level-options").querySelectorAll("button").forEach(option => option.setAttribute("aria-pressed", String(Number(option.dataset.level) === level)));
+        updateUserCount(visible.length);
+      }
+      updateDirty();
+    }));
+    updateUserCount(visible.length);
+  }
+
+  function updateUserCount(visibleCount) {
+    detail.querySelector("#access-user-count").textContent = `${visibleCount} angezeigt · ${rules.filter(rule => rule.level > 0).length} ${folder()?.active ? "mit Zugriff" : "mit gespeicherten Rechten"} · ${dirty() ? "Vorschau der ungespeicherten Rechte" : "Gespeicherte Rechte"}`;
+  }
+
+  function drawDetail() {
+    const selected = folder();
+    if (!selected) {
+      detail.innerHTML = data.folders.length ? '<div class="access-empty"><h2 id="access-folder-title">Kein Ordner in dieser Ansicht</h2><p>Den Ordnerstatus wechseln oder einen neuen Ordner anlegen.</p></div>' : '<div class="access-empty"><h2 id="access-folder-title">Ersten Ordner anlegen</h2><p>Mit „Neuer Ordner“ beginnen. Anschließend die Rechte für einzelne AD-Benutzer festlegen.</p></div>';
+      return;
+    }
+    detail.innerHTML = `<header class="access-detail-head"><div><h2 id="access-folder-title">${esc(selected.name)}</h2><p>${selected.active ? "Zugriff für jeden AD-Benutzer einzeln festlegen. Ohne Zuweisung kein Zugriff." : "Dieser Ordner ist archiviert und für Benutzer nicht erreichbar. Gespeicherte Rechte gelten nach dem Wiederherstellen."}</p></div><button type="button" id="access-archive" class="link-button">${selected.active ? "Archivieren" : "Wiederherstellen"}</button></header>
+      <section class="access-section"><div class="access-section-head"><h3>Benutzerrechte</h3></div>
+        <div class="access-filter-row"><label><span class="sr-only">Benutzer suchen</span><input id="access-user-search" type="search" placeholder="Name oder Benutzername suchen" value="${esc(userQuery)}"></label><label><span class="sr-only">Zugriff filtern</span><select id="access-user-filter"><option value="all">Alle Benutzer</option><option value="granted">${selected.active ? "Mit Zugriff" : "Mit gespeicherten Rechten"}</option><option value="hidden">${selected.active ? "Ohne Zugriff" : "Ohne gespeicherte Rechte"}</option></select></label></div>
+        <p id="access-user-count" class="muted" role="status"></p>
+        <div class="access-matrix-head"><span>AD-Benutzer</span>${permissionLabels.map((label, level) => `<span><b>${level}</b>${esc(label)}</span>`).join("")}</div>
+        <div id="access-users" class="access-users"></div>
+      </section><footer class="access-savebar"><span id="access-save-state"></span><div><button type="button" id="access-discard" hidden>Verwerfen</button><button type="button" id="access-save">Rechte anwenden</button></div></footer>`;
+    detail.querySelector("#access-user-filter").value = userFilter;
+    detail.querySelector("#access-user-search").addEventListener("input", event => { userQuery = event.target.value; drawUsers(); });
+    detail.querySelector("#access-user-filter").addEventListener("change", event => { userFilter = event.target.value; drawUsers(); });
+    detail.querySelector("#access-save").addEventListener("click", () => save({action: "set-permissions", id: selected.id, permissions: rules}));
+    detail.querySelector("#access-discard").addEventListener("click", () => { loadDraft(); drawDetail(); });
+    detail.querySelector("#access-archive").addEventListener("click", () => {
+      if (!canLeave()) return;
+      dialog(selected.active ? "Ordner archivieren?" : "Ordner wiederherstellen?", selected.active ? `„${selected.name}“ wird für Benutzer ausgeblendet. Alle Dateien bleiben erhalten.` : `„${selected.name}“ wird mit den gespeicherten Rechten wieder freigegeben.`, selected.active ? "Archivieren" : "Wiederherstellen", () => save({action: selected.active ? "archive-folder" : "restore-folder", id: selected.id}), null, selected.active);
+    });
+    drawUsers(); updateDirty();
+  }
+
+  function draw() {
+    root.querySelector("#access-search").value = query;
+    root.querySelector("#folder-status").value = folderFilter;
+    drawList(); drawDetail();
+  }
+  root.querySelector("#access-search").addEventListener("input", event => { query = event.target.value; drawList(); });
+  root.querySelector("#folder-status").addEventListener("change", event => {
+    if (!canLeave()) { event.target.value = folderFilter; return; }
+    folderFilter = event.target.value;
+    const visible = data.folders.filter(item => folderFilter === "all" || item.active === (folderFilter === "active"));
+    if (!visible.some(item => item.id === folderId)) { folderId = visible[0]?.id; userQuery = ""; userFilter = "all"; }
+    loadDraft(); drawList(); drawDetail();
+  });
+  root.querySelector("#access-create").addEventListener("click", () => {
+    if (!canLeave()) return;
+    dialog("Neuen Datenordner anlegen", "Der Ordner startet ohne Benutzerzugriff. Danach die gewünschten AD-Benutzer individuell berechtigen.", "Anlegen", name => save({action: "create-folder", name}), "");
+  });
+  loadDraft(); draw();
 }
 
 async function renderStorage(type) {
@@ -229,8 +418,8 @@ async function renderStorage(type) {
   state.storage = data;
   let query = "";
   let sort = "size-desc";
-  content.innerHTML = pageHead(type === "data" ? "Datenbelegung" : "Benutzerbelegung", type === "data" ? "Belegter Speicher je aktivem Gruppenordner unter /Data." : "Gemeinsame Belegung von /Private und /FSLogix je Benutzer.", `<span class="muted">Geprüft ${esc(utcTime(data.scannedAt))} in ${esc(data.scanSeconds || 0)} s</span>`) + `
-    <section class="panel"><div class="toolbar"><input id="storage-filter" type="search" placeholder="${type === "data" ? "Gruppenordner" : "Benutzer"} filtern"><select id="storage-sort"><option value="size-desc">Größte zuerst</option><option value="size-asc">Kleinste zuerst</option><option value="name">Name</option></select></div><div id="storage-table"></div></section>`;
+  content.innerHTML = pageHead(type === "data" ? "Datenbelegung" : "Benutzerbelegung", type === "data" ? "Belegter Speicher je aktivem Datenordner unter /Data." : "Gemeinsame Belegung von /Private und /FSLogix je Benutzer.", `<span class="muted">Geprüft ${esc(utcTime(data.scannedAt))} in ${esc(data.scanSeconds || 0)} s</span>`) + `
+    <section class="panel"><div class="toolbar"><input id="storage-filter" type="search" placeholder="${type === "data" ? "Datenordner" : "Benutzer"} filtern"><select id="storage-sort"><option value="size-desc">Größte zuerst</option><option value="size-asc">Kleinste zuerst</option><option value="name">Name</option></select></div><div id="storage-table"></div></section>`;
   const draw = () => {
     const source = [...(type === "data" ? data.groups || [] : data.users || [])];
     let rows = source.filter(row => row.name.toLowerCase().includes(query));
@@ -512,7 +701,7 @@ function reconciliationMarkup(data) {
 async function renderReconciliation() {
   content.innerHTML = pageHead(
     "Freigabenabgleich",
-    "Freigaben, Gruppenordner und Berechtigungen sofort mit Active Directory abgleichen.",
+    "Ordnerrechte anwenden und AD-Benutzerinformationen aktualisieren.",
     '<button id="start-reconciliation" type="button">Freigaben jetzt abgleichen</button>'
   ) + '<div id="reconciliation-body"></div>';
   const button = document.querySelector("#start-reconciliation");
@@ -649,5 +838,8 @@ document.querySelector("#logout").addEventListener("click", async () => { try { 
 document.querySelector("#menu-toggle").addEventListener("click", () => document.querySelector(".sidebar").classList.toggle("open"));
 nav.addEventListener("click", event => { const link = event.target.closest("a"); if (link) { event.preventDefault(); navigate(link.pathname); } });
 window.addEventListener("popstate", () => navigate(location.pathname, true));
+window.addEventListener("beforeunload", event => {
+  if (state.accessDirty) { event.preventDefault(); event.returnValue = ""; }
+});
 
 api("/api/session").then(showApp).catch(showLogin);

@@ -32,7 +32,7 @@ require_vfs_modules() {
 
   local missing=0
   local module
-  for module in acl_xattr recycle full_audit; do
+  for module in acl_xattr xattr_tdb recycle full_audit; do
     if [[ ! -f "$modules_dir/vfs/${module}.so" ]]; then
       printf '[init] ERROR: missing VFS module %s at %s/vfs/%s.so\n' "$module" "$modules_dir" "$module" >&2
       missing=1

@@ -1711,31 +1711,17 @@ def with_lock() -> bool:
 
         conn = open_db()
         try:
-            status_progress(10, "directory", "Reading data folder groups from AD")
-            phase_started = time.monotonic()
-            groups = fetch_fileshare_groups()
-            log(
-                f"Discovered {len(groups)} data folder group(s) from AD "
-                f"in {format_duration(time.monotonic() - phase_started)}"
-            )
-
-            status_progress(22, "database", "Reconciling data folder database")
-            log("Reconciling data folder DB")
-            phase_started = time.monotonic()
-            reconcile_db(conn, groups)
-            log(
-                f"Reconciled data folder DB in "
-                f"{format_duration(time.monotonic() - phase_started)}"
-            )
-
-            status_progress(32, "data-permissions", "Syncing data folder permissions")
-            log("Syncing data folder permissions")
-            phase_started = time.monotonic()
-            sync_dynamic_directory_permissions(conn, groups)
-            log(
-                f"Synced data folder permissions in "
-                f"{format_duration(time.monotonic() - phase_started)}"
-            )
+            try:
+                from . import access_control
+            except ImportError:
+                import access_control
+            status_progress(10, "database", "Loading admin-managed folders")
+            access_control.migrate(conn)
+            access_control.recover_pending(conn)
+            status_progress(32, "data-permissions", "Syncing managed folder permissions")
+            access_control.sync_permissions(conn)
+            conn.commit()
+            log("Synced admin-managed Data folder permissions")
         finally:
             conn.close()
 

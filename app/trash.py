@@ -303,7 +303,7 @@ def _remove_empty_trash_parents(repository: str, relative_path: str) -> None:
         current = os.path.dirname(current)
 
 
-def restore_item(item_id: str) -> Dict[str, object]:
+def restore_item(item_id: str, prepare=None) -> Dict[str, object]:
     share, share_root, relative_path, parts, info = _resolved_item(item_id)
     original = _original_relative(relative_path)
     original_parts = _relative_parts(original)
@@ -323,6 +323,12 @@ def restore_item(item_id: str) -> Dict[str, object]:
     )
     linked = False
     try:
+        if prepare is not None:
+            source_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_parent_fd)
+            try:
+                prepare(original, source_fd)
+            finally:
+                os.close(source_fd)
         os.link(
             parts[-1],
             original_parts[-1],

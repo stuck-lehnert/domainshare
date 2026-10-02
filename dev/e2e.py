@@ -283,11 +283,11 @@ def main() -> int:
     check({"Finance", "Engineering", "Projects"}.issubset(groups), f"seed groups missing: {sorted(groups)}")
     check(groups["Finance"]["folder"] == "Finance", "Finance group/folder mapping is wrong")
     finance_nodes = flatten_members(groups["Finance"].get("members", []))
-    check(any(kind == "group" and sam == "Finance_Analysts" for kind, sam, _ in finance_nodes), "nested Finance Analysts group missing")
+    check(all(kind == "user" for kind, _, _ in finance_nodes), "Finance still contains group assignments")
     check({"alice", "bob"}.issubset({sam for kind, sam, _ in finance_nodes if kind == "user"}), "Finance users missing")
     project_nodes = flatten_members(groups["Projects"].get("members", []))
     check({"alice", "bob", "carol", "dave", "eve", "frank"}.issubset({sam for kind, sam, _ in project_nodes if kind == "user"}), "transitive or primary-group Project membership is incomplete")
-    check(any(kind == "group" and sam == "Domain Users" for kind, sam, _ in project_nodes), "nested Domain Users group missing")
+    check(all(kind == "user" for kind, _, _ in project_nodes), "Projects still contains group assignments")
 
     announce("SMB authorization and real share reads/writes")
     alice_access = engine_run(
@@ -719,6 +719,89 @@ fi
         report_payload["backup"].get("state") == backup_payload.get("state"),
         "report backup status differs from the backup API",
     )
+
+    announce("individual AD-user folder assignments and all four SMB permission levels")
+    check(http("/api/access").status == 401, "anonymous access-policy listing accepted")
+    check(http("/api/access", method="POST", value={"action": "create-folder", "name": "Unauthorized"}).status == 401, "anonymous access-policy mutation accepted")
+    access = http("/api/access", token=token).json()
+    user_sids = {u["sam"]: u["sid"] for u in access["users"]}
+
+    def change(value):
+        response = eventually("access-policy update", lambda: http("/api/access", method="POST", value=value, token=token), lambda r: r.status != 409, timeout=45)
+        check(response.status == 200, f"policy update failed: {response.body!r}")
+        return response.json()
+
+    created = change({"action": "create-folder", "name": "Permissions"})
+    folder_id = next(f["id"] for f in created["folders"] if f["name"] == "Permissions")
+    check("groups" not in access, "access API still advertises groups")
+    rejected = http("/api/access", method="POST", value={"action": "save-group", "name": "Editors", "members": [user_sids["alice"]]}, token=token)
+    check(rejected.status == 400, "group creation accepted")
+    rejected = http("/api/access", method="POST", value={"action": "set-permissions", "id": folder_id,
+                    "permissions": [{"kind": "group", "principalId": "legacy", "level": 3}]}, token=token)
+    check(rejected.status == 400, "group folder assignment accepted")
+
+    def rules(level):
+        return change({"action": "set-permissions", "id": folder_id,
+                       "permissions": [{"kind": "user", "principalId": user_sids["alice"], "level": level}]})
+
+    def smb(command, user="alice"):
+        result = engine_run("exec", CLIENT_CONTAINER, "smbclient", f"//files.{DNS_DOMAIN}/Data", "-m", "SMB3",
+                            "-U", f"{WORKGROUP}\\{user}%{ADMIN_PASSWORD if user == ADMIN_USER else USER_PASSWORD}", "-c", command, check_result=False)
+        return result.returncode, result.stdout + result.stderr
+
+    # The SMB client sometimes exits zero on individual denied operations, so inspect status output.
+    def allowed(command, user="alice"):
+        code, output = smb(command, user)
+        check(code == 0 and "NT_STATUS_" not in output, f"operation unexpectedly failed: {command}: {output}")
+
+    def denied(command):
+        code, output = smb(command)
+        check(code != 0 or "NT_STATUS_ACCESS_DENIED" in output, f"operation unexpectedly succeeded: {command}: {output}")
+
+    rules(0)
+    denied("cd Permissions; ls")
+    _, listing = smb("ls")
+    check("Permissions" not in listing, "level 0 folder is visible")
+    allowed("cd Permissions; put /tmp/live-note.txt existing.txt", ADMIN_USER)
+    rules(1)
+    allowed("cd Permissions; get existing.txt /tmp/permission-read.txt")
+    denied("cd Permissions; put /tmp/live-note.txt blocked.txt")
+    denied("cd Permissions; del existing.txt")
+    rules(2)
+    allowed("cd Permissions; put /tmp/live-note.txt created.txt")
+    allowed("cd Permissions; put /tmp/live-note.txt existing.txt")
+    allowed("cd Permissions; mkdir Child")
+    allowed("cd Permissions; cd Child; put /tmp/live-note.txt inherited.txt")
+    denied("cd Permissions; del existing.txt")
+    denied("cd Permissions; del created.txt")
+    denied("cd Permissions; rename created.txt renamed.txt")
+    denied("cd Permissions; rmdir Child")
+    denied("cd Permissions; cd Child; del inherited.txt")
+    # Users must not promote themselves using SMB ACL changes, even on their own new files.
+    acl_edit = engine_run("exec", CLIENT_CONTAINER, "smbcacls", f"//files.{DNS_DOMAIN}/Data", "Permissions/created.txt",
+                          "-U", f"{WORKGROUP}\\alice%{USER_PASSWORD}", "--add", f"ACL:{WORKGROUP}\\alice:ALLOWED/0x0/FULL", check_result=False)
+    check(acl_edit.returncode != 0, "level 2 user can change ACLs on a created file")
+    rules(3)
+    allowed("cd Permissions; rename created.txt renamed.txt")
+    allowed("cd Permissions; del renamed.txt")
+    allowed("cd Permissions; cd Child; del inherited.txt")
+    allowed("cd Permissions; rmdir Child")
+    # Assigning Bob does not grant Alice access; zero explicitly revokes Alice.
+    change({"action": "set-permissions", "id": folder_id, "permissions": [
+        {"kind": "user", "principalId": user_sids["bob"], "level": 3},
+        {"kind": "user", "principalId": user_sids["alice"], "level": 0}]})
+    denied("cd Permissions; ls")
+    allowed("cd Permissions; ls", "bob")
+    change({"action": "archive-folder", "id": folder_id})
+    code, output = smb("cd Permissions; ls", "bob")
+    check(code != 0 or "NT_STATUS_" in output, "archived folder remains accessible")
+    change({"action": "restore-folder", "id": folder_id})
+    allowed("cd Permissions; ls", "bob")
+    change({"action": "set-permissions", "id": folder_id, "permissions": []})
+    code, output = smb("cd Permissions; ls", "bob")
+    check(code != 0 or "NT_STATUS_ACCESS_DENIED" in output, "removed individual assignment still grants access")
+    invalid = http("/api/access", method="POST", value={"action": "create-folder", "name": "../escape"}, token=token)
+    check(invalid.status == 400, "unsafe folder path accepted")
 
     logout = http("/api/logout", method="POST", value={}, token=token)
     check(logout.status == 200 and "Max-Age=0" in logout.headers.get("Set-Cookie", ""), "logout did not clear session cookie")
