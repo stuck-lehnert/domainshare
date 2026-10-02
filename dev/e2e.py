@@ -289,6 +289,19 @@ def main() -> int:
     check({"alice", "bob", "carol", "dave", "eve", "frank"}.issubset({sam for kind, sam, _ in project_nodes if kind == "user"}), "transitive or primary-group Project membership is incomplete")
     check(all(kind == "user" for kind, _, _ in project_nodes), "Projects still contains group assignments")
 
+    announce("legacy GUID-path migration preserves file hashes and inodes")
+    engine_run("exec", FILES_CONTAINER, "python3", "-c", """
+import hashlib, json
+from pathlib import Path
+manifest=json.loads(Path('/state/preview-legacy-manifest.json').read_text())
+assert manifest
+for relative, previous in manifest.items():
+    entry=Path('/data/groups/data')/relative
+    assert entry.is_file(), relative
+    assert hashlib.sha256(entry.read_bytes()).hexdigest()==previous['sha256'], relative
+    assert entry.stat().st_ino==previous['inode'], relative
+""")
+
     announce("SMB authorization and real share reads/writes")
     alice_access = engine_run(
         "exec", CLIENT_CONTAINER, "smbclient", f"//files.{DNS_DOMAIN}/Data", "-m", "SMB3",
@@ -802,6 +815,54 @@ fi
     check(code != 0 or "NT_STATUS_ACCESS_DENIED" in output, "removed individual assignment still grants access")
     invalid = http("/api/access", method="POST", value={"action": "create-folder", "name": "../escape"}, token=token)
     check(invalid.status == 400, "unsafe folder path accepted")
+
+    announce("already-migrated GUID path survives container restart with all data and rights")
+    created = change({"action": "create-folder", "name": "Startup recovery"})
+    repair_id = next(f["id"] for f in created["folders"] if f["name"] == "Startup recovery")
+    repair_rules = [{"kind": "user", "principalId": user_sids["alice"], "level": 2},
+                    {"kind": "user", "principalId": user_sids["bob"], "level": 0}]
+    change({"action": "set-permissions", "id": repair_id, "permissions": repair_rules})
+    allowed('cd "Startup recovery"; put /tmp/live-note.txt retained.txt', ADMIN_USER)
+    # Reproduce the production failure: the access marker is already committed,
+    # but the folder and stored path still use /data/groups/<GUID>.
+    previous = json.loads(engine_run("exec", FILES_CONTAINER, "python3", "-c", """
+import hashlib, json, os, sys
+sys.path.insert(0,'/app')
+import access_control as access
+import reconcile_shares as directory
+folder_id=sys.argv[1]
+with access.mutation_lock():
+    conn=directory.open_db()
+    row=conn.execute('SELECT * FROM shares WHERE objectGUID=?',(folder_id,)).fetchone()
+    assert access.initialized(conn)
+    original=row['path']
+    retained=os.path.join(original,'retained.txt')
+    with open(retained,'rb') as handle:
+        previous={'sha256':hashlib.sha256(handle.read()).hexdigest(),'inode':os.stat(retained).st_ino}
+    legacy=os.path.join(os.path.dirname(directory.GROUP_ROOT),folder_id)
+    access.rename_without_overwrite(original,legacy)
+    conn.execute('UPDATE shares SET path=? WHERE objectGUID=?',(legacy,folder_id))
+    conn.commit()
+    conn.close()
+    print(json.dumps(previous))
+""", repair_id).stdout)
+    engine_run("restart", FILES_CONTAINER)
+    eventually("file server startup after legacy path repair", lambda: http("/healthz"), lambda response: response.status == 200, timeout=120)
+    repaired = http("/api/access", token=token).json()
+    restored_folder = next(f for f in repaired["folders"] if f["id"] == repair_id)
+    check(restored_folder["name"] == "Startup recovery", "startup repair changed a noncolliding folder name")
+    check(sorted(restored_folder["permissions"], key=lambda r:r['principalId']) == sorted(repair_rules, key=lambda r:r['principalId']), "startup repair changed individual permissions")
+    actual = json.loads(engine_run("exec", FILES_CONTAINER, "python3", "-c", """
+import hashlib, json, os
+path='/data/groups/data/Startup recovery/retained.txt'
+with open(path,'rb') as handle:
+    print(json.dumps({'sha256':hashlib.sha256(handle.read()).hexdigest(),'inode':os.stat(path).st_ino}))
+""").stdout)
+    check(actual == previous, "startup repair did not preserve file contents and inode")
+    allowed('cd "Startup recovery"; get retained.txt /tmp/recovered-read.txt')
+    denied('cd "Startup recovery"; del retained.txt')
+    code, output = smb('cd "Startup recovery"; ls', 'bob')
+    check(code != 0 or 'NT_STATUS_ACCESS_DENIED' in output, 'startup recovery lost explicit level zero')
 
     logout = http("/api/logout", method="POST", value={}, token=token)
     check(logout.status == 200 and "Max-Age=0" in logout.headers.get("Set-Cookie", ""), "logout did not clear session cookie")

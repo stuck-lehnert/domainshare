@@ -130,6 +130,170 @@ class ManagedAccessTests(unittest.TestCase):
         self.assertEqual(row['groupCount'], 0)
         self.assertEqual([(node['id'], node['level']) for node in row['members']], [(BOB, 2)])
 
+    def legacy_folder(self, active=True, name='Finance'):
+        guid = 'dc537393-6882-4b94-bc08-e24966623d62'
+        path = os.path.join(os.path.dirname(directory.GROUP_ROOT), guid)
+        os.makedirs(os.path.join(path, 'Reports'))
+        with open(os.path.join(path, 'Reports', 'retained.bin'), 'wb') as handle:
+            handle.write(b'production data\x00\xff\n')
+        self.conn.execute("INSERT INTO shares VALUES(?,?,?,?,?,?,?,'old-signature')",
+                          (guid, 'FS_Finance', name, path, '2026-01-01', '2026-01-01', int(active)))
+        self.conn.commit()
+        return guid, path
+
+    def mark_managed_with_rules(self, folder):
+        self.conn.execute("INSERT INTO access_settings VALUES('managed','1')")
+        access.cache_users(self.conn, USERS)
+        self.conn.executemany('INSERT INTO folder_permissions VALUES(?,?,?,?)',
+                              [(folder, 'user', ALICE, 2), (folder, 'user', BOB, 0)])
+        self.conn.commit()
+
+    def assert_retained_data(self, folder, original_inode):
+        row = self.conn.execute('SELECT * FROM shares WHERE objectGUID=?', (folder,)).fetchone()
+        path = os.path.join(row['path'], 'Reports', 'retained.bin')
+        with open(path, 'rb') as handle:
+            self.assertEqual(handle.read(), b'production data\x00\xff\n')
+        self.assertEqual(os.stat(path).st_ino, original_inode)
+        access.safe_folder_path(row)
+        return row
+
+    def test_already_migrated_guid_path_repaired_without_reimport_or_lost_data(self):
+        folder, source = self.legacy_folder()
+        self.mark_managed_with_rules(folder)
+        inode = os.stat(os.path.join(source, 'Reports', 'retained.bin')).st_ino
+        with self.assertRaisesRegex(RuntimeError, 'Unsafe managed folder path'):
+            access.safe_folder_path(self.conn.execute('SELECT * FROM shares').fetchone())
+        with mock.patch.object(access, 'read_directory') as ad:
+            access.migrate(self.conn)
+            access.migrate(self.conn)
+        ad.assert_not_called()
+        row = self.assert_retained_data(folder, inode)
+        self.assertEqual(row['path'], os.path.join(directory.GROUP_ROOT, 'Finance'))
+        self.assertEqual(row['shareName'], 'Finance')
+        self.assertEqual(row['aclSignature'], '')
+        self.assertEqual(access.effective_levels(self.conn, folder), {ALICE: 2, BOB: 0})
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM access_changes WHERE action='migrate-folder-layout'").fetchone()[0], 1)
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM access_settings WHERE key='pendingFolderLayout'").fetchone())
+
+    def test_initial_ad_import_also_moves_legacy_guid_data(self):
+        folder, source = self.legacy_folder()
+        inode = os.stat(os.path.join(source, 'Reports', 'retained.bin')).st_ino
+        users = {ALICE: {**USERS[ALICE], 'dn': 'alice', 'primaryRid': 513}}
+        groups = {'finance': {'dn': 'finance', 'sam': 'FS_Finance', 'sid': 'S-1-5-21-1-2-3-1200', 'members': ['alice']}}
+        with mock.patch.object(access, 'read_directory', return_value=(users, groups)):
+            access.migrate(self.conn)
+        self.assert_retained_data(folder, inode)
+        self.assertEqual(access.effective_levels(self.conn, folder), {ALICE: 3})
+
+    def test_legacy_archived_data_moves_to_archive_and_stays_archived(self):
+        folder, source = self.legacy_folder(active=False)
+        self.mark_managed_with_rules(folder)
+        inode = os.stat(os.path.join(source, 'Reports', 'retained.bin')).st_ino
+        access.migrate(self.conn)
+        row = self.assert_retained_data(folder, inode)
+        self.assertFalse(row['isActive'])
+        self.assertEqual(row['path'], os.path.join(directory.GROUP_ARCHIVE_ROOT, 'Finance'))
+        self.assertEqual(access.effective_levels(self.conn, folder), {ALICE: 2, BOB: 0})
+
+    def test_layout_collision_preserves_both_directory_contents(self):
+        folder, source = self.legacy_folder()
+        self.mark_managed_with_rules(folder)
+        inode = os.stat(os.path.join(source, 'Reports', 'retained.bin')).st_ino
+        existing = os.path.join(directory.GROUP_ROOT, 'FINANCE')
+        os.mkdir(existing)
+        with open(os.path.join(existing, 'other.txt'), 'w') as handle:
+            handle.write('unrelated data')
+        access.migrate(self.conn)
+        row = self.assert_retained_data(folder, inode)
+        self.assertEqual(row['shareName'], 'Finance_dc537393')
+        with open(os.path.join(existing, 'other.txt')) as handle:
+            self.assertEqual(handle.read(), 'unrelated data')
+
+    def test_atomic_rename_refuses_existing_empty_destination(self):
+        folder, source = self.legacy_folder()
+        destination = os.path.join(directory.GROUP_ROOT, 'Finance')
+        os.mkdir(destination)
+        with self.assertRaises(FileExistsError):
+            access.rename_without_overwrite(source, destination)
+        self.assertTrue(os.path.isfile(os.path.join(source, 'Reports', 'retained.bin')))
+        self.assertTrue(os.path.isdir(destination))
+
+    def test_layout_retry_after_failure_before_move_keeps_data_and_rules(self):
+        folder, source = self.legacy_folder()
+        self.mark_managed_with_rules(folder)
+        inode = os.stat(os.path.join(source, 'Reports', 'retained.bin')).st_ino
+        with mock.patch.object(access, 'rename_without_overwrite', side_effect=OSError('interrupted before rename')):
+            with self.assertRaises(OSError):
+                access.migrate(self.conn)
+        self.assertTrue(os.path.isfile(os.path.join(source, 'Reports', 'retained.bin')))
+        self.assertIsNotNone(self.conn.execute("SELECT 1 FROM access_settings WHERE key='pendingFolderLayout'").fetchone())
+        self.assertEqual(access.effective_levels(self.conn, folder), {ALICE: 2, BOB: 0})
+        access.migrate(self.conn)
+        self.assert_retained_data(folder, inode)
+
+    def test_layout_retry_after_crash_between_rename_and_db_update(self):
+        folder, source = self.legacy_folder()
+        self.mark_managed_with_rules(folder)
+        inode = os.stat(os.path.join(source, 'Reports', 'retained.bin')).st_ino
+        rename = access.rename_without_overwrite
+        def move_then_crash(old, new):
+            rename(old, new)
+            raise RuntimeError('crashed after rename')
+        with mock.patch.object(access, 'rename_without_overwrite', side_effect=move_then_crash):
+            with self.assertRaises(RuntimeError):
+                access.migrate(self.conn)
+        self.assertFalse(os.path.lexists(source))
+        self.assertEqual(self.conn.execute('SELECT path FROM shares').fetchone()[0], source)
+        # Reopen SQLite like a new container process; recovery uses the durable journal.
+        reopened = directory.open_db()
+        try:
+            access.migrate(reopened)
+        finally:
+            reopened.close()
+        self.assert_retained_data(folder, inode)
+        self.assertEqual(access.effective_levels(self.conn, folder), {ALICE: 2, BOB: 0})
+
+    def test_layout_recovery_ambiguous_collision_retains_both_paths(self):
+        folder, source = self.legacy_folder()
+        self.mark_managed_with_rules(folder)
+        with mock.patch.object(access, 'rename_without_overwrite', side_effect=OSError('interrupted')):
+            with self.assertRaises(OSError):
+                access.migrate(self.conn)
+        pending = json.loads(self.conn.execute("SELECT value FROM access_settings WHERE key='pendingFolderLayout'").fetchone()[0])
+        os.mkdir(pending['destination'])
+        with open(os.path.join(pending['destination'], 'other.txt'), 'w') as handle:
+            handle.write('other data')
+        with self.assertRaisesRegex(RuntimeError, 'both paths retained'):
+            access.migrate(self.conn)
+        self.assertTrue(os.path.isfile(os.path.join(source, 'Reports', 'retained.bin')))
+        with open(os.path.join(pending['destination'], 'other.txt')) as handle:
+            self.assertEqual(handle.read(), 'other data')
+        self.assertIsNotNone(self.conn.execute("SELECT 1 FROM access_settings WHERE key='pendingFolderLayout'").fetchone())
+
+    def test_missing_legacy_source_does_not_create_empty_replacement(self):
+        folder, source = self.legacy_folder()
+        self.mark_managed_with_rules(folder)
+        os.rename(source, source + '.retained')
+        with self.assertRaisesRegex(RuntimeError, 'Legacy folder is missing'):
+            access.migrate(self.conn)
+        self.assertFalse(os.path.lexists(os.path.join(directory.GROUP_ROOT, 'Finance')))
+        self.assertTrue(os.path.isfile(os.path.join(source + '.retained', 'Reports', 'retained.bin')))
+        self.assertEqual(self.conn.execute('SELECT path FROM shares').fetchone()[0], source)
+
+    def test_layout_repair_rejects_symlinks_and_unregistered_paths(self):
+        folder, source = self.legacy_folder()
+        self.mark_managed_with_rules(folder)
+        os.rename(source, source + '.retained')
+        os.symlink(source + '.retained', source)
+        with self.assertRaisesRegex(RuntimeError, 'Unsafe legacy folder path'):
+            access.migrate(self.conn)
+        self.assertTrue(os.path.islink(source))
+        self.assertTrue(os.path.isfile(os.path.join(source + '.retained', 'Reports', 'retained.bin')))
+        self.conn.execute('UPDATE shares SET path=?', (source + '.retained',))
+        self.conn.commit()
+        with self.assertRaisesRegex(RuntimeError, 'Unsafe legacy folder path'):
+            access.migrate(self.conn)
+
     def test_invalid_permission_update_retains_existing_policy(self):
         folder = self.folder()
         original = [{'kind': 'user', 'principalId': ALICE, 'level': 1}]

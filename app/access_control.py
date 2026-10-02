@@ -1,6 +1,7 @@
 """Admin-managed Data folders and individual user permissions, enforced by Samba Windows ACLs."""
 
 import contextlib
+import ctypes
 import datetime as dt
 import fcntl
 import hashlib
@@ -132,6 +133,7 @@ def migrate(conn):
     """Snapshot existing assignments once; never discover new FS_* groups."""
     ensure_schema(conn)
     if initialized(conn):
+        migrate_folder_layout(conn)
         return
     rows = conn.execute("SELECT * FROM shares WHERE isActive=1").fetchall()
     users, groups = read_directory(include_groups=True) if rows else ({}, {})
@@ -179,6 +181,102 @@ def migrate(conn):
     except Exception:
         conn.rollback()
         raise
+    migrate_folder_layout(conn)
+
+
+def rename_without_overwrite(source, destination):
+    """Atomically move a directory on Linux, refusing any existing destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(libc, "renameat2", None)
+    if rename is None:
+        raise RuntimeError("Atomic no-overwrite folder migration is unavailable")
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    # AT_FDCWD=-100, RENAME_NOREPLACE=1. Never fall back to copy/remove or replace.
+    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), source, None, destination)
+
+
+def legacy_folder_path(row, source):
+    """Only accept the old /data/groups/<objectGUID> layout, never arbitrary paths."""
+    base = os.path.dirname(os.path.abspath(directory.GROUP_ROOT))
+    try:
+        same_guid = uuid.UUID(os.path.basename(source)) == uuid.UUID(row["objectGUID"])
+    except (ValueError, AttributeError):
+        same_guid = False
+    if os.path.dirname(source) != base or not same_guid or os.path.islink(base) or os.path.islink(source):
+        raise RuntimeError(f"Unsafe legacy folder path: {source}")
+
+
+def finish_folder_layout(conn, move):
+    row = conn.execute("SELECT * FROM shares WHERE objectGUID=?", (move["folderId"],)).fetchone()
+    if row is None or os.path.abspath(row["path"]) != move["source"]:
+        raise RuntimeError("Folder layout recovery does not match stored folder; all paths retained")
+    source, destination = move["source"], move["destination"]
+    legacy_folder_path(row, source)
+    root = os.path.abspath(directory.GROUP_ROOT if row["isActive"] else directory.GROUP_ARCHIVE_ROOT)
+    if os.path.islink(root) or os.path.dirname(destination) != root or os.path.basename(destination) != valid_name(move["name"]) or os.path.islink(destination):
+        raise RuntimeError("Unsafe folder layout recovery destination")
+    if os.path.lexists(source):
+        if not os.path.isdir(source):
+            raise RuntimeError(f"Legacy folder is not a directory: {source}")
+        if os.path.lexists(destination):
+            raise RuntimeError(f"Folder layout conflict; both paths retained: {source} -> {destination}")
+        rename_without_overwrite(source, destination)
+    elif not os.path.isdir(destination):
+        raise RuntimeError(f"Folder layout recovery cannot find source or destination; no empty folder created: {source} -> {destination}")
+    # The move intent was committed before rename. If startup died after rename,
+    # the retained destination is adopted here without repeating the AD import.
+    try:
+        conn.execute("UPDATE shares SET path=?,shareName=?,aclSignature='' WHERE objectGUID=?",
+                     (destination, move["name"], row["objectGUID"]))
+        conn.execute("INSERT INTO access_changes(timestamp,actor,action,details) VALUES(?,?,?,?)",
+                     (timestamp(), "system", "migrate-folder-layout", json.dumps(move)))
+        conn.execute("DELETE FROM access_settings WHERE key='pendingFolderLayout'")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    directory.log(f"Migrated legacy folder without overwriting data: {source} -> {destination}")
+
+
+def migrate_folder_layout(conn):
+    """Repair old GUID paths even after the access migration has been committed."""
+    pending = conn.execute("SELECT value FROM access_settings WHERE key='pendingFolderLayout'").fetchone()
+    if pending:
+        finish_folder_layout(conn, json.loads(pending[0]))
+    rows = conn.execute("SELECT * FROM shares ORDER BY objectGUID").fetchall()
+    legacy = []
+    for row in rows:
+        root = os.path.abspath(directory.GROUP_ROOT if row["isActive"] else directory.GROUP_ARCHIVE_ROOT)
+        if os.path.islink(root):
+            raise RuntimeError(f"Unsafe managed folder root: {root}")
+        source = os.path.abspath(row["path"])
+        if os.path.dirname(source) == root:
+            safe_folder_path(row)
+            continue
+        legacy_folder_path(row, source)
+        if not os.path.isdir(source):
+            raise RuntimeError(f"Legacy folder is missing; no empty folder created: {source}")
+        legacy.append(row)
+    # Validate every legacy path before moving any of them.
+    for row in legacy:
+        root = os.path.abspath(directory.GROUP_ROOT if row["isActive"] else directory.GROUP_ARCHIVE_ROOT)
+        os.makedirs(root, exist_ok=True)
+        used = {entry.name.casefold() for entry in os.scandir(root)}
+        used.update(other["shareName"].casefold() for other in conn.execute("SELECT shareName FROM shares WHERE objectGUID<>?", (row["objectGUID"],)))
+        preferred = directory.sanitize_group_folder_name(row["shareName"])
+        try:
+            valid_name(preferred)
+        except ValueError:
+            preferred = row["objectGUID"]
+        name = directory.choose_group_folder_name(preferred, row["samAccountName"], row["objectGUID"], used)
+        move = {"folderId": row["objectGUID"], "source": os.path.abspath(row["path"]),
+                "destination": os.path.join(root, name), "name": name}
+        conn.execute("INSERT INTO access_settings VALUES('pendingFolderLayout',?)", (json.dumps(move),))
+        conn.commit()
+        finish_folder_layout(conn, move)
 
 
 def valid_name(value):

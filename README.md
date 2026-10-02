@@ -56,7 +56,9 @@ Saving applies ACL changes recursively when the effective policy changes and dis
 
 ### Upgrading from FS_* groups
 
-On the first startup, existing active `shares` records are retained. Nested and primary-group memberships are expanded into a snapshot of individual user SIDs, each receiving level 3 on its existing folders. Paths and data are retained. An unresolved group or member stops migration with an error so an incomplete import cannot silently remove access.
+On the first startup, existing active `shares` records are retained. Nested and primary-group memberships are expanded into a snapshot of individual user SIDs, each receiving level 3 on its existing folders. Folder identities and data are retained. An unresolved group or member stops migration with an error so an incomplete import cannot silently remove access.
+
+Legacy GUID directories stored as `/data/groups/<objectGUID>` are moved into `/data/groups/data/<folderName>` (or `archive` for inactive records) before ACL reconciliation. Existing target directories are preserved; collisions receive a unique folder name. Moves use an atomic no-overwrite rename on the existing volume and retain file inodes and contents. A committed move journal recovers interruptions between filesystem and database updates. This layout repair also runs when the access migration was already marked complete, preserving saved individual permissions and avoiding another AD import. Missing or ambiguous paths stop recovery without creating empty replacements or deleting either path.
 
 After import, AD group renames, membership changes, deletion, and new `FS_*` groups do not change Data folders or access. Manage subsequent changes in the web UI. User assignments are keyed by SID, so renaming an AD account retains its assignments; recreating an account under the same username does not inherit them.
 
@@ -202,7 +204,8 @@ The E2E suite verifies:
 - CA-issued TLS, hostname validation, HSTS, and CSP;
 - anonymous rejection, bad credentials, valid non-admin rejection, real Domain Admin login, JWT claims, bearer use, cookie flags, tamper rejection, and logout;
 - domain trust, one-time legacy folder/membership migration, and individual folder assignments;
-- admin-managed membership, all four SMB access levels, hidden-folder behavior, inheritance, ACL-edit rejection, revocation, and archive/restore;
+- legacy GUID-path migration with file hash/inode checks, and real container restart after an already-completed access migration;
+- individual user assignments, all four SMB access levels, hidden-folder behavior, inheritance, ACL-edit rejection, revocation, and archive/restore;
 - SMB allow/deny behavior and real file operations;
 - Data, Private, and FSLogix usage aggregation;
 - high-level `full_audit` ingestion for all four actions, service-account exclusion, filters, facets, and pagination;
@@ -599,6 +602,19 @@ docker compose exec samba python3 -m json.tool /state/reconcile-status.json
   ```
 
 - After a successful repair, later cron runs return to root-only Data ACL refreshes unless group ACLs change again.
+
+### Startup fails with `Unsafe managed folder path: /data/groups/<GUID>`
+
+This indicates a legacy GUID directory still referenced by an already-migrated database. Update the application code/image and restart using the existing volumes:
+
+```bash
+docker compose stop samba
+docker compose build samba
+docker compose up -d --no-deps samba
+docker compose logs --tail=100 samba
+```
+
+Startup repairs stored legacy paths without reimporting AD membership. It logs `Migrated legacy folder without overwriting data` for each completed move. Keep `/state` and all data volumes; do not remove volumes or reset the `managed` migration marker. If recovery reports a missing source or conflicting source/destination, both data paths remain untouched for inspection.
 
 ### `acl_xattr.so` or `full_audit.so` module load error
 

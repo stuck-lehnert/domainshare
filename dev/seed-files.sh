@@ -33,10 +33,26 @@ printf '[preview-seed] Seeded group, private, and FSLogix data.\n'
 
 # Seed the old state layout to exercise the one-time migration on startup.
 python3 - <<'PYSEED'
+import hashlib
+import json
+import os
 import sqlite3
+import uuid
+from pathlib import Path
+
 conn = sqlite3.connect('/state/shares.db')
 conn.execute("CREATE TABLE shares (objectGUID TEXT PRIMARY KEY, samAccountName TEXT NOT NULL, shareName TEXT NOT NULL, path TEXT NOT NULL, createdAt TEXT NOT NULL, lastSeenAt TEXT NOT NULL, isActive INTEGER NOT NULL DEFAULT 1)")
+manifest = {}
 for name in ('Finance', 'Engineering', 'Projects'):
-    conn.execute("INSERT INTO shares VALUES(?,?,?,?,?,?,1)", (name, 'FS_' + name, name, '/data/groups/data/' + name, '2026-01-01', '2026-01-01'))
+    guid = str(uuid.uuid5(uuid.NAMESPACE_DNS, 'preview.FS_' + name))
+    original = Path('/data/groups/data') / name
+    legacy = Path('/data/groups') / guid
+    for entry in original.rglob('*'):
+        if entry.is_file():
+            relative = str(Path(name) / entry.relative_to(original))
+            manifest[relative] = {'sha256': hashlib.sha256(entry.read_bytes()).hexdigest(), 'inode': entry.stat().st_ino}
+    os.rename(original, legacy)
+    conn.execute("INSERT INTO shares VALUES(?,?,?,?,?,?,1)", (guid, 'FS_' + name, name, str(legacy), '2026-01-01', '2026-01-01'))
 conn.commit()
+Path('/state/preview-legacy-manifest.json').write_text(json.dumps(manifest))
 PYSEED
