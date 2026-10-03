@@ -11,7 +11,7 @@ const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp
 function actionIcon(action) {
   const paths = {
     download: '<path d="M12 3v12m-5-5 5 5 5-5"/><path d="M5 16v4h14v-4"/>',
-    restore: '<path d="M5 12a7 7 0 1 1 2.05 4.95"/><path d="m1 8 4 4 4-4"/>',
+    restore: '<path d="m9 4-5 5 5 5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>',
   };
   return `<svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths[action]}</svg>`;
 }

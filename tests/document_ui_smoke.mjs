@@ -57,7 +57,12 @@ try {
    const parts=url.pathname.split('/'),row=fixtures.find(row=>row.id===parts[3]);
    if(!row||row.id===deniedId){status=404;body={error:'Datei nicht verfügbar'};}
    else if(parts[4]==='preview'){
+    if(row.previewWidth){
+     const width=row.previewWidth,height=row.previewHeight;
+     type='image/svg+xml';body=Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 400 700" preserveAspectRatio="none"><rect width="400" height="700" fill="#dceaf2"/><circle cx="300" cy="120" r="45" fill="#e7bb57"/><path d="M0 450L140 200L310 480L400 370V700H0Z" fill="#7e9a82"/><path d="M0 600L200 400L400 580V700H0Z" fill="#59796a"/><path d="M0 0H400V700H0Z" fill="none" stroke="#304a60" stroke-width="12"/><text x="20" y="40" font-family="Arial" font-size="20">Oben · ${width} × ${height}</text><text x="20" y="675" font-family="Arial" font-size="20" fill="white">Unten · vollständiges Bild</text></svg>`);
+    }else{
     type='image/svg+xml';body=Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="700" height="940" viewBox="0 0 700 940"><rect width="700" height="940" fill="white"/><text x="70" y="100" font-family="Arial" font-size="30">RECHNUNG</text><text x="70" y="160" font-family="Arial" font-size="18">Oktober 2026 · FINANZ742</text><path d="M70 200h560M70 500h560" stroke="#aaa"/><text x="70" y="275" font-family="Arial" font-size="20">Büroausstattung</text><text x="70" y="350" font-family="Arial" font-size="18">3 × Bildschirm</text><text x="480" y="350" font-family="Arial" font-size="18">1.500,00 EUR</text><text x="70" y="560" font-family="Arial" font-size="20">Gesamtbetrag: 1.500,00 EUR</text></svg>`);
+    }
    }else if(parts[4]==='content'){type='application/pdf';body=pdf;}else body=row;
   }else if(url.pathname.startsWith('/assets/vendor/pdfjs/6.3.289-app1/')){
    const relative=url.pathname.slice('/assets/vendor/pdfjs/6.3.289-app1/'.length);
@@ -122,6 +127,38 @@ try {
  }
  fixtures[1].extension='docx';
  await page.locator('#document-close').click();
+ // Large images must fit in both dimensions, including after resizing an open dialog.
+ const originalOffice={...fixtures[1]};
+ for(const [orientation,width,height] of [['portrait',4000,7000],['landscape',7000,4000],['small',180,240]]){
+  Object.assign(fixtures[1],{extension:'png',name:'Bildvorschau.png',path:'Dokumente/Ein sehr langer Ordnername für die Prüfung mehrzeiliger Metadaten/Bildvorschau.png',hasPreview:true,previewWidth:width,previewHeight:height,version:width.toString(16).padStart(16,'0')});
+  await page.setViewportSize({width:1500,height:1050});
+  await page.locator(`[data-document="${fixtures[1].id}"]`).click();
+  await page.locator('#document-preview img').waitFor();
+  await page.waitForFunction(()=>{const img=document.querySelector('#document-preview img');return img?.complete&&img.naturalWidth>0;});
+  for(const [device,viewport] of [['desktop',{width:1500,height:1050}],['mobile',{width:390,height:844}],['mobile-landscape',{width:844,height:390}]]){
+   await page.setViewportSize(viewport);
+   const metrics=await page.evaluate(()=>{
+    const dialog=document.querySelector('#document-dialog'),preview=document.querySelector('#document-preview'),img=preview.querySelector('img');
+    const bounds=element=>{const {x,y,width,height}=element.getBoundingClientRect();return {x,y,width,height};};
+    return {dialog:bounds(dialog),preview:bounds(preview),image:bounds(img),naturalWidth:img.naturalWidth,naturalHeight:img.naturalHeight,scrolls:[dialog,preview].map(element=>({x:element.scrollWidth-element.clientWidth,y:element.scrollHeight-element.clientHeight}))};
+   });
+   assert.deepEqual([metrics.naturalWidth,metrics.naturalHeight],[width,height]);
+   for(const scroll of metrics.scrolls){assert.ok(scroll.x<=1,'Image preview must not scroll horizontally');assert.ok(scroll.y<=1,'Image preview must not scroll vertically');}
+   assert.ok(Math.abs(metrics.image.width/metrics.image.height-width/height)<0.01,'Image aspect ratio must be preserved');
+   assert.ok(metrics.image.width<=width&&metrics.image.height<=height,'Small images must not be enlarged');
+   assert.ok(metrics.image.width>0&&metrics.image.height>0,'Image must remain visible');
+   assert.ok(metrics.image.x>=metrics.preview.x&&metrics.image.y>=metrics.preview.y);
+   assert.ok(metrics.image.x+metrics.image.width<=metrics.preview.x+metrics.preview.width+1);
+   assert.ok(metrics.image.y+metrics.image.height<=metrics.preview.y+metrics.preview.height+1);
+   assert.ok(metrics.dialog.y>=0&&metrics.dialog.y+metrics.dialog.height<=viewport.height+1,'Dialog must fit the viewport');
+   assert.equal(await page.evaluate(()=>getComputedStyle(document.documentElement).overflowY),'hidden');
+   await shot(`06-image-${orientation}-${device}`);
+  }
+  await page.locator('#document-close').click();
+ }
+ delete fixtures[1].previewWidth;delete fixtures[1].previewHeight;
+ Object.assign(fixtures[1],originalOffice);
+ await page.setViewportSize({width:1500,height:1050});
  await page.locator('#source-filter').selectOption('private:alice');
  await page.waitForFunction(()=>document.querySelectorAll('.document-card').length===1);
  assert.match(await page.locator('.document-card').innerText(),/Meine Notizen/);
@@ -184,6 +221,6 @@ try {
  assert.equal(await page.locator('#admin-link').isVisible(),true);
  assert.ok(pendingRequests.includes('FINANZ742')&&pendingRequests.includes('SCANLIVE742'));
  assert.deepEqual(errors,[]);
- console.log('PASS: user login, admin separation, live content search, own-private filter, preview/download links, OCR refresh, revocation, grid/list, desktop/mobile.');
+ console.log('PASS: user login, admin separation, live content search, own-private filter, preview/download links, OCR refresh, revocation, grid/list, desktop/mobile, portrait/landscape image fitting.');
  console.log('Screenshots: '+out);
 } finally {await browser.close();}
