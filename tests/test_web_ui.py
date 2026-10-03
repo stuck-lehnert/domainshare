@@ -297,7 +297,7 @@ class DomainAuthenticationTests(unittest.TestCase):
         result = web_ui.authenticate_domain_admin("alice", "p@ss word")
 
         self.assertEqual(result, "EXAMPLE\\alice")
-        self.assertEqual(run.call_args_list[0].args[0], ["kinit", "alice@EXAMPLE.COM"])
+        self.assertEqual(run.call_args_list[0].args[0], ["kinit", "--", "alice@EXAMPLE.COM"])
         self.assertNotIn("p@ss word", run.call_args_list[0].args[0])
 
     @mock.patch.dict(os.environ, {'WORKGROUP':'EXAMPLE','REALM':'EXAMPLE.COM','DOMAIN_ADMINS_SID':'S-1-5-21-1-2-3-512'})
@@ -314,23 +314,60 @@ class DomainAuthenticationTests(unittest.TestCase):
     @mock.patch.dict(os.environ, {'WORKGROUP':'EXAMPLE','REALM':'EXAMPLE.COM','DOMAIN':'example.com','DOMAIN_ADMINS_SID':'S-1-5-21-1-2-3-512'})
     @mock.patch('app.web_ui.subprocess.run')
     def test_login_formats_resolve_the_same_identity_and_role(self, run):
-        for name in ('alice','EXAMPLE\\alice','example\\alice','alice@example.com','alice@EXAMPLE.COM','alice@EXAMPLE'):
+        for name in ('alice','EXAMPLE\\alice','example\\alice','alice@example.com','alice@EXAMPLE.COM'):
             with self.subTest(name=name):
                 run.reset_mock()
-                run.side_effect = [mock.Mock(returncode=0,stdout=''),
+                responses = [mock.Mock(returncode=0,stdout=''),
                                    mock.Mock(returncode=0,stdout='S-1-5-21-1-2-3-1100 SID_USER (1)'),
                                    mock.Mock(returncode=0,stdout='S-1-5-21-1-2-3-513'),
                                    mock.Mock(returncode=0,stdout='EXAMPLE\\alice 1'),
                                    mock.Mock(returncode=0,stdout='11100')]
+                if '@' in name:
+                    responses.insert(1,mock.Mock(returncode=0,stdout='Default principal: alice@EXAMPLE.COM\n'))
+                run.side_effect = responses
                 value = web_ui.authenticate_user(name,'password')
                 self.assertEqual(value['sub'],'EXAMPLE\\alice')
                 self.assertEqual(value['role'],'user')
-                self.assertEqual(run.call_args_list[0].args[0],['kinit','alice@EXAMPLE.COM'])
-                self.assertEqual(run.call_args_list[1].args[0],['wbinfo','--name-to-sid','EXAMPLE\\alice'])
+                self.assertEqual(run.call_args_list[0].args[0],['kinit','-C','-E','--',name] if '@' in name else ['kinit','--','alice@EXAMPLE.COM'])
+                self.assertEqual(run.call_args_list[2 if '@' in name else 1].args[0],['wbinfo','--name-to-sid','EXAMPLE\\alice'])
         run.reset_mock()
-        for name in ('alice@other.example','OTHER\\alice','MSOL_sync@example.com','krbtgt@example.com'):
+        for name in ('alice@EXAMPLE','OTHER\\alice','MSOL_sync@example.com','krbtgt@example.com','alice@','@example.com','alice@@example.com','EXAMPLE\\alice@example.com'):
             self.assertIsNone(web_ui.authenticate_user(name,'password'))
         run.assert_not_called()
+
+    @mock.patch.dict(os.environ, {'WORKGROUP':'EXAMPLE','REALM':'EXAMPLE.COM','DOMAIN':'dc.example.com','DOMAIN_ADMINS_SID':'S-1-5-21-1-2-3-512'})
+    @mock.patch('app.web_ui.subprocess.run')
+    def test_upn_uses_kdc_account_with_different_prefix_and_alternate_dns_suffix(self, run):
+        for upn in ('alice.smith@example.com','alice.smith@people.example.net'):
+            with self.subTest(upn=upn):
+                run.reset_mock()
+                run.side_effect = [mock.Mock(returncode=0,stdout=''),
+                                   mock.Mock(returncode=0,stdout='Default principal: alice@EXAMPLE.COM\n'),
+                                   mock.Mock(returncode=0,stdout='S-1-5-21-1-2-3-1100 SID_USER (1)'),
+                                   mock.Mock(returncode=0,stdout='S-1-5-21-1-2-3-513'),
+                                   mock.Mock(returncode=0,stdout='EXAMPLE\\alice 1'),
+                                   mock.Mock(returncode=0,stdout='11100')]
+                result=web_ui.authenticate_user(upn,'password')
+                self.assertEqual(result['sub'],'EXAMPLE\\alice')
+                self.assertEqual(result['role'],'user')
+                self.assertEqual(run.call_args_list[0].args[0],['kinit','-C','-E','--',upn])
+                self.assertEqual(run.call_args_list[2].args[0],['wbinfo','--name-to-sid','EXAMPLE\\alice'])
+                self.assertEqual(run.call_args_list[1].kwargs['env']['LC_ALL'],'C')
+                self.assertFalse(os.path.exists(run.call_args_list[1].args[0][2]))
+
+    @mock.patch.dict(os.environ, {'WORKGROUP':'EXAMPLE','REALM':'EXAMPLE.COM'})
+    @mock.patch('app.web_ui.subprocess.run')
+    def test_upn_rejects_failed_password_foreign_ticket_and_system_account_alias(self, run):
+        for code, ticket in ((1,''),(0,'Default principal: alice@OTHER.EXAMPLE\n'),
+                             (0,'Default principal: MSOL_sync@EXAMPLE.COM\n'),
+                             (0,'Default principal: krbtgt@EXAMPLE.COM\n'),(0,'unreadable ticket')):
+            with self.subTest(code=code,ticket=ticket):
+                run.reset_mock()
+                run.side_effect=[mock.Mock(returncode=code,stdout=''),mock.Mock(returncode=0,stdout=ticket)]
+                self.assertIsNone(web_ui.authenticate_user('alias@example.com','password'))
+                self.assertFalse(any(call.args[0][0]=='wbinfo' for call in run.call_args_list))
+                cache=run.call_args_list[0].kwargs['env']['KRB5CCNAME'].removeprefix('FILE:')
+                self.assertFalse(os.path.exists(cache))
 
     @mock.patch.dict(os.environ, {'WORKGROUP':'EXAMPLE','REALM':'EXAMPLE.COM','DOMAIN_ADMINS_SID':'S-1-5-21-1-2-3-512'})
     @mock.patch('app.web_ui.subprocess.run')

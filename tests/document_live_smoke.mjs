@@ -45,7 +45,34 @@ try{
  await page.setViewportSize({width:390,height:844});
  assert.deepEqual(await page.locator('#document-dialog').boundingBox(),{x:0,y:0,width:390,height:844});
  await page.screenshot({path:out+'/02c-live-mobile-pdf-viewer.png',fullPage:false});
- await page.locator('#document-close').click();await page.locator('#reset-filters').click();
+ await page.locator('#document-close').click();
+ // Real seeded JPEG/PNG files exercise the image parser and responsive dialog together.
+ for(const name of ['portrait-4000x6000.jpg','landscape-6000x4000.png','small-320x240.png','private-portrait.jpg']){
+  await page.setViewportSize({width:1500,height:1050});
+  await page.locator('#search-query').fill(name);
+  const card=page.locator('.document-card').filter({hasText:name});
+  await card.waitFor();await card.locator('[data-document]').click();
+  await page.locator('#document-preview img').waitFor();
+  await page.waitForFunction(()=>{const img=document.querySelector('#document-preview img');return img?.complete&&img.naturalWidth>0;});
+  for(const [device,viewport] of [['desktop',{width:1500,height:1050}],['mobile',{width:390,height:844}]]){
+   await page.setViewportSize(viewport);
+   const metrics=await page.evaluate(()=>{
+    const dialog=document.querySelector('#document-dialog'),preview=document.querySelector('#document-preview'),img=preview.querySelector('img');
+    const bounds=img.getBoundingClientRect(),area=preview.getBoundingClientRect();
+    return {ratio:bounds.width/bounds.height,naturalRatio:img.naturalWidth/img.naturalHeight,
+     fits:bounds.width>0&&bounds.height>0&&bounds.left>=area.left&&bounds.top>=area.top&&bounds.right<=area.right+1&&bounds.bottom<=area.bottom+1,
+     scrolls:[dialog,preview].some(element=>element.scrollHeight>element.clientHeight+1||element.scrollWidth>element.clientWidth+1)};
+   });
+   assert.ok(metrics.fits,`${name} must fit the ${device} preview`);
+   assert.ok(Math.abs(metrics.ratio-metrics.naturalRatio)<0.01,'Image must preserve its aspect ratio');
+   assert.equal(metrics.scrolls,false,'Image dialog must not require scrolling');
+   await page.screenshot({path:`${out}/02d-image-${name}-${device}.png`,fullPage:false});
+  }
+  await page.locator('#document-close').click();
+ }
+ const imageText=await page.evaluate(async()=>{const response=await fetch('/api/documents?q=IMAGEPREVIEW742&scope=content');return response.json();});
+ assert.equal(imageText.total,0,'Image fixtures must not be OCRed or content-indexed');
+ await page.locator('#reset-filters').click();
  await page.waitForFunction(()=>document.querySelectorAll('.document-card').length>1);
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
  await page.screenshot({path:out+'/03-live-mobile-files.png',fullPage:true});
@@ -74,6 +101,6 @@ try{
  await admin.goto(origin+'/');await admin.locator('.document-card').first().waitFor();
  assert.equal(await admin.locator('#admin-link').isVisible(),true);
  assert.deepEqual(errors,[]);
- console.log('PASS: live user/admin login, OCR search/preview, original PDF download, mobile layout, /admin boundary, index monitoring and pause/resume.');
+ console.log('PASS: live user/admin login, OCR search/preview, original PDF download, shared/private JPEG/PNG previews, mobile layout, /admin boundary, index monitoring and pause/resume.');
  console.log('Screenshots: '+out);
 }finally{await browser.close();}

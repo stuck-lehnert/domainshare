@@ -50,6 +50,36 @@ font=next(Path('/usr/share/fonts').rglob('NimbusSans-Regular.otf'))
 draw=ImageDraw.Draw(image)
 draw.text((120,200),'INVOICE SCAN\nCustomer reference SCANNEDUNIQUE742\nInvoice total 1500 EUR\nPayment due 30 October 2026',fill='black',font=ImageFont.truetype(str(font),44),spacing=40)
 image.save(root/'scanned-invoice.pdf','PDF',resolution=150)
+
+# Large portrait/landscape images and a small image for responsive preview checks.
+# Generate them locally so the preview needs no external downloads or image assets.
+def preview_image(path, width, height):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.new('RGB', (width, height), '#dceaf2')
+    draw = ImageDraw.Draw(image)
+    unit = min(width, height)
+    sun = unit // 9
+    center = (width * 3 // 4, height // 4)
+    draw.ellipse((center[0] - sun, center[1] - sun,
+                  center[0] + sun, center[1] + sun), fill='#e7bb57')
+    draw.polygon([(0, height * 3 // 4), (width // 3, height // 3),
+                  (width * 3 // 4, height * 4 // 5), (width, height // 2),
+                  (width, height), (0, height)], fill='#7e9a82')
+    draw.polygon([(0, height * 9 // 10), (width // 2, height * 3 // 5),
+                  (width, height * 4 // 5), (width, height), (0, height)], fill='#59796a')
+    margin = unit // 20
+    label_font = ImageFont.truetype(str(font), max(12, unit // 24))
+    draw.text((margin, margin), f'{width} × {height} px', fill='#304a60', font=label_font)
+    draw.text((margin, height - margin - unit // 20), 'IMAGEPREVIEW742', fill='white', font=label_font)
+    draw.rectangle((0, 0, width - 1, height - 1), outline='#304a60', width=max(2, unit // 100))
+    image.save(path)
+
+photos = Path('/data/groups/data/Finance/Photos')
+preview_image(photos/'portrait-4000x6000.jpg', 4000, 6000)
+preview_image(photos/'landscape-6000x4000.png', 6000, 4000)
+preview_image(photos/'small-320x240.png', 320, 240)
+preview_image(Path('/data/private/alice/private-portrait.jpg'), 2400, 3600)
+
 for folder in (root,Path('/data/private/alice')):
     for name in ('Thumbs.db','THUMBS.DB','~$Locked.docx','~$Locked.pptx'):
         (folder/name).write_text('IGNOREDARTIFACT742')

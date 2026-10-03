@@ -120,6 +120,23 @@ ensure_user "$AD_WEB_ADMIN_USER" "$AD_WEB_ADMIN_PASSWORD" Preview Administrator
 ensure_user report_svc "$AD_USER_PASSWORD" Report Service
 ensure_user MSOL_sync "$AD_USER_PASSWORD" Directory Sync
 
+# Windows' post-2000 logon name can differ from the pre-2000 account name,
+# including a DNS suffix that differs from the domain's Kerberos realm.
+for user in dave frank; do
+  user_dn=$(samba-tool user show "$user" | sed -n 's/^dn: //p')
+  if [[ $user == dave ]]; then
+    user_upn="david.davis@${AD_DNS_DOMAIN}"
+  else
+    user_upn="frank.foster@people.${AD_DNS_DOMAIN}"
+  fi
+  ldbmodify -H /var/lib/samba/private/sam.ldb <<EOF
+dn: ${user_dn}
+changetype: modify
+replace: userPrincipalName
+userPrincipalName: ${user_upn}
+EOF
+done
+
 for group in Finance_Analysts Engineering_Leads FS_Finance FS_Engineering FS_Projects; do
   ensure_group "$group"
 done

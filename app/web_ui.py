@@ -332,19 +332,24 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
 
     workgroup = os.environ["WORKGROUP"]
     realm = os.environ["REALM"]
+    is_upn = "\\" not in qualified
     if "\\" in qualified:
         domain_name, account = qualified.split("\\", 1)
         if domain_name.casefold() != workgroup.casefold():
             return None
+        principal = f"{account}@{realm}"
     else:
-        account, principal_realm = qualified.rsplit("@", 1)
-        domain_names = {realm.casefold(), workgroup.casefold(), os.getenv("DOMAIN", realm).casefold()}
-        if principal_realm.casefold() not in domain_names:
+        if qualified.count("@") != 1:
             return None
-    if not account or is_excluded_user(account):
+        account, principal_realm = qualified.rsplit("@", 1)
+        # A UPN suffix belongs to AD, including alternate DNS suffixes. DOMAIN
+        # names the domain controller; WORKGROUP is only for DOMAIN\user logins.
+        if not principal_realm or principal_realm.casefold() == workgroup.casefold() or any(char.isspace() for char in principal_realm):
+            return None
+        principal = qualified
+    if not account or any(char in account for char in "@\\/") or is_excluded_user(account):
         return None
     canonical_name = f"{workgroup}\\{account}"
-    principal = f"{account}@{realm}"
 
     cache_fd = -1
     cache_path = ""
@@ -356,8 +361,9 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
         cache_fd = -1
         command_env = os.environ.copy()
         command_env["KRB5CCNAME"] = f"FILE:{cache_path}"
+        command_env["LC_ALL"] = "C"
         auth_result = subprocess.run(
-            ["kinit", principal],
+            ["kinit", *(["-C", "-E"] if is_upn else []), "--", principal],
             input=f"{password}\n",
             capture_output=True,
             text=True,
@@ -365,6 +371,20 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
             timeout=15,
             check=False,
         )
+        if auth_result.returncode != 0:
+            return None
+        if is_upn:
+            # Use the KDC-confirmed account, never assume the UPN prefix is its
+            # sAMAccountName. Keep the ticket private and remove it below.
+            ticket = subprocess.run(["klist", "-c", cache_path], capture_output=True, text=True,
+                                    env=command_env, timeout=15, check=False)
+            matched = re.search(r"^Default principal:\s*([^\s@\\/]+)@([^\s]+)\s*$", ticket.stdout, re.MULTILINE)
+            if ticket.returncode != 0 or not matched or matched.group(2).casefold() != realm.casefold():
+                return None
+            account = matched.group(1)
+            if is_excluded_user(account):
+                return None
+            canonical_name = f"{workgroup}\\{account}"
     except (OSError, subprocess.TimeoutExpired):
         return None
     finally:
@@ -375,9 +395,6 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
                 os.remove(cache_path)
             except OSError:
                 pass
-    if auth_result.returncode != 0:
-        return None
-
     try:
         sid_result = subprocess.run(
             ["wbinfo", "--name-to-sid", canonical_name],

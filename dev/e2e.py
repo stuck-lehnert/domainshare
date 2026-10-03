@@ -241,11 +241,20 @@ def main() -> int:
     )
     check(non_admin.status == 200 and non_admin.json().get("role") == "user", "valid non-admin domain user cannot sign in")
     user_token = non_admin.json()["token"]
-    for username in (f"{WORKGROUP}\\alice", f"alice@{DNS_DOMAIN}", f"alice@{WORKGROUP}"):
+    for username in (f"{WORKGROUP}\\alice", f"alice@{DNS_DOMAIN}", f"alice@{DNS_DOMAIN.upper()}"):
         formatted = http("/api/login", method="POST", value={"username": username, "password": USER_PASSWORD})
         check(formatted.status == 200, f"qualified user login failed for {username}")
         check(formatted.json().get("sid") == non_admin.json()["sid"] and formatted.json().get("role") == "user",
               "login format changes identity or grants administration")
+    check(http("/api/login", method="POST", value={"username": f"alice@{WORKGROUP}", "password": USER_PASSWORD}).status == 401,
+          "UPN login accepts a NetBIOS suffix")
+    for account, upn in (("dave", f"david.davis@{DNS_DOMAIN}"), ("frank", f"frank.foster@people.{DNS_DOMAIN}")):
+        legacy = http("/api/login", method="POST", value={"username": f"{WORKGROUP}\\{account}", "password": USER_PASSWORD})
+        modern = http("/api/login", method="POST", value={"username": upn, "password": USER_PASSWORD})
+        check(legacy.status == modern.status == 200, f"UPN alias authentication failed for {upn}")
+        check(modern.json()["user"] == f"{WORKGROUP}\\{account}" and modern.json()["sid"] == legacy.json()["sid"],
+              "UPN prefix is confused with another account")
+        check(modern.json()["role"] == "user", "UPN alias receives unexpected admin access")
     for endpoint in ("/api/overview", "/api/access", "/api/storage", "/api/trash", "/api/report", "/api/system"):
         check(http(endpoint, token=user_token).status == 403, f"non-admin can read {endpoint}")
     for endpoint in ("/api/access", "/api/actions/backup", "/api/actions/reconciliation", "/api/trash/restore"):
