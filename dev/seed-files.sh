@@ -18,8 +18,8 @@ mkdir -p \
 printf 'Quarter,Forecast\nQ1,120000\nQ2,135000\n' > /data/groups/data/Finance/Reports/forecast.csv
 printf '# Architecture\n\nPreview design notes.\n' > /data/groups/data/Engineering/Designs/architecture.md
 printf 'Milestone,Owner\nDiscovery,Eve\nDelivery,Carol\n' > /data/groups/data/Projects/Planning/roadmap.csv
-printf 'Alice private preview data.\n' > /data/private/alice/readme.txt
-printf 'Bob private preview data.\n' > /data/private/bob/readme.txt
+printf 'Alice private preview data. ALICEPRIVATE742\n' > /data/private/alice/readme.txt
+printf 'Bob private preview data. BOBPRIVATE742\n' > /data/private/bob/readme.txt
 printf 'Carol private preview data.\n' > /data/private/carol/readme.txt
 printf 'Dummy FSLogix profile for Alice.\n' > /data/fslogix/alice_S-1-5-21-111-222-333-1101/profile.vhdx
 printf 'Dummy FSLogix profile for Carol.\n' > /data/fslogix/carol_S-1-5-21-111-222-333-1103/profile.vhdx
@@ -30,6 +30,29 @@ dd if=/dev/zero of=/data/fslogix/alice_S-1-5-21-111-222-333-1101/profile-data.bi
 
 
 printf '[preview-seed] Seeded group, private, and FSLogix data.\n'
+
+# Native text, image-only scan and Office fixture for the document portal.
+python3 - <<'PYDOCUMENTS'
+from pathlib import Path
+import zipfile
+from PIL import Image, ImageDraw, ImageFont
+from reportlab.pdfgen import canvas
+root=Path('/data/groups/data/Finance/Reports')
+native=canvas.Canvas(str(root/'digital-invoice.pdf'))
+native.drawString(72,760,'Digital invoice NATIVEINVOICE742')
+native.showPage()
+native.drawString(72,760,'Digital invoice page 2')
+native.showPage()
+native.drawString(72,760,'Digital invoice page 3')
+native.save()
+image=Image.new('RGB',(1654,2339),'white')
+font=next(Path('/usr/share/fonts').rglob('NimbusSans-Regular.otf'))
+draw=ImageDraw.Draw(image)
+draw.text((120,200),'INVOICE SCAN\nCustomer reference SCANNEDUNIQUE742\nInvoice total 1500 EUR\nPayment due 30 October 2026',fill='black',font=ImageFont.truetype(str(font),44),spacing=40)
+image.save(root/'scanned-invoice.pdf','PDF',resolution=150)
+with zipfile.ZipFile(root/'office-notes.docx','w') as office:
+    office.writestr('word/document.xml','<document><body><p><t>Office document OFFICETEXT742</t></p></body></document>')
+PYDOCUMENTS
 
 # Seed the old state layout to exercise the one-time migration on startup.
 python3 - <<'PYSEED'

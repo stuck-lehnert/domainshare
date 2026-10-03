@@ -88,6 +88,8 @@ def http(
     value: Optional[Dict[str, object]] = None,
     token: str = "",
 ) -> Response:
+    if path.startswith("/api/") and not path.startswith("/api/documents") and path.split("?",1)[0] not in {"/api/login", "/api/logout", "/api/session"}:
+        path = "/admin" + path
     body = None
     headers = {"Accept": "application/json"}
     if value is not None:
@@ -153,7 +155,7 @@ def main() -> int:
     health = http("/healthz")
     check(health.status == 200 and health.json() == {"status": "ok"}, "health check failed")
     index = http("/")
-    check(index.status == 200 and b'Dateiserver-Verwaltung' in index.body, "German web shell was not served")
+    check(index.status == 200 and b'portal.js' in index.body, "German web shell was not served")
     check(b'<html lang="de">' in index.body, "web shell language is not German")
     styles = http("/assets/styles.css")
     check(b"[hidden]" in styles.body and b"display: none !important" in styles.body, "hidden views can be made visible by author CSS")
@@ -162,7 +164,7 @@ def main() -> int:
     check(
         b"Sicherung jetzt starten" in script.body
         and b"Freigaben jetzt abgleichen" in script.body
-        and b'href="/reconciliation"' in index.body,
+        and b'href="/admin/reconciliation"' in http('/admin/access').body,
         "manual actions or the top-level reconciliation navigation are missing",
     )
     check(b"localTime" not in script.body and b"eyebrow" not in script.body, "obsolete local-time or decorative UI code remains")
@@ -237,7 +239,17 @@ def main() -> int:
         method="POST",
         value={"username": "alice", "password": USER_PASSWORD},
     )
-    check(non_admin.status == 401, "valid non-admin domain user was allowed into the UI")
+    check(non_admin.status == 200 and non_admin.json().get("role") == "user", "valid non-admin domain user cannot sign in")
+    user_token = non_admin.json()["token"]
+    for username in (f"{WORKGROUP}\\alice", f"alice@{DNS_DOMAIN}", f"alice@{WORKGROUP}"):
+        formatted = http("/api/login", method="POST", value={"username": username, "password": USER_PASSWORD})
+        check(formatted.status == 200, f"qualified user login failed for {username}")
+        check(formatted.json().get("sid") == non_admin.json()["sid"] and formatted.json().get("role") == "user",
+              "login format changes identity or grants administration")
+    for endpoint in ("/api/overview", "/api/access", "/api/storage", "/api/trash", "/api/report", "/api/system"):
+        check(http(endpoint, token=user_token).status == 403, f"non-admin can read {endpoint}")
+    for endpoint in ("/api/access", "/api/actions/backup", "/api/actions/reconciliation", "/api/trash/restore"):
+        check(http(endpoint, method="POST", value={}, token=user_token).status == 403, f"non-admin can mutate {endpoint}")
     wrong_password = http(
         "/api/login",
         method="POST",
@@ -254,7 +266,7 @@ def main() -> int:
     token = str(login_payload.get("token", ""))
     claims = decode_jwt_payload(token)
     check(claims.get("iss") == "ad-file-server-web", "JWT issuer is wrong")
-    check(claims.get("aud") == "domain-admins", "JWT audience is wrong")
+    check(claims.get("aud") == "ad-users", "JWT audience is wrong")
     check(claims.get("role") == "domain-admin", "JWT role is wrong")
     check(claims.get("sub") == f"{WORKGROUP}\\{ADMIN_USER}", "JWT subject is wrong")
     cookie = login.headers.get("Set-Cookie", "")
@@ -296,6 +308,66 @@ def main() -> int:
         "-U", f"{WORKGROUP}\\MSOL_sync%{USER_PASSWORD}", "-c", "cd Finance; ls", check_result=False)
     check(service_denied.returncode != 0 or "NT_STATUS_ACCESS_DENIED" in service_denied.stdout,
           "excluded service account received migrated access")
+
+    announce("live filename/full-text search, real PDF OCR, and own Private access")
+    portal = eventually("initial document catalog", lambda: http("/api/documents", token=user_token),
+                        lambda r: r.status == 200 and r.json().get("total",0) > 0, timeout=90).json()
+    check(all(row.get("source") != "Engineering" for row in portal["items"]), "unassigned Engineering folder appears in user portal")
+    own = eventually("own Private full text", lambda: http(query_path("/api/documents", {"q":"ALICEPRIVATE742","scope":"content"}), token=user_token),
+                     lambda r: r.status == 200 and r.json().get("total") == 1, timeout=90).json()
+    check(own["items"][0]["kind"] == "private", "own Private document is absent")
+    check(http(query_path("/api/documents", {"q":"BOBPRIVATE742"}), token=user_token).json()["total"] == 0, "another user's Private text is searchable")
+    scanned = eventually("real scan OCR full text", lambda: http(query_path("/api/documents", {"q":"SCANNEDUNIQUE742","scope":"content"}), token=user_token),
+                         lambda r: r.status == 200 and r.json().get("total") == 1, timeout=120).json()["items"][0]
+    scanned_detail = http("/api/documents/"+scanned["id"], token=user_token)
+    check(scanned_detail.status == 200 and "SCANNEDUNIQUE742" in scanned_detail.json()["text"], "OCR content unavailable in document detail")
+    check(http("/api/documents/"+scanned["id"]+"/preview", token=user_token).body.startswith(b"\xff\xd8"), "scan JPEG preview is absent")
+    downloaded_scan = http("/api/documents/"+scanned["id"]+"/download", token=user_token)
+    check(downloaded_scan.status == 200 and downloaded_scan.body.startswith(b"%PDF-"), "original scan download failed")
+    # An admin cannot use the user portal to inspect someone else's home either.
+    check(http(query_path("/api/documents", {"q":"BOBPRIVATE742"}), token=token).json()["total"] == 0, "admin user portal exposes another home")
+    office = eventually("Office document full text", lambda: http(query_path("/api/documents", {"q":"OFFICETEXT742"}), token=user_token),
+                        lambda r: r.status == 200 and r.json().get("total") == 1, timeout=90).json()
+    check(office["items"][0]["extension"] == "docx", "Office full text extraction failed")
+    # Guessing an indexed ID is insufficient to get another user's content.
+    hidden_id = engine_run("exec", FILES_CONTAINER, "python3", "-c", "import sqlite3; c=sqlite3.connect('/state/documents/search.db'); print(c.execute(\"SELECT id FROM documents WHERE source_id='private:bob' AND name='readme.txt'\").fetchone()[0])").stdout.strip()
+    for suffix in ("", "/preview", "/download", "/content"):
+        check(http("/api/documents/"+hidden_id+suffix, token=user_token).status == 404, "guessed private document ID exposes data")
+    if os.getenv("PLAYWRIGHT_MODULE"):
+        announce("real browser: user portal, PDF preview, and /admin separation")
+        result = subprocess.run(["node", "tests/document_live_smoke.mjs"], check=False)
+        check(result.returncode == 0, "live user/admin browser check failed")
+
+    announce("document worker monitoring, paused catalog, and active OCR cancellation")
+    status_path = "/admin/api/documents/status"
+    control_path = "/admin/api/documents/control"
+    check(http(status_path, token=user_token).status == 403, "ordinary user can monitor all document jobs")
+    check(http(control_path, method="POST", value={"action":"pause"}, token=user_token).status == 403, "ordinary user can control document jobs")
+    paused = http(control_path, method="POST", value={"action":"pause"}, token=token)
+    check(paused.status == 200 and paused.json()["paused"], "admin cannot pause indexing")
+    eventually("document worker pauses", lambda: http(status_path, token=token),
+               lambda r: r.status == 200 and r.json()["state"] == "paused" and not r.json()["scanning"], timeout=15)
+    engine_run("exec", CLIENT_CONTAINER, "sh", "-c", "printf 'PAUSED_QUEUE742\n' > /tmp/paused-note.txt")
+    engine_run("exec", CLIENT_CONTAINER, "smbclient", f"//files.{DNS_DOMAIN}/Data", "-m", "SMB3",
+               "-U", f"{WORKGROUP}\\alice%{USER_PASSWORD}", "-c", "cd Finance; cd Reports; put /tmp/paused-note.txt paused-note.txt; get scanned-invoice.pdf /tmp/pausable-scan.pdf; put /tmp/pausable-scan.pdf pausable-scan.pdf")
+    paused_at = time.time()
+    eventually("paused worker heartbeat", lambda: http(status_path, token=token),
+               lambda r: r.status == 200 and r.json()["heartbeat"] > paused_at + 1 and r.json()["paused"], timeout=15)
+    check(http(query_path("/api/documents", {"q":"paused-note","scope":"name"}), token=user_token).json()["total"] == 0, "catalog keeps indexing while paused")
+    check(http(control_path, method="POST", value={"action":"resume"}, token=token).status == 200, "index cannot resume")
+    eventually("new scan reaches OCR phase", lambda: http(status_path, token=token),
+               lambda r: r.status == 200 and r.json()["state"] == "ocr" and (r.json().get("current") or {}).get("name") == "pausable-scan.pdf", timeout=60, interval=0.1)
+    check(http(control_path, method="POST", value={"action":"pause"}, token=token).status == 200, "active OCR cannot pause")
+    stopped = eventually("active OCR interrupted", lambda: http(status_path, token=token),
+                         lambda r: r.status == 200 and r.json()["state"] == "paused" and r.json()["current"] is None, timeout=15).json()
+    check(any(event["action"] == "interrupted" for event in stopped["activity"]), "active OCR was not interrupted")
+    queued_scan = http(query_path("/api/documents", {"q":"pausable-scan.pdf","scope":"name"}), token=user_token).json()["items"][0]
+    check(queued_scan["state"] == "ocr" and queued_scan["attempts"] == 0, "pause loses OCR phase or counts as a failure")
+    http(control_path, method="POST", value={"action":"resume"}, token=token)
+    eventually("paused scan completes after resume", lambda: http("/api/documents/"+queued_scan["id"], token=user_token),
+               lambda r: r.status == 200 and r.json()["state"] == "ready" and "SCANNEDUNIQUE742" in r.json()["text"], timeout=90)
+    eventually("paused filename and content become searchable", lambda: http(query_path("/api/documents", {"q":"PAUSED_QUEUE742"}), token=user_token),
+               lambda r: r.status == 200 and r.json()["total"] == 1, timeout=45)
 
     announce("legacy GUID-path migration preserves file hashes and inodes")
     engine_run("exec", FILES_CONTAINER, "python3", "-c", """
@@ -800,6 +872,11 @@ fi
     rules(2)
     allowed("cd Permissions; put /tmp/live-note.txt created.txt")
     allowed("cd Permissions; put /tmp/live-note.txt existing.txt")
+    engine_run("exec", CLIENT_CONTAINER, "sh", "-c", "printf 'LIVE_CONTENT742 from SMB\n' > /tmp/live-search.txt")
+    allowed("cd Permissions; put /tmp/live-search.txt live-search.txt")
+    live_row = eventually("SMB write becomes full-text searchable", lambda: http(query_path("/api/documents", {"q":"LIVE_CONTENT742"}), token=user_token),
+                          lambda r: r.status == 200 and r.json().get("total") == 1, timeout=45).json()["items"][0]
+
     allowed("cd Permissions; mkdir Child")
     allowed("cd Permissions; cd Child; put /tmp/live-note.txt inherited.txt")
     denied("cd Permissions; del existing.txt")
@@ -828,6 +905,9 @@ fi
     change({"action": "restore-folder", "id": folder_id})
     allowed("cd Permissions; ls", "bob")
     change({"action": "set-permissions", "id": folder_id, "permissions": []})
+    check(http(query_path("/api/documents", {"q":"LIVE_CONTENT742"}), token=user_token).json()["total"] == 0, "revoked folder remains searchable")
+    for suffix in ("", "/preview", "/download", "/content"):
+        check(http("/api/documents/"+live_row["id"]+suffix, token=user_token).status == 404, "revoked file remains readable through portal")
     code, output = smb("cd Permissions; ls", "bob")
     check(code != 0 or "NT_STATUS_ACCESS_DENIED" in output, "removed individual assignment still grants access")
     invalid = http("/api/access", method="POST", value={"action": "create-folder", "name": "../escape"}, token=token)
@@ -908,8 +988,13 @@ with access.mutation_lock():
     conn.close()
     print(json.dumps(previous))
 """, repair_id).stdout)
+    check(http(control_path, method="POST", value={"action":"pause"}, token=token).status == 200, "cannot persist worker pause before restart")
     engine_run("restart", FILES_CONTAINER)
     eventually("file server startup after legacy path repair", lambda: http("/healthz"), lambda response: response.status == 200, timeout=120)
+    restarted_worker = eventually("paused document worker after restart", lambda: http(status_path, token=token),
+                                 lambda r: r.status == 200 and r.json()["online"], timeout=30).json()
+    check(restarted_worker["paused"], "container restart lost document pause state")
+    check(http(control_path, method="POST", value={"action":"resume"}, token=token).status == 200, "worker cannot resume after restart")
     repaired = http("/api/access", token=token).json()
     restored_folder = next(f for f in repaired["folders"] if f["id"] == repair_id)
     check(restored_folder["name"] == "Startup recovery", "startup repair changed a noncolliding folder name")

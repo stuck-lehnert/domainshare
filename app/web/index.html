@@ -11,7 +11,7 @@
   <section id="login-view" class="login-view" hidden>
     <main class="login-card">
       <h1>Dateiserver-Verwaltung</h1>
-      <p>Anmeldung nur für Domänenadministratoren. Ohne Domänenangabe wird automatisch die konfigurierte NetBIOS-Domäne verwendet.</p>
+      <p>Verwaltung für Domänenadministratoren.</p>
       <form id="login-form" class="stack">
         <label>Benutzername<input name="username" autocomplete="username" required autofocus placeholder="benutzername"></label>
         <label>Passwort<input name="password" type="password" autocomplete="current-password" required></label>
@@ -25,19 +25,20 @@
     <aside class="sidebar">
       <div class="brand">Dateiserver</div>
       <nav id="navigation" aria-label="Hauptnavigation">
-        <a href="/overview" data-route="overview">Übersicht</a>
-        <a href="/access" data-route="access">Zugriffsverwaltung</a>
-        <a href="/reconciliation" data-route="reconciliation">Freigabenabgleich</a>
-        <a href="/storage/data" data-route="storage-data">Datenbelegung</a>
-        <a href="/storage/users" data-route="storage-users">Benutzerbelegung</a>
-        <a href="/activity" data-route="activity">Aktivitätsprotokoll</a>
-        <a href="/activity/fslogix" data-route="activity-fslogix">FSLogix-Protokoll</a>
-        <a href="/trash" data-route="trash">Papierkorb</a>
-        <a href="/backup" data-route="backup">Sicherungen</a>
-        <a href="/report" data-route="report">PDF-Bericht</a>
-        <a href="/system" data-route="system">System</a>
+        <a href="/admin/overview" data-route="overview">Übersicht</a>
+        <a href="/admin/access" data-route="access">Zugriffsverwaltung</a>
+        <a href="/admin/documents" data-route="documents">Dokumentindex</a>
+        <a href="/admin/reconciliation" data-route="reconciliation">Freigabenabgleich</a>
+        <a href="/admin/storage/data" data-route="storage-data">Datenbelegung</a>
+        <a href="/admin/storage/users" data-route="storage-users">Benutzerbelegung</a>
+        <a href="/admin/activity" data-route="activity">Aktivitätsprotokoll</a>
+        <a href="/admin/activity/fslogix" data-route="activity-fslogix">FSLogix-Protokoll</a>
+        <a href="/admin/trash" data-route="trash">Papierkorb</a>
+        <a href="/admin/backup" data-route="backup">Sicherungen</a>
+        <a href="/admin/report" data-route="report">PDF-Bericht</a>
+        <a href="/admin/system" data-route="system">System</a>
       </nav>
-      <div class="sidebar-footer"><span id="session-user"></span><button id="logout" class="link-button">Abmelden</button></div>
+      <div class="sidebar-footer"><a href="/">Dateiansicht</a><span id="session-user"></span><button id="logout" class="link-button">Abmelden</button></div>
     </aside>
     <header class="mobile-header"><button id="menu-toggle" aria-label="Navigation ein- oder ausblenden">Menü</button><strong>Dateiserver</strong></header>
     <main id="content" class="content" tabindex="-1"></main>

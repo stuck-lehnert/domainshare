@@ -15,6 +15,11 @@ RUN apt-get update \
         libpam-winbind \
         python3 \
         python3-samba \
+        python3-pil \
+        ocrmypdf \
+        poppler-utils \
+        tesseract-ocr-deu \
+        tesseract-ocr-eng \
         p7zip-full \
         rclone \
         rsync \
@@ -24,6 +29,8 @@ RUN apt-get update \
         tini \
         winbind \
     && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin document-ocr
 
 RUN mkdir -p /app /data/private /data/fslogix /data/groups/data /data/groups/archive /state
 COPY --from=step-cli /usr/local/bin/step /usr/local/bin/step
@@ -38,6 +45,9 @@ COPY app/audit_store.py /app/audit_store.py
 COPY app/audit_collector.py /app/audit_collector.py
 COPY app/trash.py /app/trash.py
 COPY app/web_ui.py /app/web_ui.py
+COPY app/documents.py /app/documents.py
+COPY app/document_index.py /app/document_index.py
+COPY app/extract_document.py /app/extract_document.py
 COPY app/web /app/web
 COPY app/init.sh /app/init.sh
 COPY etc/samba/smb.conf /app/smb.conf.template

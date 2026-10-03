@@ -17,7 +17,7 @@ class TokenManagerTests(unittest.TestCase):
     def test_issues_and_verifies_short_lived_admin_jwt(self):
         manager = web_ui.TokenManager("s" * 48, 600)
 
-        token, expires = manager.issue("EXAMPLE\\alice")
+        token, expires = manager.issue("EXAMPLE\\alice", "S-1-5-21-1-2-3-1100", "domain-admin")
         payload = manager.verify(token)
 
         self.assertEqual(payload["sub"], "EXAMPLE\\alice")
@@ -26,7 +26,7 @@ class TokenManagerTests(unittest.TestCase):
 
     def test_rejects_tampered_jwt(self):
         manager = web_ui.TokenManager("s" * 48, 600)
-        token, _ = manager.issue("EXAMPLE\\alice")
+        token, _ = manager.issue("EXAMPLE\\alice", "S-1-5-21-1-2-3-1100", "domain-admin")
 
         with self.assertRaisesRegex(ValueError, "Invalid or expired"):
             manager.verify(f"{token[:-1]}x")
@@ -290,6 +290,8 @@ class DomainAuthenticationTests(unittest.TestCase):
             mock.Mock(returncode=0, stdout=""),
             mock.Mock(returncode=0, stdout="S-1-5-21-1-2-3-1100 SID_USER (1)\n"),
             mock.Mock(returncode=0, stdout="S-1-5-21-1-2-3-1100\nS-1-5-21-1-2-3-512\n"),
+            mock.Mock(returncode=0, stdout="EXAMPLE\\alice 1\n"),
+            mock.Mock(returncode=0, stdout="11100\n"),
         ]
 
         result = web_ui.authenticate_domain_admin("alice", "p@ss word")
@@ -297,6 +299,50 @@ class DomainAuthenticationTests(unittest.TestCase):
         self.assertEqual(result, "EXAMPLE\\alice")
         self.assertEqual(run.call_args_list[0].args[0], ["kinit", "alice@EXAMPLE.COM"])
         self.assertNotIn("p@ss word", run.call_args_list[0].args[0])
+
+    @mock.patch.dict(os.environ, {'WORKGROUP':'EXAMPLE','REALM':'EXAMPLE.COM','DOMAIN_ADMINS_SID':'S-1-5-21-1-2-3-512'})
+    @mock.patch('app.web_ui.subprocess.run')
+    def test_all_human_domain_users_can_authenticate_without_admin_membership(self, run):
+        run.side_effect = [mock.Mock(returncode=0,stdout=''),
+                           mock.Mock(returncode=0,stdout='S-1-5-21-1-2-3-1100 SID_USER (1)'),
+                           mock.Mock(returncode=0,stdout='S-1-5-21-1-2-3-513'),
+                           mock.Mock(returncode=0,stdout='EXAMPLE\\alice 1'),
+                           mock.Mock(returncode=0,stdout='11100')]
+        result = web_ui.authenticate_user('alice','password')
+        self.assertEqual(result,{'sub':'EXAMPLE\\alice','sid':'S-1-5-21-1-2-3-1100','uid':11100,'role':'user'})
+
+    @mock.patch.dict(os.environ, {'WORKGROUP':'EXAMPLE','REALM':'EXAMPLE.COM','DOMAIN':'example.com','DOMAIN_ADMINS_SID':'S-1-5-21-1-2-3-512'})
+    @mock.patch('app.web_ui.subprocess.run')
+    def test_login_formats_resolve_the_same_identity_and_role(self, run):
+        for name in ('alice','EXAMPLE\\alice','example\\alice','alice@example.com','alice@EXAMPLE.COM','alice@EXAMPLE'):
+            with self.subTest(name=name):
+                run.reset_mock()
+                run.side_effect = [mock.Mock(returncode=0,stdout=''),
+                                   mock.Mock(returncode=0,stdout='S-1-5-21-1-2-3-1100 SID_USER (1)'),
+                                   mock.Mock(returncode=0,stdout='S-1-5-21-1-2-3-513'),
+                                   mock.Mock(returncode=0,stdout='EXAMPLE\\alice 1'),
+                                   mock.Mock(returncode=0,stdout='11100')]
+                value = web_ui.authenticate_user(name,'password')
+                self.assertEqual(value['sub'],'EXAMPLE\\alice')
+                self.assertEqual(value['role'],'user')
+                self.assertEqual(run.call_args_list[0].args[0],['kinit','alice@EXAMPLE.COM'])
+                self.assertEqual(run.call_args_list[1].args[0],['wbinfo','--name-to-sid','EXAMPLE\\alice'])
+        run.reset_mock()
+        for name in ('alice@other.example','OTHER\\alice','MSOL_sync@example.com','krbtgt@example.com'):
+            self.assertIsNone(web_ui.authenticate_user(name,'password'))
+        run.assert_not_called()
+
+    @mock.patch.dict(os.environ, {'WORKGROUP':'EXAMPLE','REALM':'EXAMPLE.COM','DOMAIN_ADMINS_SID':'S-1-5-21-1-2-3-512'})
+    @mock.patch('app.web_ui.subprocess.run')
+    def test_system_accounts_rejected_even_when_resolved_from_an_alias(self, run):
+        for username in ('MSOL_sync','EXAMPLE\\krbtgt'):
+            self.assertIsNone(web_ui.authenticate_user(username,'password'))
+        run.assert_not_called()
+        run.side_effect = [mock.Mock(returncode=0,stdout=''),
+                           mock.Mock(returncode=0,stdout='S-1-5-21-1-2-3-1100 SID_USER (1)'),
+                           mock.Mock(returncode=0,stdout='S-1-5-21-1-2-3-513'),
+                           mock.Mock(returncode=0,stdout='EXAMPLE\\MSOL_sync 1')]
+        self.assertIsNone(web_ui.authenticate_user('other-name','password'))
 
 
 class DirectoryManagedFolderTests(unittest.TestCase):
@@ -1202,8 +1248,8 @@ class WebPresentationTests(unittest.TestCase):
         self.assertNotIn("nav-group", html)
         self.assertIn('>Datenbelegung</a>', html)
         self.assertIn('>Benutzerbelegung</a>', html)
-        self.assertIn('href="/reconciliation" data-route="reconciliation">Freigabenabgleich</a>', html)
-        self.assertIn('href="/report" data-route="report">PDF-Bericht</a>', html)
+        self.assertIn('href="/admin/reconciliation" data-route="reconciliation">Freigabenabgleich</a>', html)
+        self.assertIn('href="/admin/report" data-route="report">PDF-Bericht</a>', html)
         self.assertNotIn("brand-mark", html)
         self.assertNotIn("eyebrow", html + script)
         self.assertIn("getUTCHours()", script)
@@ -1218,9 +1264,9 @@ class WebPresentationTests(unittest.TestCase):
         self.assertIn("/activity/fslogix", html)
         self.assertIn("/api/fslogix-activity", script)
         self.assertIn('renderActivity("fslogix")', script)
-        self.assertIn('href="/trash" data-route="trash">Papierkorb</a>', html)
+        self.assertIn('href="/admin/trash" data-route="trash">Papierkorb</a>', html)
         self.assertIn("/api/trash?", script)
-        self.assertIn("/api/trash/download?id=", script)
+        self.assertIn("/admin/api/trash/download?id=", script)
         self.assertIn('api("/api/trash/restore"', script)
         self.assertIn("Herunterladen", script)
         self.assertIn("Wiederherstellen", script)

@@ -959,7 +959,12 @@ def prepare_state_snapshot(
 
     temporary_root = tempfile.mkdtemp(prefix="backup-state-")
     staged_state = os.path.join(temporary_root, "state")
+    # The document index and previews are derived from backed-up originals.
+    # Rebuild them on restore rather than copy a live second WAL database.
+    document_cache = os.path.abspath(os.getenv("DOCUMENT_STATE_ROOT", os.path.join(state_root, "documents")))
+    document_relative = os.path.relpath(document_cache, state_root)
     excluded = {
+        document_relative,
         database_relative,
         f"{database_relative}-wal",
         f"{database_relative}-shm",

@@ -31,8 +31,8 @@ let nextId=0, failSave=false; const requests=[],errors=[],restores=[];
  const page=await browser.newPage({viewport:{width:1500,height:1050}});
  page.on('pageerror',e=>errors.push(e.message));
  await page.route('http://adfs.test/**',async route=>{
-  const url=new URL(route.request().url());let body,type='application/json',status=200;
-  if(url.pathname==='/api/session')body={user:'EXAMPLE\\admin',expiresAt:9999999999};
+  const url=new URL(route.request().url());url.pathname=url.pathname.replace(/^\/admin(?=\/)/,'');let body,type='application/json',status=200;
+  if(url.pathname==='/api/session')body={user:'EXAMPLE\\admin',expiresAt:9999999999,role:'domain-admin'};
   else if(url.pathname==='/api/access'){
    if(route.request().method()==='POST'){
     const change=route.request().postDataJSON();requests.push(change);
@@ -88,7 +88,7 @@ let nextId=0, failSave=false; const requests=[],errors=[],restores=[];
   assert.deepEqual(differences,[],'Access controls differ from the established admin styles');
  };
  await page.goto('http://adfs.test/shares');await page.locator('[data-user-rule]').first().waitFor();
- assert.equal(new URL(page.url()).pathname,'/access');
+ assert.equal(new URL(page.url()).pathname,'/admin/access');
  assert.equal(await page.locator('nav a[href="/shares"]').count(),0);
  assert.equal(await page.locator('[data-tab=groups], [data-group-rule]').count(),0);
  assert.doesNotMatch(await page.locator('#content').innerText(),/Gruppe/);
@@ -151,7 +151,7 @@ let nextId=0, failSave=false; const requests=[],errors=[],restores=[];
  assert.equal(await page.locator('#folder-status').inputValue(),'active');
  assert.equal(dialogs,2);
  await page.locator('a[data-route="storage-data"]').click();
- assert.equal(new URL(page.url()).pathname,'/access');
+ assert.equal(new URL(page.url()).pathname,'/admin/access');
  assert.equal(dialogs,3);
  failSave=true;await page.locator('#access-save').click();
  await page.locator('.access-message.failure').waitFor();
@@ -237,7 +237,7 @@ let nextId=0, failSave=false; const requests=[],errors=[],restores=[];
                  {sid:'unassigned',sam:'unzugeordnet',name:'Nicht zugeordnet',available:false});
  data.folders.find(f=>f.id==='invoices').permissions.push({kind:'user',principalId:'departed',level:1});
  await page.setViewportSize({width:1500,height:1050});
- await page.goto('http://adfs.test/access');
+ await page.goto('http://adfs.test/admin/access');
  await page.locator('[data-user-rule=departed]').first().waitFor();
  assert.equal(await page.locator('[data-user-rule=unassigned]').count(),0);
  await page.locator('#access-user-search').fill('ehemalig');
@@ -247,7 +247,7 @@ let nextId=0, failSave=false; const requests=[],errors=[],restores=[];
  assert.equal(await page.locator('[data-user-rule=departed]').count(),0);
  // An installation with only archived folders opens the matching list.
  data.folders.forEach(f=>f.active=false);
- await page.goto('http://adfs.test/access');
+ await page.goto('http://adfs.test/admin/access');
  await page.locator('#access-archive').waitFor();
  assert.equal(await page.locator('#folder-status').inputValue(),'archived');
  assert.equal(await page.locator('[data-select].active').count(),1);
@@ -255,12 +255,12 @@ let nextId=0, failSave=false; const requests=[],errors=[],restores=[];
  assert.equal(await page.locator('#access-save').isDisabled(),true);
  data.folders.length=0;
  await page.setViewportSize({width:1500,height:1050});
- await page.goto('http://adfs.test/access');
+ await page.goto('http://adfs.test/admin/access');
  await page.locator('#access-create').waitFor();
  assert.match(await page.locator('#access-detail').innerText(),/Ersten Ordner anlegen/);
  await shot('07-desktop-leere-installation');
  // Icon controls keep accessible names and activate their original actions.
- await page.goto('http://adfs.test/trash');
+ await page.goto('http://adfs.test/admin/trash');
  await page.locator('#trash-rows .row-actions').first().waitFor();
  for(const [role,name] of [['link','Herunterladen'],['button','Wiederherstellen']]){
   const control=page.getByRole(role,{name,exact:true}).first();
@@ -272,7 +272,7 @@ let nextId=0, failSave=false; const requests=[],errors=[],restores=[];
  const downloadStarted=page.waitForEvent('download');
  await page.getByRole('link',{name:'Herunterladen',exact:true}).first().locator('svg').click();
  const download=await downloadStarted;
- assert.equal(download.url(),'http://adfs.test/api/trash/download?id=data%2Freport');
+ assert.equal(download.url(),'http://adfs.test/admin/api/trash/download?id=data%2Freport');
  // Downloads leave page interception; verify the destination and cancel the mocked transfer.
  await download.cancel();
  await page.getByRole('button',{name:'Wiederherstellen',exact:true}).first().locator('svg').click();

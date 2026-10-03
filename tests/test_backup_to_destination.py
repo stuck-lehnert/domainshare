@@ -1,5 +1,6 @@
 import io
 import os
+from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
@@ -346,6 +347,28 @@ class GroupArchiveTests(unittest.TestCase):
 
 
 class StateSnapshotTests(unittest.TestCase):
+    def test_document_cache_is_omitted_without_changing_originals_or_access_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            cache = state / "documents"
+            cache.mkdir(parents=True)
+            (cache / "search.db").write_bytes(b"derived index")
+            original = Path(tmpdir) / "original.pdf"
+            original.write_bytes(b"original PDF bytes")
+            database = state / "shares.db"
+            sqlite3.connect(database).close()
+            (state / "data-xattrs.tdb").write_bytes(b"access records")
+            with mock.patch.dict(os.environ, {"DOCUMENT_STATE_ROOT": str(cache)}):
+                snapshot_root, staged = backup.prepare_state_snapshot(str(state), str(database))
+            try:
+                self.assertFalse((Path(staged) / "documents").exists())
+                self.assertEqual((cache / "search.db").read_bytes(), b"derived index")
+                self.assertEqual(original.read_bytes(), b"original PDF bytes")
+                self.assertEqual((Path(staged) / "data-xattrs.tdb").read_bytes(), b"access records")
+                self.assertTrue((Path(staged) / "shares.db").exists())
+            finally:
+                shutil.rmtree(snapshot_root)
+
     def test_online_snapshot_includes_wal_commits_and_other_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_root = os.path.join(tmpdir, "state")

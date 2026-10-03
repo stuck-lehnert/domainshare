@@ -559,7 +559,15 @@ start_observability_services() {
           ;;
       esac
     fi
-    log "Starting administration web UI for https://${WEB_HOSTNAME}"
+    log 'Starting document search and OCR worker'
+    (
+      while true; do
+        python3 /app/document_index.py || log 'Document worker failed'
+        log 'Document worker stopped; restarting in two seconds'
+        sleep 2
+      done
+    ) &
+    log "Starting web UI for https://${WEB_HOSTNAME}"
     python3 /app/web_ui.py &
   else
     log 'WEB_ENABLED is false; web UI disabled'

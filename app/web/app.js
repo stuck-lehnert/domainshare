@@ -11,7 +11,7 @@ const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp
 function actionIcon(action) {
   const paths = {
     download: '<path d="M12 3v12m-5-5 5 5 5-5"/><path d="M5 16v4h14v-4"/>',
-    restore: '<path d="M3 11a9 9 0 1 1 2.6 7"/><path d="M3 4v7h7"/>',
+    restore: '<path d="M5 12a7 7 0 1 1 2.05 4.95"/><path d="m1 8 4 4 4-4"/>',
   };
   return `<svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths[action]}</svg>`;
 }
@@ -60,6 +60,7 @@ const isoDay = date => date.toISOString().slice(0, 10);
 const sum = (rows, field) => (rows || []).reduce((total, row) => total + Number(row[field] || 0), 0);
 
 async function api(path, options = {}) {
+  if (path.startsWith("/api/") && !["/api/login", "/api/logout", "/api/session"].includes(path)) path = "/admin" + path;
   const response = await fetch(path, {
     ...options,
     headers: {"Content-Type": "application/json", ...(options.headers || {})},
@@ -91,11 +92,12 @@ function showLogin() {
 }
 
 function showApp(session) {
+  if (session.role !== "domain-admin") { location.replace("/"); return; }
   state.session = {user: session.user, expiresAt: session.expiresAt};
   document.querySelector("#session-user").textContent = session.user;
   loginView.hidden = true;
   appView.hidden = false;
-  navigate(location.pathname === "/" ? "/overview" : location.pathname, true);
+  navigate(["/", "/admin", "/admin/"].includes(location.pathname) ? "/admin/overview" : location.pathname, true);
 }
 
 function setLoading() { content.innerHTML = '<div class="loading">Wird geladen…</div>'; }
@@ -106,10 +108,12 @@ function empty(message) { return `<div class="empty">${esc(message)}</div>`; }
 function badge(text, kind = "") { return `<span class="badge ${kind}">${esc(text)}</span>`; }
 
 function routeFor(path) {
+  path = path.replace(/^\/admin(?=\/|$)/, "") || "/overview";
   if (path.startsWith("/storage/data")) return "storage-data";
   if (path.startsWith("/storage/users")) return "storage-users";
   if (path.startsWith("/access")) return "access";
   if (path.startsWith("/reconciliation")) return "reconciliation";
+  if (path.startsWith("/documents")) return "documents";
   if (path.startsWith("/activity/fslogix")) return "activity-fslogix";
   if (path.startsWith("/activity")) return "activity";
   if (path.startsWith("/trash")) return "trash";
@@ -124,7 +128,8 @@ async function navigate(path, replace = false) {
     if (replace && state.currentPath) history.replaceState({}, "", state.currentPath);
     return;
   }
-  if (path === "/shares" || path.startsWith("/shares/")) { path = "/access"; replace = true; }
+  if (path === "/shares" || path.startsWith("/shares/") || path === "/admin/shares") { path = "/admin/access"; replace = true; }
+  if (!path.startsWith("/admin/")) path = "/admin" + path;
   state.accessDirty = false;
   state.currentPath = path;
   clearInterval(state.timer);
@@ -138,6 +143,7 @@ async function navigate(path, replace = false) {
     if (route === "overview") await renderOverview();
     if (route === "access") await renderAccess();
     if (route === "reconciliation") await renderReconciliation();
+    if (route === "documents") await renderDocuments();
     if (route === "storage-data") await renderStorage("data");
     if (route === "storage-users") await renderStorage("users");
     if (route === "activity") await renderActivity();
@@ -489,7 +495,7 @@ async function renderTrash() {
         <td class="path">${esc(item.path)}</td>
         <td class="numeric">${bytes(item.size)}</td>
         <td class="timestamp">${esc(utcTime(item.expiresAt))}</td>
-        <td><div class="row-actions"><a class="button icon-button" href="/api/trash/download?id=${encodeURIComponent(item.id)}" download aria-label="Herunterladen" title="Herunterladen">${actionIcon("download")}</a><button type="button" class="icon-button" data-restore="${esc(item.id)}" aria-label="Wiederherstellen" title="Wiederherstellen">${actionIcon("restore")}</button></div></td>
+        <td><div class="row-actions"><a class="button icon-button" href="/admin/api/trash/download?id=${encodeURIComponent(item.id)}" download aria-label="Herunterladen" title="Herunterladen">${actionIcon("download")}</a><button type="button" class="icon-button" data-restore="${esc(item.id)}" aria-label="Wiederherstellen" title="Wiederherstellen">${actionIcon("restore")}</button></div></td>
       </tr>`).join("");
     }
     const shown = result.items.length.toLocaleString("de-DE");
@@ -729,6 +735,55 @@ async function renderReconciliation() {
   if (!body.isConnected || !button.isConnected) return;
   previousActive = processIsActive(initial);
   state.timer = window.setInterval(() => { void poll(); }, 1500);
+}
+
+async function renderDocuments() {
+  content.innerHTML = pageHead("Dokumentindex", "Dateierfassung, Volltextsuche und PDF-Texterkennung.") + `
+    <section class="panel"><div class="panel-head"><h2 id="document-worker-state" role="status">Status wird geladen…</h2><button type="button" id="document-worker-control" disabled>Anhalten</button></div>
+      <p id="document-worker-current" class="path"></p>
+      <progress id="document-worker-progress" max="100" value="0" aria-label="Indexierungsfortschritt"></progress><p id="document-worker-progress-label" class="muted"></p>
+      <div class="check-list"><div class="check"><span>Letzte Dateierfassung</span><strong id="document-worker-scan">—</strong></div><div class="check"><span>Letztes Lebenszeichen</span><strong id="document-worker-heartbeat">—</strong></div></div>
+    </section>
+    <section class="cards" id="document-worker-counts"></section>
+    <section class="panel"><h2>Ausstehende Wiederholungen</h2><div class="table-wrap document-worker-table"><table><thead><tr><th>Ordner / Datei</th><th>Auftrag</th><th>Versuche</th><th>Nächster Versuch (UTC)</th></tr></thead><tbody id="document-worker-failures"></tbody></table></div></section>
+    <section class="panel"><h2>Aktivität</h2><div class="table-wrap document-worker-table"><table><thead><tr><th>Zeit (UTC)</th><th>Vorgang</th><th>Ordner / Datei</th><th>Benutzer / Ergebnis</th></tr></thead><tbody id="document-worker-activity"></tbody></table></div></section>`;
+  const button = document.querySelector("#document-worker-control");
+  let status, polling = false, controlling = false;
+  const actionLabels = {started:"Worker gestartet",text:"Text erfassen",ocr:"PDF-Texterkennung",complete:"Abgeschlossen","queued-ocr":"Für OCR vorgemerkt",changed:"Datei verändert",failed:"Wiederholung geplant",interrupted:"Auftrag unterbrochen",pause:"Anhalten",resume:"Fortsetzen"};
+  const refresh = async () => {
+    if (polling || !button.isConnected) return;
+    polling = true;
+    try {
+      const data = await api("/api/documents/status");
+      if (!button.isConnected) return;
+      status = data;
+      const paused = data.paused;
+      const caption = !data.online ? "Worker nicht erreichbar" : paused ? (data.current ? "Wird angehalten…" : "Angehalten") : data.state === "ocr" ? "PDF-Texterkennung läuft" : data.state === "text" ? "Text wird erfasst" : data.scanning ? "Dateikatalog wird aktualisiert" : "Bereit";
+      document.querySelector("#document-worker-state").textContent = caption;
+      button.textContent = paused ? "Fortsetzen" : "Anhalten";
+      button.disabled = controlling;
+      document.querySelector("#document-worker-current").textContent = data.current ? `${data.current.source} / ${data.current.path}` : "Kein aktiver Auftrag";
+      document.querySelector("#document-worker-progress").value = data.progress;
+      document.querySelector("#document-worker-progress-label").textContent = `${data.counts.complete.toLocaleString("de-DE")} von ${data.counts.total.toLocaleString("de-DE")} Dateien erfasst · ${data.progress} %`;
+      document.querySelector("#document-worker-scan").textContent = data.last_scan ? utcTime(new Date(data.last_scan * 1000)) : "Ausstehend";
+      document.querySelector("#document-worker-heartbeat").textContent = data.heartbeat ? utcTime(new Date(data.heartbeat * 1000)) : "Ausstehend";
+      document.querySelector("#document-worker-counts").innerHTML = [["Text-Warteschlange",data.counts.pending],["OCR-Warteschlange",data.counts.ocr],["Wiederholungen",data.counts.errors],["Nur Dateiname",data.counts.nameOnly]].map(([label,value]) => `<article class="card"><span class="label">${label}</span><strong class="value">${value.toLocaleString("de-DE")}</strong></article>`).join("");
+      document.querySelector("#document-worker-failures").innerHTML = data.failures.length ? data.failures.map(row => `<tr><td class="path">${esc(row.source)} / ${esc(row.path)}</td><td>${row.state === "ocr" ? "OCR" : "Text"}</td><td>${Number(row.attempts)}</td><td class="timestamp">${esc(utcTime(new Date(row.retry_at * 1000)))}</td></tr>`).join("") : '<tr><td colspan="4" class="empty">Keine fehlgeschlagenen Aufträge</td></tr>';
+      document.querySelector("#document-worker-activity").innerHTML = data.activity.length ? data.activity.map(row => `<tr><td class="timestamp">${esc(utcTime(new Date(row.timestamp * 1000)))}</td><td>${esc(actionLabels[row.action] || row.action)}</td><td class="path">${esc(row.source)}${row.path ? " / " + esc(row.path) : "—"}</td><td>${esc(row.actor || row.message || "—")}</td></tr>`).join("") : '<tr><td colspan="4" class="empty">Noch keine Aktivität</td></tr>';
+    } catch (error) { notice(error.message); }
+    finally { polling = false; }
+  };
+  button.addEventListener("click", async () => {
+    if (!status || controlling) return;
+    controlling = true; button.disabled = true;
+    try {
+      await api("/api/documents/control", {method:"POST",body:JSON.stringify({action:status.paused ? "resume" : "pause"})});
+      notice(status.paused ? "Dokumentindex wird fortgesetzt." : "Dokumentindex wird angehalten.");
+    } catch (error) { notice(error.message); }
+    finally { controlling = false; await refresh(); }
+  });
+  await refresh();
+  if (button.isConnected) state.timer = setInterval(() => { void refresh(); }, 1500);
 }
 
 async function renderReport() {

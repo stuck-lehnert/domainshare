@@ -25,8 +25,9 @@ This repository provides a production-oriented Samba file server container that 
 - Samba `full_audit` records successful and failed reads, writes, renames, and deletions on all three shares; FSLogix events are retained in a separate indexed activity stream.
 - A collector normalizes those four actions and persists them in indexed SQLite tables; activity is never automatically deleted.
 - Samba retains deleted files for seven days in per-user recycle repositories on the same data volumes.
-- A plain HTTPS administration console manages Data folders and individual user access, and provides statistics, logs, trash downloads/restores, manual backups, and share reconciliation. It also includes a fully client-side Typst PDF report.
-- Web sign-in validates the submitted username/password with Kerberos, permits only users whose winbind group SID set contains `DOMAIN_ADMINS_SID`, and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
+- The HTTPS file interface at `/` lets AD users search accessible Data folders and their own Private folder. An independent background worker indexes text and recognizes scanned PDFs without changing original files.
+- The administration console at `/admin/...` manages Data folders and individual user access, and provides statistics, logs, trash downloads/restores, manual backups, and share reconciliation. It also includes a fully client-side Typst PDF report.
+- Web sign-in validates the submitted username/password with Kerberos and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. Human AD users can sign in; `MSOL_*` and `krbtgt` accounts are excluded. Administration pages and APIs require membership in `DOMAIN_ADMINS_SID`. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
 - HTTPS certificates are requested from a configured local Smallstep CA and renewed automatically. Pre-issued certificate files are also supported.
 - Optional remote backups run when `BACKUP_DESTINATION` and `BACKUP_ARCHIVE_PASSWORD` are configured; each active or archived group folder is uploaded as its own encrypted, non-solid 7z archive.
 - Private home creation skips well-known/service accounts by default (including `krbtgt`, `msol_*`, `FileShare_ServiceAcc`).
@@ -67,6 +68,34 @@ Installations using the previous app-local group model are upgraded atomically t
 A new installation starts without assignments. Existing untracked Data directories are adopted with admin-only access. Previously archived folders remain archived and need explicit permissions before users can access them after restoration.
 
 The Data share uses Samba Windows ACL checks instead of POSIX ACLs. Keep its data volumes private to the container; direct local or NFS access is outside this permission model. The protected TDB store avoids requiring extra container capabilities. After restoring Data to different filesystem inodes, run reconciliation with `REPAIR_DATA_ACLS=1` to rebuild ACL records. Trash restoration applies the current folder policy before exposing the restored file.
+
+## File Search and PDF Recognition
+
+Users sign in at `/` with their existing AD credentials using `username`, `DOMAIN\username`, or `username@domain`. Domain-qualified names accept the configured AD DNS domain/realm; the short NetBIOS domain is also accepted after `@`. The file view provides live search by filename and content, folder and file-type filters, grid/list views, previews, and downloads of the original files. Only Domain Admins see the administration link and can use management pages and APIs under `/admin/...`; old administration URLs redirect there. Administrative APIs are under `/admin/api/...`, while sign-in, session, and document endpoints remain under `/api/...`. This upgrade expires existing web sessions.
+
+The catalog includes active Data folders and each user's own Private folder. Every search, detail, preview, and download request checks current individual folder permissions. Revoking access or archiving a folder takes effect without waiting for reindexing. Domain Admins can see all active Data folders, but the user file view still shows only their own Private folder. Archived folders, recycle repositories, FSLogix profiles, symlinks, nested mounts, and special files are excluded. Private files additionally require ownership and read/traverse permissions for the signed-in user's mapped Unix identity.
+
+Linux filesystem events update the filename catalog as files change, with periodic scans recovering missed events. Text extraction and OCR run through a persistent background queue; files become searchable by filename before content extraction finishes. Search updates while typing, and open views refresh every two seconds to show completed extraction. Full-text queries match word prefixes and ignore accents; filename-only queries also match substrings.
+
+Content extraction supports PDFs, UTF-8/UTF-16 text files, modern Office formats (`docx`, `xlsx`, `pptx`), and OpenDocument formats (`odt`, `ods`, `odp`). PDFs and common images receive a first-page/image thumbnail. PDFs open in a fullscreen dialog with the locally bundled Mozilla PDF.js viewer, including page navigation, zoom, thumbnails and search within native PDF text. PDF loading and byte-range requests check current folder access. Other formats, including legacy binary Office files, remain searchable by filename. Extracted text is limited to 2 MiB per file; encrypted, damaged, or oversized documents may have no searchable content.
+
+PDFs containing raster images and pages with little extracted text are queued for local OCR using OCRmyPDF and Tesseract, with German and English enabled by default. Native text remains searchable while OCR is pending. OCR text is used for search. No file type displays a separate extracted document-text panel in its dialog. The PDF viewer displays the original PDF. Downloads always return the original file. No OCR replacement or separate OCR PDF is published. Failed jobs retry with backoff, and pending work survives restarts.
+
+Parsers run as an unprivileged service account on temporary copies, with filesystem/network restrictions and resource limits. This requires a Linux kernel with Landlock enabled (Linux 5.13 or newer) on x86-64 or ARM64. If isolation is unavailable, extraction fails closed while filename search remains available; the worker logs the reason. OCR needs no external service or additional container capabilities.
+
+The derived index and previews live in `/state/documents` (`DOCUMENT_STATE_ROOT` override), separate from the managed-access database. The directory is accessible only to the service. Backups retain all original files and access records, and omit this rebuildable cache. Restoring a backup rebuilds the catalog automatically. Allow space for extracted text, previews, and temporary OCR work; the first indexing pass runs asynchronously.
+
+Domain Admins monitor the worker at `/admin/documents`: current file and phase, completed/total files, text/OCR queues, retries, heartbeat, last catalog scan, and recent activity. Pause and resume controls stop both catalog updates and extraction. Pausing interrupts an active parser and its child processes, discards its temporary workspace, and keeps the original queue phase for resumption. Existing indexed files remain searchable subject to current access rules. The pause flag survives container restarts. Control events record the administrator in the document activity history; status and control APIs are restricted to administrators. This derived worker history and its pause flag are omitted with the document cache from backups.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DOCUMENT_SCAN_SECONDS` | `30` | Recovery scan interval; filesystem events handle intervening changes |
+| `DOCUMENT_OCR_LANGUAGE` | `deu+eng` | Installed Tesseract languages used for OCR |
+| `DOCUMENT_OCR_TIMEOUT_SECONDS` | `600` | Maximum runtime for an OCR job |
+| `DOCUMENT_MAX_FILE_MB` | `512` | Largest file copied for extraction; larger files use filename search |
+| `DOCUMENT_MAX_PDF_PAGES` | `500` | Maximum PDF page count for extraction |
+
+These settings are passed through the existing Compose environment file. Setting `WEB_ENABLED=false` also disables the document worker.
 
 ## Shared SQLite State Database
 
@@ -129,6 +158,9 @@ Kerberos requires close time alignment.
 - `app/audit_store.py`
 - `app/state_db.py`
 - `app/web_ui.py`
+- `app/documents.py`
+- `app/document_index.py`
+- `app/extract_document.py`
 - `app/web/`
 - `etc/samba/smb.conf`
 - `dev/` (disposable AD DC, backup target, SMB client, seed data, and E2E assertions)

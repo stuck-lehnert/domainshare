@@ -8,6 +8,9 @@ RUN apt-get update \
         dnsutils \
         krb5-user \
         ldb-tools \
+        python3-pil \
+        python3-reportlab \
+        fonts-urw-base35 \
         samba \
         samba-ad-dc \
         samba-ad-provision \

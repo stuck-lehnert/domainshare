@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Dateiserver · Dateien</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body class="portal">
+  <section id="login-view" class="login-view" hidden>
+    <main class="login-card">
+      <h1>Dateiserver</h1>
+      <p>Mit Ihrem AD-Benutzerkonto anmelden.</p>
+      <form id="login-form" class="stack">
+        <label>Benutzername<input name="username" autocomplete="username" required autofocus placeholder="benutzername"></label>
+        <label>Passwort<input name="password" type="password" autocomplete="current-password" required></label>
+        <p id="login-error" class="error" role="alert" hidden></p>
+        <button type="submit">Anmelden</button>
+      </form>
+    </main>
+  </section>
+  <div id="portal-view" hidden>
+    <header class="portal-header"><a href="/" class="portal-brand">Dateiserver</a><div><span id="session-user"></span><a href="/admin/overview" id="admin-link" hidden>Verwaltung</a><button id="logout" class="link-button">Abmelden</button></div></header>
+    <main class="portal-main">
+      <header class="page-head"><div><h1>Dateien</h1><p>Dokumente finden und durchsuchen.</p></div></header>
+      <form id="document-search" class="portal-search" role="search">
+        <label class="portal-query"><span class="sr-only">Dateien durchsuchen</span><input id="search-query" type="search" placeholder="Dateiname oder Inhalt durchsuchen…" autocomplete="off"></label>
+        <label><span class="sr-only">Suchbereich</span><select id="search-scope"><option value="all">Name und Inhalt</option><option value="name">Nur Dateiname</option><option value="content">Nur Inhalt</option></select></label>
+        <button type="submit">Suchen</button>
+      </form>
+      <div class="portal-workspace">
+        <aside class="portal-filters" aria-label="Dateifilter">
+          <h2>Filter</h2>
+          <label>Ordner<select id="source-filter"><option value="">Alle Ordner</option></select></label>
+          <label>Dateityp<select id="type-filter"><option value="">Alle Dateitypen</option></select></label>
+          <label>Sortieren<select id="sort-filter"><option value="recent">Zuletzt geändert</option><option value="relevance">Beste Treffer</option><option value="name">Dateiname</option><option value="oldest">Älteste zuerst</option></select></label>
+          <button type="button" id="reset-filters">Filter zurücksetzen</button>
+        </aside>
+        <section class="portal-results" aria-label="Suchergebnisse">
+          <div class="portal-results-head"><p id="result-summary" role="status">Dateien werden geladen…</p><div class="portal-view-options" role="group" aria-label="Ansicht"><button type="button" id="view-grid" aria-pressed="true">Kacheln</button><button type="button" id="view-list" aria-pressed="false">Liste</button></div></div>
+          <p id="index-progress" class="muted" role="status" hidden></p>
+          <p id="search-error" class="error" role="alert" hidden></p>
+          <div id="documents" class="document-grid"></div>
+          <div class="portal-pagination"><button type="button" id="previous-page" disabled>Zurück</button><span id="page-label"></span><button type="button" id="next-page" disabled>Weiter</button></div>
+        </section>
+      </div>
+    </main>
+  </div>
+  <dialog id="document-dialog" class="document-dialog" aria-labelledby="document-title">
+    <header class="document-dialog-head"><div><h2 id="document-title"></h2><p id="document-location" class="muted"></p></div><div class="row-actions"><a id="document-download" class="button icon-button" aria-label="Herunterladen" title="Herunterladen" download></a><button type="button" id="document-close" class="icon-button" aria-label="Schließen" title="Schließen"></button></div></header>
+    <div class="document-detail"><div id="document-preview" class="document-preview"></div></div>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script src="/assets/portal.js" defer></script>
+</body>
+</html>

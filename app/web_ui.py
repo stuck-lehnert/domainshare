@@ -27,11 +27,11 @@ from typing import Dict, List, Optional, Tuple
 
 try:
     from app import reconcile_shares as directory
-    from app import trash, access_control
+    from app import trash, access_control, documents
     from app.account_policy import is_excluded_user
 except ImportError:  # Container execution uses /app as the import root.
     import reconcile_shares as directory
-    import trash, access_control
+    import trash, access_control, documents
     from account_policy import is_excluded_user
 
 try:
@@ -74,7 +74,7 @@ TLS_CERT_FILE = os.getenv("WEB_TLS_CERT_FILE", "/state/tls/web.crt")
 TLS_KEY_FILE = os.getenv("WEB_TLS_KEY_FILE", "/state/tls/web.key")
 JWT_COOKIE = "adfs_session"
 JWT_ISSUER = "ad-file-server-web"
-JWT_AUDIENCE = "domain-admins"
+JWT_AUDIENCE = "ad-users"
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SID_RE = re.compile(r"S-\d+(?:-\d+)+", re.IGNORECASE)
 LOGIN_LIMIT: Dict[str, deque] = {}
@@ -262,7 +262,7 @@ class TokenManager:
         self.secret = secret.encode("utf-8")
         self.ttl_seconds = ttl_seconds
 
-    def issue(self, username: str) -> Tuple[str, int]:
+    def issue(self, username: str, sid: str, role: str = "user", uid: Optional[int] = None) -> Tuple[str, int]:
         issued = int(time.time())
         expires = issued + self.ttl_seconds
         header = {"alg": "HS256", "typ": "JWT"}
@@ -270,7 +270,9 @@ class TokenManager:
             "iss": JWT_ISSUER,
             "aud": JWT_AUDIENCE,
             "sub": username,
-            "role": "domain-admin",
+            "sid": sid,
+            "uid": uid,
+            "role": role,
             "iat": issued,
             "exp": expires,
             "jti": secrets.token_urlsafe(16),
@@ -300,7 +302,7 @@ class TokenManager:
                 raise ValueError("header")
             if payload.get("iss") != JWT_ISSUER or payload.get("aud") != JWT_AUDIENCE:
                 raise ValueError("issuer")
-            if payload.get("role") != "domain-admin":
+            if payload.get("role") not in {"domain-admin", "user"} or not SID_RE.fullmatch(str(payload.get("sid", ""))):
                 raise ValueError("role")
             if int(payload.get("exp", 0)) <= int(time.time()):
                 raise ValueError("expired")
@@ -320,7 +322,7 @@ def normalize_username(username: str) -> str:
     return username
 
 
-def authenticate_domain_admin(username: str, password: str) -> Optional[str]:
+def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
     if not password or len(password) > 4096 or any(char in password for char in "\r\n\0"):
         return None
     try:
@@ -336,9 +338,10 @@ def authenticate_domain_admin(username: str, password: str) -> Optional[str]:
             return None
     else:
         account, principal_realm = qualified.rsplit("@", 1)
-        if principal_realm.casefold() != realm.casefold():
+        domain_names = {realm.casefold(), workgroup.casefold(), os.getenv("DOMAIN", realm).casefold()}
+        if principal_realm.casefold() not in domain_names:
             return None
-    if not account:
+    if not account or is_excluded_user(account):
         return None
     canonical_name = f"{workgroup}\\{account}"
     principal = f"{account}@{realm}"
@@ -399,7 +402,29 @@ def authenticate_domain_admin(username: str, password: str) -> Optional[str]:
         return None
     admin_sid = os.environ["DOMAIN_ADMINS_SID"].casefold()
     group_sids = {value.casefold() for value in SID_RE.findall(group_result.stdout)}
-    return canonical_name if admin_sid in group_sids else None
+    sid = user_sid_match.group(0)
+    try:
+        resolved = subprocess.run(["wbinfo", "--sid-to-name", sid], capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if resolved.returncode != 0 or not resolved.stdout.strip().endswith(" 1"):
+        return None
+    canonical_name = resolved.stdout.strip().rsplit(" ", 1)[0]
+    if is_excluded_user(canonical_name):
+        return None
+    try:
+        mapped = subprocess.run(["wbinfo", "--sid-to-uid", sid], capture_output=True, text=True, timeout=15, check=False)
+        uid = int(mapped.stdout.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    if mapped.returncode or uid < 0:
+        return None
+    return {"sub": canonical_name, "sid": sid, "uid": uid, "role": "domain-admin" if admin_sid in group_sids else "user"}
+
+
+def authenticate_domain_admin(username: str, password: str) -> Optional[str]:
+    identity = authenticate_user(username, password)
+    return identity["sub"] if identity and identity["role"] == "domain-admin" else None
 
 
 def login_allowed(remote: str) -> bool:
@@ -798,13 +823,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         log(f"{self.client_address[0]} {fmt % args}")
 
-    def security_headers(self, cache_control: str = "no-store") -> None:
+    def security_headers(self, cache_control: str = "no-store", pdf_viewer: bool = False) -> None:
         self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
+            ("default-src 'self'; connect-src 'self' blob: data:; img-src 'self' data: blob:; "
+             "worker-src 'self' blob:; font-src 'self' data: blob:; media-src blob:; "
+             if pdf_viewer else "default-src 'self'; connect-src 'self'; img-src 'self' data:; ") +
             "style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
-            "base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+            "base-uri 'none'; frame-ancestors " + ("'self'" if pdf_viewer else "'none'") + "; form-action 'self'",
         )
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -846,6 +873,13 @@ class Handler(BaseHTTPRequestHandler):
         value = self.user()
         if value is None:
             self.send_error_json(HTTPStatus.UNAUTHORIZED, "Anmeldung erforderlich")
+        return value
+
+    def require_admin(self) -> Optional[Dict[str, object]]:
+        value = self.require_user()
+        if value is not None and value.get("role") != "domain-admin":
+            self.send_error_json(HTTPStatus.FORBIDDEN, "Domänenadministrator erforderlich")
+            return None
         return value
 
     def read_json_body(self, maximum: int = 16384) -> Dict[str, object]:
@@ -912,21 +946,48 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
                 return
-            username = authenticate_domain_admin(str(body.get("username", "")), str(body.get("password", "")))
-            if username is None:
+            identity = authenticate_user(str(body.get("username", "")), str(body.get("password", "")))
+            if identity is None:
                 record_login_failure(remote)
                 time.sleep(0.4)
-                self.send_error_json(HTTPStatus.UNAUTHORIZED, "Ungültige Zugangsdaten oder keine Mitgliedschaft bei den Domänenadministratoren")
+                self.send_error_json(HTTPStatus.UNAUTHORIZED, "Ungültige Zugangsdaten")
                 return
             clear_login_failures(remote)
-            token, expires = APP.tokens.issue(username)
+            token, expires = APP.tokens.issue(identity["sub"], identity["sid"], identity["role"], identity["uid"])
+            conn = directory.open_db()
+            try:
+                access_control.ensure_schema(conn)
+                sam = identity["sub"].split("\\")[-1]
+                conn.execute("INSERT INTO access_users(sid,sam,name) VALUES(?,?,?) ON CONFLICT(sid) DO UPDATE SET sam=excluded.sam",
+                             (identity["sid"], sam, sam))
+                conn.commit()
+            finally:
+                conn.close()
             max_age = max(0, expires - int(time.time()))
             cookie = f"{JWT_COOKIE}={token}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=Strict"
-            self.send_json({"user": username, "expiresAt": expires, "token": token, "tokenType": "Bearer"}, cookie=cookie)
+            self.send_json({"user": identity["sub"], "sid": identity["sid"], "role": identity["role"], "expiresAt": expires, "token": token, "tokenType": "Bearer"}, cookie=cookie)
             return
         if parsed.path == "/api/logout":
             cookie = f"{JWT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
             self.send_json({"ok": True}, cookie=cookie)
+            return
+        if not parsed.path.startswith("/admin/api/"):
+            self.send_error_json(HTTPStatus.NOT_FOUND, "Nicht gefunden")
+            return
+        administrator = self.require_admin()
+        if administrator is None:
+            return
+        parsed = parsed._replace(path=parsed.path[len("/admin"):])
+        if parsed.path == "/api/documents/control":
+            conn = documents.connect()
+            try:
+                documents.ensure_schema(conn)
+                body = self.read_json_body()
+                self.send_json(documents.control_worker(conn, body.get("action"), str(administrator["sub"])))
+            except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
+                self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            finally:
+                conn.close()
             return
         if parsed.path == "/api/access":
             user = self.require_user()
@@ -1036,9 +1097,31 @@ class Handler(BaseHTTPRequestHandler):
             if user is None:
                 return
             params = urllib.parse.parse_qs(parsed.query)
+            if path == "/api/session":
+                self.send_json({"user": user["sub"], "sid": user["sid"], "role": user["role"], "expiresAt": user["exp"]})
+            elif path == "/api/documents" or path.startswith("/api/documents/"):
+                self.document_request(path, params, user)
+            else:
+                self.send_error_json(HTTPStatus.NOT_FOUND, "Nicht gefunden")
+            return
+        if path.startswith("/admin/api/"):
+            if self.require_admin() is None:
+                return
+            path = path[len("/admin"):]
+            user = self.require_user()
+            if user is None:
+                return
+            params = urllib.parse.parse_qs(parsed.query)
             try:
                 if path == "/api/session":
                     self.send_json({"user": user["sub"], "expiresAt": user["exp"]})
+                elif path == "/api/documents/status":
+                    conn = documents.connect()
+                    try:
+                        documents.ensure_schema(conn)
+                        self.send_json(documents.worker_snapshot(conn))
+                    finally:
+                        conn.close()
                 elif path == "/api/overview":
                     self.send_json(APP.overview())
                 elif path == "/api/access":
@@ -1087,10 +1170,126 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"Request {path} failed: {exc}")
                 self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
+        legacy = {"/overview", "/access", "/reconciliation", "/storage/data", "/storage/users",
+                  "/activity", "/activity/fslogix", "/trash", "/backup", "/report", "/system", "/shares"}
+        if path in legacy:
+            self.send_response(HTTPStatus.TEMPORARY_REDIRECT)
+            self.security_headers()
+            self.send_header("Location", "/admin/access" if path == "/shares" else "/admin" + path)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.serve_static(path)
 
+    def document_request(self, path, params, identity):
+        conn = documents.connect()
+        try:
+            documents.ensure_schema(conn)
+            if path == "/api/documents":
+                self.send_json(documents.search(conn, identity, params))
+                return
+            parts = path.split("/")
+            if len(parts) not in {4, 5} or not re.fullmatch(r"[a-f0-9]{32}", parts[3]):
+                raise FileNotFoundError()
+            if len(parts) == 4:
+                self.send_json(documents.detail(conn, identity, parts[3]))
+                return
+            if parts[4] == "download":
+                with documents.download(conn, identity, parts[3]) as (handle, row):
+                    self.send_document_file(handle, row["size"], "application/octet-stream", row["name"])
+            elif parts[4] == "content":
+                with documents.download(conn, identity, parts[3]) as (handle, row):
+                    if row['extension'] != '.pdf':
+                        raise FileNotFoundError()
+                    self.send_document_file(handle, row['size'], 'application/pdf', row['name'], range_support=True, disposition='inline')
+            elif parts[4] == "preview":
+                with documents.preview(conn, identity, parts[3]) as (handle, size):
+                    self.send_document_file(handle, size, "image/jpeg")
+            else:
+                raise FileNotFoundError()
+        except FileNotFoundError:
+            self.send_error_json(HTTPStatus.NOT_FOUND, "Datei nicht verfügbar")
+        except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
+            log(f"Document request failed: {exc}")
+            self.send_error_json(HTTPStatus.BAD_REQUEST, "Dateien konnten nicht geladen werden")
+        finally:
+            conn.close()
+
+    def send_document_file(self, handle, size, mime, filename=None, *, range_support=False, disposition='attachment'):
+        start, end = 0, size - 1
+        ranged = range_support and self.headers.get('Range') is not None
+        if ranged:
+            value = self.headers.get('Range', '')
+            match = re.fullmatch(r'bytes=(\d*)-(\d*)', value) if len(value) <= 128 else None
+            valid = bool(match and size > 0 and (match[1] or match[2]))
+            if valid:
+                if match[1]:
+                    start = int(match[1])
+                    end = min(size - 1, int(match[2])) if match[2] else size - 1
+                else:
+                    length = int(match[2])
+                    start = max(0, size - length)
+                    valid = length > 0
+                valid = valid and 0 <= start <= end < size
+            if not valid:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.security_headers()
+                self.send_header('Content-Range', f'bytes */{size}')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+        length = max(0, end - start + 1)
+        self.send_response(HTTPStatus.PARTIAL_CONTENT if ranged else HTTPStatus.OK)
+        self.security_headers()
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(length))
+        if range_support:
+            self.send_header('Accept-Ranges', 'bytes')
+        if ranged:
+            self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+        if filename:
+            encoded = urllib.parse.quote(filename, safe="")
+            self.send_header("Content-Disposition", f"{disposition}; filename*=UTF-8{chr(39)*2}{encoded}")
+        self.end_headers()
+        try:
+            handle.seek(start)
+            while length:
+                chunk = handle.read(min(length, 1024 * 1024))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                length -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def serve_static(self, path: str) -> None:
+        pdf_prefix = '/assets/vendor/pdfjs/6.3.289-app1/'
+        if path.startswith(pdf_prefix):
+            relative = urllib.parse.unquote(path[len(pdf_prefix):])
+            if any(part in {'', '.', '..'} or '\\' in part or '\x00' in part for part in relative.split('/')):
+                self.send_error_json(HTTPStatus.NOT_FOUND, 'Statische Datei nicht gefunden')
+                return
+            mime = {'.html':'text/html; charset=utf-8', '.mjs':'text/javascript; charset=utf-8',
+                    '.css':'text/css; charset=utf-8', '.svg':'image/svg+xml', '.png':'image/png',
+                    '.json':'application/json', '.ftl':'text/plain; charset=utf-8', '.wasm':'application/wasm',
+                    '.ttf':'font/ttf', '.woff':'font/woff', '.woff2':'font/woff2'}.get(os.path.splitext(relative)[1], 'application/octet-stream')
+            try:
+                with documents.open_file(os.path.join(STATIC_ROOT, 'vendor/pdfjs/6.3.289-app1'), relative) as (handle, _):
+                    body = handle.read()
+            except (ValueError, OSError):
+                self.send_error_json(HTTPStatus.NOT_FOUND, 'Statische Datei nicht gefunden')
+                return
+            self.send_response(HTTPStatus.OK)
+            self.security_headers('public, max-age=31536000, immutable', pdf_viewer=relative == 'web/viewer.html')
+            self.send_header('Content-Type', mime)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         files = {
+            "/assets/portal.js": ("portal.js", "text/javascript; charset=utf-8"),
+            "/assets/pdf-viewer.js": ("pdf-viewer.js", "text/javascript; charset=utf-8"),
+            "/assets/pdf-viewer.css": ("pdf-viewer.css", "text/css; charset=utf-8"),
             "/assets/app.js": ("app.js", "text/javascript; charset=utf-8"),
             "/assets/report.mjs": ("report.mjs", "text/javascript; charset=utf-8"),
             "/assets/styles.css": ("styles.css", "text/css; charset=utf-8"),
@@ -1102,7 +1301,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in files:
             filename, content_type = files[path]
         else:
-            filename, content_type = "index.html", "text/html; charset=utf-8"
+            filename, content_type = ("index.html" if path == "/admin" or path.startswith("/admin/") else "portal.html"), "text/html; charset=utf-8"
         try:
             with open(os.path.join(STATIC_ROOT, filename), "rb") as handle:
                 body = handle.read()

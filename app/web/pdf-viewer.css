@@ -1,0 +1,11 @@
+/* Keep Mozilla's viewer controls aligned with the file interface. */
+:root {
+  --body-bg-color: #eee;
+  --toolbar-bg-color: #eee;
+  --toolbar-border-bottom: 1px solid #aaa;
+  --toolbar-icon-bg-color: #333;
+  --toolbar-icon-hover-bg-color: #111;
+}
+body, button, input, select { font-family: Arial, sans-serif; }
+button, input, select, .doorHanger, .menuContainer { border-radius: 0 !important; }
+#secondaryOpenFile, #editorModeButtons { display: none !important; }
