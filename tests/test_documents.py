@@ -105,6 +105,73 @@ class DocumentTests(DocumentFixture):
         for query in ('"', '*', ':', '" OR NOT ()', 'x\x00y'):
             self.find({'q':[query]})
 
+    def artifact_files(self):
+        files=[]
+        for root,name in ((self.data/'Finance','Thumbs.db'),(self.data/'Finance'/'Child','THUMBS.DB'),
+                          (self.data/'Finance','~$report.docx'),(self.data/'Finance'/'Child','~$Slides.PPTX'),
+                          (self.private/'alice','thumbs.Db'),(self.private/'alice','~$notes.odt')):
+            path=root/name
+            self.write(path,'IGNOREDARTIFACT742')
+            files.append((path,path.read_bytes(),path.stat().st_ino))
+        return files
+
+    def seed_old_artifact_entries(self):
+        files=self.artifact_files()
+        with mock.patch.object(documents,'is_excluded_filename',return_value=False):
+            self.scan()
+        for path,_,_ in files:
+            self.conn.execute("UPDATE documents SET body='IGNOREDARTIFACT742',state='pending' WHERE name=?",(path.name,))
+        self.conn.commit()
+        return files
+
+    def test_cache_and_lock_files_are_never_cataloged_in_data_or_private(self):
+        files=self.artifact_files()
+        for name in ('Thumbs.db.docx','project-Thumbs.db','~notes.docx'):
+            self.write(self.data/'Finance'/name,'ordinary file')
+        self.scan()
+        for path,original,inode in files:
+            self.assertEqual(self.conn.execute('SELECT count(*) FROM documents WHERE name=?',(path.name,)).fetchone()[0],0)
+            self.assertEqual(path.read_bytes(),original)
+            self.assertEqual(path.stat().st_ino,inode)
+        for name in ('Thumbs.db.docx','project-Thumbs.db','~notes.docx'):
+            self.assertEqual(self.find({'q':[name],'scope':['name']})['total'],1)
+
+    def test_stale_artifacts_never_affect_search_counts_facets_or_direct_access(self):
+        self.seed_old_artifact_entries()
+        result=self.find({'limit':['1']})
+        self.assertEqual((result['total'],len(result['items']),result['hasMore'],result['types'],result['pending']),
+                         (2,1,True,['docx','odt'],0))
+        for scope in ('name','all','content'):
+            for query in ('Thumbs','report','IGNOREDARTIFACT742'):
+                self.assertEqual(self.find({'q':[query],'scope':[scope]})['total'],0)
+        for row in self.conn.execute("SELECT id FROM documents WHERE name GLOB '~$*' OR lower(name)='thumbs.db'"):
+            with self.assertRaises(FileNotFoundError):
+                documents.detail(self.conn,IDENTITY,row['id'])
+            for operation in (documents.download,documents.preview):
+                with self.assertRaises(FileNotFoundError), operation(self.conn,IDENTITY,row['id']):
+                    pass
+        with mock.patch.object(document_index,'run_job') as job:
+            while document_index.process_next(self.conn):
+                pass
+            job.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM documents').fetchone()[0],4)
+
+    def test_upgrade_removes_old_artifacts_and_fts_without_changing_originals_or_pause(self):
+        files=self.seed_old_artifact_entries()
+        documents.control_worker(self.conn,'pause','admin')
+        self.conn.execute('PRAGMA user_version=1')
+        self.conn.commit()
+        documents.ensure_schema(self.conn)
+        self.assertTrue(documents.worker_paused(self.conn))
+        self.assertEqual(self.conn.execute('SELECT count(*) FROM documents').fetchone()[0],4)
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM document_fts WHERE document_fts MATCH 'IGNOREDARTIFACT742'").fetchone()[0],0)
+        self.assertEqual(self.find({'q':['Umsatz'],'scope':['content']})['total'],1)
+        for path,original,inode in files:
+            self.assertEqual(path.read_bytes(),original)
+            self.assertEqual(path.stat().st_ino,inode)
+        documents.ensure_schema(self.conn)
+        self.assertEqual(self.conn.execute('PRAGMA user_version').fetchone()[0],2)
+
     def test_only_document_types_are_queued_for_content_and_all_types_keep_filename_search(self):
         for extension in ('.pdf','.docx','.pptx','.odt','.odp','.txt','.md','.csv','.xlsx','.ods','.html','.json','.bin'):
             self.write(self.data/'Finance'/('typed'+extension),'EXCLUDEDBODY742')

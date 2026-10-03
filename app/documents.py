@@ -25,6 +25,11 @@ except ImportError:
 SEARCH_ROOT = os.getenv('DOCUMENT_STATE_ROOT', os.path.join(os.getenv('STATE_ROOT', '/state'), 'documents'))
 SEARCH_DB = os.path.join(SEARCH_ROOT, 'search.db')
 MAX_TEXT = 2 * 1024 * 1024
+SEARCHABLE_NAME_SQL = "lower({name}) <> 'thumbs.db' AND {name} NOT GLOB '~$*'"
+
+
+def is_excluded_filename(name):
+    return name.casefold() == 'thumbs.db' or name.startswith('~$')
 
 
 
@@ -83,17 +88,20 @@ def ensure_schema(conn):
 
     # Upgrade the derived index only: keep catalog IDs, permissions, previews
     # and originals, but remove content and jobs for excluded file types.
-    if conn.execute('PRAGMA user_version').fetchone()[0] < 1:
+    if conn.execute('PRAGMA user_version').fetchone()[0] < 2:
         with conn:
             conn.execute('BEGIN IMMEDIATE')
-            if conn.execute('PRAGMA user_version').fetchone()[0] < 1:
+            version = conn.execute('PRAGMA user_version').fetchone()[0]
+            if version < 1:
                 content = sorted(CONTENT_SUFFIXES)
                 images = sorted(IMAGE_SUFFIXES)
                 conn.execute(f"""UPDATE documents SET body='',pages=0,attempts=0,retry_at=0,
                                 state=CASE WHEN extension IN ({','.join('?' for _ in images)}) AND preview=''
                                            THEN 'pending' ELSE 'name-only' END
                                 WHERE extension NOT IN ({','.join('?' for _ in content)})""", [*images,*content])
-                conn.execute('PRAGMA user_version=1')
+            if version < 2:
+                conn.execute(f"DELETE FROM documents WHERE NOT ({SEARCHABLE_NAME_SQL.format(name='name')})")
+                conn.execute('PRAGMA user_version=2')
 
 
 def worker_paused(conn):
@@ -243,6 +251,10 @@ def allowed_sources(conn, identity):
 
 
 def discover_file(conn, source, relative, seen=0):
+    name = relative.rsplit('/', 1)[-1]
+    if is_excluded_filename(name):
+        conn.execute('DELETE FROM documents WHERE source_id=? AND path=?', (source['id'], relative))
+        return
     try:
         with open_file(source['root'], relative) as (_, info):
             stamp = fingerprint(info)
@@ -254,7 +266,6 @@ def discover_file(conn, source, relative, seen=0):
         if seen:
             conn.execute('UPDATE documents SET seen=? WHERE source_id=? AND path=?', (seen, source['id'], relative))
         return
-    name = relative.rsplit('/', 1)[-1]
     extension = os.path.splitext(name)[1].lower()
     state = 'pending' if extension in CONTENT_SUFFIXES | IMAGE_SUFFIXES else 'name-only'
     conn.execute('''INSERT INTO documents(id,source_id,path,name,extension,size,modified,fingerprint,seen,state)
@@ -348,7 +359,7 @@ def private_readable(source, relative, uid):
 def current_document(conn, document_id, identity):
     sources = allowed_sources(conn, identity)
     row = conn.execute('SELECT * FROM documents WHERE id=?', (document_id,)).fetchone()
-    if row is None or row['source_id'] not in sources:
+    if row is None or row['source_id'] not in sources or is_excluded_filename(row['name']):
         raise FileNotFoundError('Document not found')
     source = sources[row['source_id']]
     if not private_readable(source, row['path'], identity.get('uid')):
@@ -397,7 +408,7 @@ def search(conn, identity, params):
     for row in conn.execute(f"SELECT id,source_id,path FROM documents WHERE source_id IN ({placeholders}) AND source_id LIKE 'private:%'", ids).fetchall():
         if private_readable(selected[row['source_id']], row['path'], identity.get('uid')):
             conn.execute('INSERT INTO readable_private VALUES(?)', (row['id'],))
-    private_condition = "(d.source_id NOT LIKE 'private:%' OR EXISTS (SELECT 1 FROM readable_private r WHERE r.id=d.id))"
+    private_condition = SEARCHABLE_NAME_SQL.format(name='d.name') + " AND (d.source_id NOT LIKE 'private:%' OR EXISTS (SELECT 1 FROM readable_private r WHERE r.id=d.id))"
     conditions = [f'd.source_id IN ({placeholders})', private_condition]
     values = ids[:]
     from_sql = 'documents d'

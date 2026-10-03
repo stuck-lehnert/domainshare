@@ -338,6 +338,12 @@ def main() -> int:
     for filename in ('index-excluded.txt','index-excluded.xlsx','index-excluded.ods','forecast.csv','readme.txt'):
         result=http(query_path("/api/documents", {"q":filename,"scope":"name"}), token=user_token).json()
         check(result["total"] == 1 and result["items"][0]["snippet"] == '', "excluded file cannot be found by name or exposes text")
+    for scope in ('name','all','content'):
+        for query in ('Thumbs','Locked','IGNOREDARTIFACT742'):
+            check(http(query_path("/api/documents", {"q":query,"scope":scope}), token=user_token).json()["total"] == 0,
+                  "cache or Office lock file appears in document search")
+    catalog_artifacts=engine_run("exec", FILES_CONTAINER, "python3", "-c", "import sqlite3; c=sqlite3.connect('/state/documents/search.db'); print(c.execute(\"SELECT count(*) FROM documents WHERE lower(name)='thumbs.db' OR name GLOB '~$*'\").fetchone()[0])").stdout.strip()
+    check(catalog_artifacts == '0', "cache or Office lock file reaches the document queue")
     # Guessing an indexed ID is insufficient to get another user's content.
     hidden_id = engine_run("exec", FILES_CONTAINER, "python3", "-c", "import sqlite3; c=sqlite3.connect('/state/documents/search.db'); print(c.execute(\"SELECT id FROM documents WHERE source_id='private:bob' AND name='readme.docx'\").fetchone()[0])").stdout.strip()
     for suffix in ("", "/preview", "/download", "/content"):

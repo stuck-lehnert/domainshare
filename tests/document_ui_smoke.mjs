@@ -78,10 +78,13 @@ try {
  assert.equal(await page.locator('nav a[href^="/admin"]').count(),0);
  assert.equal(await page.locator('#source-filter').textContent().then(text=>text.includes('Mein Private-Ordner')),true);
  assert.match(await page.locator('#index-progress').innerText(),/1 Datei/);
+ assert.equal(await page.locator('.document-excerpt').count(),0);
+ assert.equal(await page.locator('#documents').innerText().then(text=>text.includes('Referenz FINANZ742')||text.includes('Projektplan mit Schulung')),false);
  await shot('01-portal-desktop');
  await page.locator('#search-query').fill('FINANZ742');
  await page.waitForFunction(()=>document.querySelectorAll('.document-card').length===1);
  assert.match(await page.locator('.document-card').innerText(),/Rechnung Oktober/);
+ assert.equal(await page.locator('.document-card').innerText().then(text=>text.includes('FINANZ742')),false);
  await page.locator('#search-scope').selectOption('content');
  await page.locator('[data-document]').click();
  await page.locator('#document-dialog').waitFor({state:'visible'});
@@ -101,11 +104,13 @@ try {
  assert.equal(await page.locator('#document-download').getAttribute('href'),'/api/documents/'+fixtures[0].id+'/download');
  await shot('02-portal-document-preview');
  await page.locator('#document-close').click();
+ assert.notEqual(await page.evaluate(()=>getComputedStyle(document.documentElement).overflowY),'hidden');
  await page.locator('#reset-filters').click();await all();
  await page.locator(`[data-document="${fixtures[1].id}"]`).click();
  await page.locator('#document-dialog').waitFor({state:'visible'});
  assert.equal(await page.locator('.document-text, #document-content, #document-pdf-viewer').count(),0);
  assert.equal(await page.locator('#document-dialog').innerText().then(text=>text.includes('Projektplan mit Schulung')),false);
+ assert.equal(await page.evaluate(()=>getComputedStyle(document.documentElement).overflowY),'hidden');
  assert.ok((await page.locator('#document-dialog').boundingBox()).height<400,'Files without a visual preview should have a compact dialog');
  await shot('02b-office-without-document-text');
  for(const extension of ['md','odt']) {
@@ -123,6 +128,8 @@ try {
  await page.locator('#reset-filters').click();await all();
  await page.locator('#view-list').click();
  assert.equal(await page.locator('#documents').evaluate(element=>element.classList.contains('document-list')),true);
+ assert.equal(await page.locator('.document-excerpt').count(),0);
+ assert.equal(await page.locator('#documents').innerText().then(text=>text.includes('Referenz FINANZ742')||text.includes('Projektplan mit Schulung')),false);
  await shot('03-portal-list');
  // A background OCR completion becomes searchable without reloading.
  fixtures[4].text='Erkanntes Protokoll mit dem Suchwort SCANLIVE742';fixtures[4].snippet=fixtures[4].text;fixtures[4].state='ready';
@@ -134,6 +141,7 @@ try {
  deniedId=fixtures[4].id;
  await page.locator('#document-dialog').waitFor({state:'hidden',timeout:6000});
  assert.match(await page.locator('#toast').innerText(),/nicht verfügbar/);
+ assert.notEqual(await page.evaluate(()=>getComputedStyle(document.documentElement).overflowY),'hidden');
  deniedId=''; await page.locator('#reset-filters').click();await all();
  await page.locator('#view-grid').click();
  for(const width of [900,390]){
@@ -141,12 +149,31 @@ try {
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,'Portal overflows at '+width);
   await shot('04-portal-'+width);
  }
+ await page.evaluate(()=>window.scrollTo(0,300));
  await page.locator('[data-document]').first().click();
  await page.locator('#document-dialog').waitFor({state:'visible'});
  assert.equal(await page.evaluate(()=>document.querySelector('#document-dialog').scrollWidth>document.querySelector('#document-dialog').clientWidth),false);
  await page.frameLocator('#document-pdf-viewer').locator('.page canvas').first().waitFor();
  assert.deepEqual(await page.locator('#document-dialog').boundingBox(),{x:0,y:0,width:390,height:844});
+ const backgroundScroll=await page.evaluate(()=>scrollY);
+ assert.ok(backgroundScroll>0,'Use a genuinely scrolled background for the modal test');
+ assert.equal(await page.evaluate(()=>getComputedStyle(document.documentElement).overflowY),'hidden');
+ assert.equal(await page.evaluate(()=>getComputedStyle(document.body).overflowY),'hidden');
+ await page.mouse.move(40,20);await page.mouse.wheel(0,600);await page.waitForTimeout(200);
+ assert.equal(await page.evaluate(()=>scrollY),backgroundScroll,'Header wheel must not scroll the background');
+ const pdfScroll=await page.evaluate(()=>document.querySelector('#document-pdf-viewer').contentDocument.querySelector('#viewerContainer').scrollTop);
+ await page.mouse.move(200,300);await page.mouse.wheel(0,600);
+ await page.waitForFunction(before=>document.querySelector('#document-pdf-viewer').contentDocument.querySelector('#viewerContainer').scrollTop>before,pdfScroll);
+ assert.equal(await page.evaluate(()=>scrollY),backgroundScroll,'PDF scroll must leave the background stationary');
+ await page.evaluate(()=>{const viewer=document.querySelector('#document-pdf-viewer').contentDocument.querySelector('#viewerContainer');viewer.scrollTop=viewer.scrollHeight;});
+ await page.mouse.wheel(0,600);await page.waitForTimeout(200);
+ assert.equal(await page.evaluate(()=>scrollY),backgroundScroll,'Scrolling past the PDF end must not scroll the background');
  await shot('05-portal-mobile-document');await page.locator('#document-close').click();
+ assert.notEqual(await page.evaluate(()=>getComputedStyle(document.documentElement).overflowY),'hidden');
+ assert.equal(await page.evaluate(()=>scrollY),backgroundScroll,'Closing must preserve the original scroll position');
+ await page.mouse.move(200,300);await page.mouse.wheel(0,300);
+ await page.waitForFunction(before=>scrollY>before,backgroundScroll);
+ await page.evaluate(()=>window.scrollTo(0,0));
  await page.locator('#logout').click();await page.locator('#login-view').waitFor({state:'visible'});
  await page.locator('#login-form input[name=username]').fill('alice');
  await page.locator('#login-form input[name=password]').fill('password');

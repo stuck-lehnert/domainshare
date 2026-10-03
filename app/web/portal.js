@@ -2,7 +2,6 @@
 
 const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
-const snippet = value => esc(value).replace(/\x01/g, "<mark>").replace(/\x02/g, "</mark>");
 const sizeLabel = value => {
   const units = ["B", "kB", "MB", "GB", "TB"];
   let amount = Number(value), index = 0;
@@ -18,7 +17,6 @@ function icon(name) {
   };
   return `<svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths[name]}</svg>`;
 }
-const statusLabel = row => ({pending:"Text wird erfasst…",ocr:row.attempts ? "Texterkennung wird erneut versucht…" : "Texterkennung läuft…",failed:"Text konnte noch nicht erfasst werden.","name-only":"Suche nach Dateinamen verfügbar."}[row.state] || "");
 let session = null, offset = 0, listMode = false, timer, debounce, request, serial = 0, lastResult = "", activeDocument = null, initialFilters = null;
 const pageSize = 40;
 
@@ -99,7 +97,7 @@ async function refresh(userAction = true) {
       $("#documents").innerHTML = result.items.length ? result.items.map(row => `<article class="document-card">
         <button type="button" class="document-open" data-document="${esc(row.id)}" aria-label="Öffnen: ${esc(row.name)}">
           <div class="document-thumbnail">${row.hasPreview ? `<img src="/api/documents/${row.id}/preview?v=${row.version}" loading="lazy" alt="">` : `<div class="document-placeholder">${icon("file")}<span>${esc((row.extension || "Datei").toUpperCase())}</span></div>`}</div>
-          <div class="document-description"><h2 title="${esc(row.name)}">${esc(row.name)}</h2><p class="document-path" title="${esc(row.path)}">${esc(row.path)}</p><p class="document-excerpt">${snippet(row.snippet || statusLabel(row))}</p></div>
+          <div class="document-description"><h2 title="${esc(row.name)}">${esc(row.name)}</h2><p class="document-path" title="${esc(row.path)}">${esc(row.path)}</p></div>
         </button><footer><span title="${esc(row.source)}">${esc(row.kind === "private" ? "Private" : row.source)} · ${sizeLabel(row.size)}<small>${modifiedLabel(row.modified)} UTC</small></span><a class="button icon-button" href="/api/documents/${row.id}/download" download="${esc(row.name)}" aria-label="Herunterladen: ${esc(row.name)}" title="Herunterladen">${icon("download")}</a></footer>
       </article>`).join("") : '<div class="portal-empty"><h2>Keine Dateien gefunden</h2><p>Suchbegriff oder Filter ändern.</p></div>';
     }

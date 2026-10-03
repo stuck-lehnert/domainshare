@@ -50,6 +50,9 @@ font=next(Path('/usr/share/fonts').rglob('NimbusSans-Regular.otf'))
 draw=ImageDraw.Draw(image)
 draw.text((120,200),'INVOICE SCAN\nCustomer reference SCANNEDUNIQUE742\nInvoice total 1500 EUR\nPayment due 30 October 2026',fill='black',font=ImageFont.truetype(str(font),44),spacing=40)
 image.save(root/'scanned-invoice.pdf','PDF',resolution=150)
+for folder in (root,Path('/data/private/alice')):
+    for name in ('Thumbs.db','THUMBS.DB','~$Locked.docx','~$Locked.pptx'):
+        (folder/name).write_text('IGNOREDARTIFACT742')
 (root/'index-excluded.txt').write_text('TEXTONLY742 should never be content-indexed')
 for suffix,entry in [('xlsx','xl/sharedStrings.xml'),('ods','content.xml')]:
     with zipfile.ZipFile(root/('index-excluded.'+suffix),'w') as spreadsheet:

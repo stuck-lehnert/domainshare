@@ -300,6 +300,11 @@ def process_next(conn, prefer_ocr=False, stop=None):
     if row is None:
         worker_state(conn, 'idle')
         return False
+    if documents.is_excluded_filename(row['name']):
+        conn.execute('DELETE FROM documents WHERE id=?', (row['id'],))
+        conn.commit()
+        worker_state(conn, 'idle')
+        return True
     source = conn.execute('SELECT * FROM document_sources WHERE id=?', (row['source_id'],)).fetchone()
     if source is None:
         return False
