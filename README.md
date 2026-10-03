@@ -79,7 +79,7 @@ Linux filesystem events update the filename catalog as files change, with period
 
 Content search indexes only PDFs, Word documents (`docx`, `odt`) and PowerPoint presentations (`pptx`, `odp`). All file types remain searchable by filename, including text, Markdown, spreadsheets and images. Existing extracted content from excluded types is removed from the derived search index on upgrade; original files and filename entries remain intact. PDFs and common images receive a first-page/image thumbnail. PDFs open in a fullscreen dialog with the locally bundled Mozilla PDF.js viewer, including page navigation, zoom, thumbnails and search within native PDF text. PDF loading and byte-range requests check current folder access. Legacy binary Office formats (`doc`, `ppt`) remain searchable by filename. Extracted text is limited to 2 MiB per file; encrypted, damaged, or oversized documents may have no searchable content.
 
-PDFs containing raster images and pages with little extracted text are queued for local OCR using OCRmyPDF and Tesseract, with German and English enabled by default. Native text remains searchable while OCR is pending. OCR text is used for search. No file type displays a separate extracted document-text panel in its dialog. The PDF viewer displays the original PDF. Downloads always return the original file. No OCR replacement or separate OCR PDF is published. Failed jobs retry with backoff, and pending work survives restarts.
+Only PDF pages that themselves contain raster images and little extracted text are queued for local OCR using Poppler and Tesseract, with German and English enabled by default. Search OCR renders those pages at 300 DPI, capped at 3500 pixels on the longest side, instead of inheriting high DPI from embedded logos or rebuilding an OCR PDF. Each render and recognition step has a 30-second timeout. Photos can still require a recognition attempt to establish whether they contain text; text-free pages finish without adding search content. Native text remains searchable while OCR is pending. OCR text is used for search. No file type displays a separate extracted document-text panel in its dialog. The PDF viewer displays the original PDF. Downloads always return the original file. No OCR replacement or separate OCR PDF is published. Failed jobs retry with backoff, and pending work survives restarts.
 
 Parsers run as an unprivileged service account on temporary copies, with filesystem/network restrictions and resource limits. This requires a Linux kernel with Landlock enabled (Linux 5.13 or newer) on x86-64 or ARM64. If isolation is unavailable, extraction fails closed while filename search remains available; the worker logs the reason. OCR needs no external service or additional container capabilities.
 
@@ -92,6 +92,9 @@ Domain Admins monitor the worker at `/admin/documents`: current file and phase, 
 | `DOCUMENT_SCAN_SECONDS` | `30` | Recovery scan interval; filesystem events handle intervening changes |
 | `DOCUMENT_OCR_LANGUAGE` | `deu+eng` | Installed Tesseract languages used for OCR |
 | `DOCUMENT_OCR_TIMEOUT_SECONDS` | `600` | Maximum runtime for an OCR job |
+| `DOCUMENT_OCR_DPI` | `300` | OCR render resolution (150–400 DPI), subject to the pixel cap |
+| `DOCUMENT_OCR_MAX_DIMENSION` | `3500` | Maximum OCR image width/height (1500–5000 pixels); originals are unchanged |
+| `DOCUMENT_OCR_PAGE_TIMEOUT_SECONDS` | `30` | Maximum runtime per page render or recognition step (5–120 seconds) |
 | `DOCUMENT_MAX_FILE_MB` | `512` | Largest file copied for extraction; larger files use filename search |
 | `DOCUMENT_MAX_PDF_PAGES` | `500` | Maximum PDF page count for extraction |
 

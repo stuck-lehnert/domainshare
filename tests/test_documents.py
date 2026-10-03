@@ -105,6 +105,35 @@ class DocumentTests(DocumentFixture):
         for query in ('"', '*', ':', '" OR NOT ()', 'x\x00y'):
             self.find({'q':[query]})
 
+    def test_ocr_candidates_match_images_to_their_page_and_ignore_native_text_and_masks(self):
+        body='Short cover\f'+'Native text '*30+'\fTiny footer\fNo text\f'
+        images='page num type width height\n2 0 image 300 300\n3 1 image 500 500\n4 2 smask 500 500\n'
+        self.assertEqual(extract_document.ocr_candidates(body,images,4),[3])
+        self.assertEqual(extract_document.ocr_candidates(body,images,2),[])
+        self.assertEqual(extract_document.ocr_candidates('Header\fNative text '+('word '*30)+'\f','2 0 image 100 100',2),[])
+
+    def test_search_ocr_limits_render_size_and_time_and_does_not_rebuild_the_pdf(self):
+        calls=[]
+        def parser(args,timeout=120):
+            calls.append((args,timeout))
+            return ('Page 3 size: 595 x 842 pts\nPage 7 size: 144 x 288 pts' if args[0]=='pdfinfo' else
+                    'Recognized page text' if args[0]=='tesseract' else '')
+        config={'language':'deu+eng','ocr_dpi':300,'ocr_max_dimension':3500,'ocr_page_timeout':30}
+        with mock.patch.object(extract_document,'command',side_effect=parser):
+            body=extract_document.ocr_search_text(Path('input'),[3,7],config)
+        self.assertEqual(body,'Recognized page text\nRecognized page text')
+        self.assertEqual([args[0] for args,_ in calls],['pdfinfo','pdftoppm','tesseract','pdftoppm','tesseract'])
+        for args,timeout in calls[1:]:
+            self.assertEqual(timeout,30)
+            if args[0]=='pdftoppm':
+                self.assertLessEqual(int(args[args.index('-scale-to')+1]),3500)
+                self.assertEqual(args[args.index('-r')+1],'300')
+                self.assertEqual(args[args.index('-f')+1],args[args.index('-l')+1])
+        self.assertEqual(calls[1][0][calls[1][0].index('-f')+1],'3')
+        self.assertEqual(calls[3][0][calls[3][0].index('-f')+1],'7')
+        self.assertEqual(calls[1][0][calls[1][0].index('-scale-to')+1],'3500')
+        self.assertEqual(calls[3][0][calls[3][0].index('-scale-to')+1],'1200')
+
     def artifact_files(self):
         files=[]
         for root,name in ((self.data/'Finance','Thumbs.db'),(self.data/'Finance'/'Child','THUMBS.DB'),

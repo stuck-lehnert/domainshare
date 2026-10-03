@@ -211,7 +211,10 @@ def run_job(row, source, phase, cancelled=None):
         os.chown(workspace, user.pw_uid, user.pw_gid)
         config = {'extension': row['extension'], 'phase': phase,
                   'language': os.getenv('DOCUMENT_OCR_LANGUAGE', 'deu+eng'),
-                  'max_pages': setting('DOCUMENT_MAX_PDF_PAGES', 500, 1, 5000), 'timeout': timeout}
+                  'max_pages': setting('DOCUMENT_MAX_PDF_PAGES', 500, 1, 5000), 'timeout': timeout,
+                  'ocr_dpi': setting('DOCUMENT_OCR_DPI', 300, 150, 400),
+                  'ocr_max_dimension': setting('DOCUMENT_OCR_MAX_DIMENSION', 3500, 1500, 5000),
+                  'ocr_page_timeout': setting('DOCUMENT_OCR_PAGE_TIMEOUT_SECONDS', 30, 5, 120)}
         for name, content in [('config.json', json.dumps(config))]:
             path = os.path.join(workspace, name)
             with open(path, 'w') as handle:

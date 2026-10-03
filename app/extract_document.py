@@ -4,6 +4,7 @@
 import ctypes
 import errno
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -114,6 +115,47 @@ def office_text(path):
     return '\n'.join(text)[:MAX_TEXT]
 
 
+def ocr_candidates(body, image_list, pages):
+    """Only text-poor pages that themselves contain raster images need OCR."""
+    image_pages = set()
+    for line in image_list.splitlines():
+        fields = line.split()
+        if len(fields) >= 5 and fields[0].isdigit() and fields[2] == 'image':
+            image_pages.add(int(fields[0]))
+    return [number for number, text in enumerate(body.split('\f')[:pages], 1)
+            if number in image_pages and len(re.sub(r'\s+', '', text)) < 80]
+
+
+def ocr_search_text(source, candidates, config):
+    # Search needs text only: do not rebuild a PDF or render at embedded-image
+    # DPI, which can enlarge an entire page because of a small high-DPI logo.
+    if not candidates:
+        return ''
+    sizes = command(['pdfinfo', '-f', '1', '-l', str(max(candidates)), str(source)])
+    dimensions = {int(number): max(float(width), float(height)) for number,width,height in
+                  re.findall(r'Page\s+(\d+)\s+size:\s+([0-9.]+)\s+x\s+([0-9.]+)\s+pts', sizes)}
+    text = []
+    length = 0
+    dpi = config.get('ocr_dpi', 300)
+    maximum = config.get('ocr_max_dimension', 3500)
+    for page in candidates:
+        # The scale option overrides Poppler's DPI option. Compute the target
+        # from the physical page size so small pages are not upscaled to the cap.
+        scale = max(1, min(maximum, math.ceil(dimensions[page] * dpi / 72))) if page in dimensions else maximum
+        command(['pdftoppm', '-f', str(page), '-l', str(page), '-singlefile',
+                 '-r', str(dpi), '-scale-to', str(scale),
+                 '-gray', '-png', str(source), 'ocr-page'], timeout=config.get('ocr_page_timeout', 30))
+        fragment = command(['tesseract', 'ocr-page.png', 'stdout', '-l', config['language'],
+                            '--dpi', str(config.get('ocr_dpi', 300))], timeout=config.get('ocr_page_timeout', 30))
+        fragment = fragment.strip()
+        if fragment:
+            text.append(fragment)
+            length += len(fragment) + 1
+        if length >= MAX_TEXT:
+            break
+    return '\n'.join(text)[:MAX_TEXT]
+
+
 def extract(config):
     suffix = config['extension']
     source = Path('input')
@@ -124,18 +166,16 @@ def extract(config):
         pages = int(found.group(1)) if found else 0
         if pages > config['max_pages']:
             raise RuntimeError('PDF exceeds page limit')
-        if config['phase'] == 'ocr':
-            command(['ocrmypdf', '--redo-ocr', '--output-type', 'pdf', '--optimize', '0', '--jobs', '1',
-                     '--language', config['language'], '--tesseract-timeout', '120', '--skip-big', '50',
-                     str(source), 'ocr.pdf'], timeout=config['timeout'] - 15)
-            source = Path('ocr.pdf')
         command(['pdftotext', '-enc', 'UTF-8', '-layout', str(source), 'text.txt'])
         body = read_text('text.txt')
-        if config['phase'] != 'ocr':
-            image_list = command(['pdfimages', '-list', str(source)])
-            has_images = bool(re.search(r'^\s*\d+\s+\d+\s+image\s', image_list, re.MULTILINE))
-            page_text = body.split('\f')[:pages]
-            needs_ocr = has_images and any(len(re.sub(r'\s+', '', page)) < 80 for page in page_text)
+        image_list = command(['pdfimages', '-list', str(source)])
+        candidates = ocr_candidates(body, image_list, pages)
+        if config['phase'] == 'ocr':
+            recognized = ocr_search_text(source, candidates, config)
+            if recognized:
+                body = (body.rstrip() + '\n' + recognized)[:MAX_TEXT]
+        else:
+            needs_ocr = bool(candidates)
             command(['pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-scale-to', '1400', '-jpeg', str(source), 'preview'])
     elif suffix in OFFICE_SUFFIXES:
         body = office_text(source)
