@@ -9,6 +9,8 @@ body { margin: 0; min-height: 100vh; }
 a { color: #0645ad; }
 button, input, select { font: inherit; }
 button, .button { display: inline-block; padding: .4rem .7rem; border: 1px solid #777; color: #111; background: #eee; cursor: pointer; text-decoration: none; white-space: nowrap; }
+button.icon-button, .button.icon-button { display: inline-flex; align-items: center; justify-content: center; min-width: 2.4rem; min-height: 2.4rem; padding: .4rem; flex-shrink: 0; }
+.action-icon { display: block; width: 20px; height: 20px; }
 button:disabled { color: #777; cursor: wait; }
 input, select { width: 100%; padding: .4rem; border: 1px solid #999; background: #fff; }
 button:focus, input:focus, select:focus, a:focus { outline: 2px solid #0645ad; outline-offset: 1px; }
@@ -44,12 +46,6 @@ nav a.active { font-weight: bold; background: #ddd; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: .7rem; }
 .panel-head h2 { margin: 0; }
 .split { display: grid; grid-template-columns: minmax(260px, .7fr) minmax(380px, 1.3fr); gap: 1rem; }
-.shares-view { display: flex; height: calc(100vh - 4.5rem); height: calc(100dvh - 4.5rem); min-height: 0; flex-direction: column; }
-.shares-split { min-height: 0; flex: 1; }
-.shares-split > .panel { display: flex; min-height: 0; margin-bottom: 0; flex-direction: column; }
-.shares-split .list { min-height: 0; flex: 1; overflow-y: auto; }
-.shares-split #tree-panel { display: flex; height: 100%; min-height: 0; flex-direction: column; }
-.shares-split .tree { min-height: 0; max-height: none; flex: 1; overflow-y: auto; }
 .filters { display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)); gap: .6rem; margin-bottom: 1rem; align-items: end; }
 .filters .wide { grid-column: span 2; }
 .table-wrap { width: 100%; overflow-x: auto; }
@@ -65,16 +61,9 @@ th, td { padding: .5rem; border-bottom: 1px solid #ccc; vertical-align: top; }
 .toolbar { display: flex; flex-wrap: wrap; gap: .5rem; }
 .toolbar input { max-width: 340px; }
 .row-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
-.list { margin: 0; padding: 0; list-style: none; }
 .select-row { width: 100%; display: grid; grid-template-columns: 1fr auto; gap: .5rem; border: 0; border-bottom: 1px solid #ccc; background: #fff; text-align: left; }
 .select-row.active { font-weight: bold; background: #eee; }
 .select-row span:last-child { color: #555; font-size: .85rem; }
-.tree { max-height: 65vh; overflow: auto; }
-.tree details { margin-left: 1rem; padding-left: .5rem; border-left: 1px solid #bbb; }
-.tree > details { margin-left: 0; border-left: 0; }
-.tree summary, .tree .leaf { padding: .2rem 0; }
-.tree .leaf { margin-left: 1.5rem; }
-.tree .kind { display: inline-block; min-width: 4.5rem; color: #555; }
 .empty { padding: 1rem 0; color: #666; }
 progress { width: 100%; }
 .usage-bar { min-width: 160px; }
@@ -89,7 +78,6 @@ progress { width: 100%; }
   .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .filters { grid-template-columns: repeat(3, minmax(120px, 1fr)); }
   .split { grid-template-columns: 1fr; }
-  .shares-split { grid-template-rows: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 700px) {
   .sidebar { display: none; z-index: 5; }
@@ -115,7 +103,7 @@ progress { width: 100%; }
 .access-search, .access-status-filter { margin: 0 .8rem .65rem; }
 .access-list { border-top: 1px solid #ccc; max-height: 60vh; overflow-y: auto; }
 .access-list .access-list-item { grid-template-columns: minmax(0,1fr) auto; align-items: center; padding: .5rem .7rem; white-space: normal; }
-.access-list-item strong { font-weight: inherit; overflow-wrap: anywhere; }
+.access-list-item strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: inherit; }
 .access-list-item small { color: #555; font-size: .85rem; font-weight: normal; text-align: right; }
 .access-detail-head { display: flex; gap: 1rem; justify-content: space-between; align-items: start; padding: .8rem; }
 .access-detail-head h2 { margin: 0 0 .3rem; overflow-wrap: anywhere; }

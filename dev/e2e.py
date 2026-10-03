@@ -289,6 +289,14 @@ def main() -> int:
     check({"alice", "bob", "carol", "dave", "eve", "frank"}.issubset({sam for kind, sam, _ in project_nodes if kind == "user"}), "transitive or primary-group Project membership is incomplete")
     check(all(kind == "user" for kind, _, _ in project_nodes), "Projects still contains group assignments")
 
+    check(not {'msol_sync', 'krbtgt'} & {sam.casefold() for _, sam, _ in finance_nodes + project_nodes},
+          "service identities were imported as folder users")
+    service_denied = engine_run(
+        "exec", CLIENT_CONTAINER, "smbclient", f"//files.{DNS_DOMAIN}/Data", "-m", "SMB3",
+        "-U", f"{WORKGROUP}\\MSOL_sync%{USER_PASSWORD}", "-c", "cd Finance; ls", check_result=False)
+    check(service_denied.returncode != 0 or "NT_STATUS_ACCESS_DENIED" in service_denied.stdout,
+          "excluded service account received migrated access")
+
     announce("legacy GUID-path migration preserves file hashes and inodes")
     engine_run("exec", FILES_CONTAINER, "python3", "-c", """
 import hashlib, json
@@ -753,6 +761,15 @@ fi
                     "permissions": [{"kind": "group", "principalId": "legacy", "level": 3}]}, token=token)
     check(rejected.status == 400, "group folder assignment accepted")
 
+    announce("MSOL_* and krbtgt cannot be selected or granted folder access")
+    check(not {'msol_sync', 'krbtgt'} & {name.casefold() for name in user_sids}, "excluded accounts appear in access UI data")
+    for name in ('MSOL_sync', 'krbtgt'):
+        sid = engine_run("exec", FILES_CONTAINER, "wbinfo", "--name-to-sid", f"{WORKGROUP}\\{name}").stdout.split()[0]
+        rejected = eventually("excluded-account grant", lambda: http("/api/access", method="POST", value={
+            'action': 'set-permissions', 'id': folder_id,
+            'permissions': [{'kind': 'user', 'principalId': sid, 'level': 3}]}, token=token), lambda r: r.status != 409, timeout=45)
+        check(rejected.status == 400, f"excluded account {name} accepted a direct grant")
+
     def rules(level):
         return change({"action": "set-permissions", "id": folder_id,
                        "permissions": [{"kind": "user", "principalId": user_sids["alice"], "level": level}]})
@@ -815,6 +832,51 @@ fi
     check(code != 0 or "NT_STATUS_ACCESS_DENIED" in output, "removed individual assignment still grants access")
     invalid = http("/api/access", method="POST", value={"action": "create-folder", "name": "../escape"}, token=token)
     check(invalid.status == 400, "unsafe folder path accepted")
+
+    announce("previously stored system-account grant revoked without deleting data")
+    # Reproduce a policy and ACL from a version that allowed MSOL accounts.
+    previous_service_file = json.loads(engine_run("exec", FILES_CONTAINER, "python3", "-c", """
+import hashlib, json, os, sys
+sys.path.insert(0, '/app')
+import access_control as access
+import reconcile_shares as directory
+folder_id=sys.argv[1]
+os.environ['DOMAIN_ADMINS_SID']=sys.argv[2]+'-512'
+sid=directory.run_command(['wbinfo','--name-to-sid','MSOL_sync']).stdout.split()[0]
+with access.mutation_lock():
+    conn=directory.open_db()
+    row=conn.execute('SELECT * FROM shares WHERE objectGUID=?',(folder_id,)).fetchone()
+    retained=os.path.join(row['path'],'retained-system-grant.bin')
+    with open(retained,'xb') as handle:
+        handle.write(b'previously granted data must survive')
+    top=access.descriptor({sid:3},os.environ['DOMAIN_ADMINS_SID'],top_level=True)
+    access.set_acl(row['path'],access.pack_descriptor(top),True)
+    access.set_acl(retained,access.pack_descriptor(access.descriptor({sid:3},os.environ['DOMAIN_ADMINS_SID'],False)),False)
+    conn.execute('INSERT INTO folder_permissions VALUES(?,?,?,?)',(folder_id,'user',sid,3))
+    conn.execute('UPDATE shares SET aclSignature=? WHERE objectGUID=?',(hashlib.sha256(top.encode()).hexdigest(),folder_id))
+    conn.commit()
+    conn.close()
+    with open(retained,'rb') as handle:
+        print(json.dumps({'sha256':hashlib.sha256(handle.read()).hexdigest(),'inode':os.stat(retained).st_ino}))
+""", folder_id, DOMAIN_SID).stdout)
+    allowed('cd Permissions; get retained-system-grant.bin /tmp/old-system-grant.bin', 'MSOL_sync')
+    engine_run('exec', FILES_CONTAINER, 'bash', '-lc',
+               'source /app/runtime.env && exec python3 /app/reconcile_shares.py')
+    code, output = smb('cd Permissions; get retained-system-grant.bin /tmp/revoked-system-grant.bin', 'MSOL_sync')
+    check(code != 0 or 'NT_STATUS_ACCESS_DENIED' in output, 'stored system-account grant still permits SMB reads')
+    actual_service_file = json.loads(engine_run('exec', FILES_CONTAINER, 'python3', '-c', """
+import hashlib, json, os, sys
+sys.path.insert(0,'/app')
+import reconcile_shares as directory
+conn=directory.open_db()
+assert not conn.execute('SELECT 1 FROM folder_permissions WHERE folderId=?',(sys.argv[1],)).fetchone()
+assert not conn.execute("SELECT 1 FROM access_settings WHERE key='pendingExcludedRevocation'").fetchone()
+conn.close()
+path='/data/groups/data/Permissions/retained-system-grant.bin'
+with open(path,'rb') as handle:
+    print(json.dumps({'sha256':hashlib.sha256(handle.read()).hexdigest(),'inode':os.stat(path).st_ino}))
+""", folder_id).stdout)
+    check(actual_service_file == previous_service_file, 'system-account revocation changed file contents or inode')
 
     announce("already-migrated GUID path survives container restart with all data and rights")
     created = change({"action": "create-folder", "name": "Startup recovery"})

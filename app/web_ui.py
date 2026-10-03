@@ -28,9 +28,11 @@ from typing import Dict, List, Optional, Tuple
 try:
     from app import reconcile_shares as directory
     from app import trash, access_control
+    from app.account_policy import is_excluded_user
 except ImportError:  # Container execution uses /app as the import root.
     import reconcile_shares as directory
     import trash, access_control
+    from account_policy import is_excluded_user
 
 try:
     from app.audit_store import (
@@ -520,7 +522,9 @@ class UsageScanner:
 
     def snapshot(self) -> Dict[str, object]:
         with self.lock:
-            return json.loads(json.dumps(self.data))
+            value = json.loads(json.dumps(self.data))
+            value["users"] = [row for row in value.get("users", []) if not is_excluded_user(str(row["name"]))]
+            return value
 
     def scan(self) -> Dict[str, object]:
         started = now_utc()
@@ -556,7 +560,7 @@ class UsageScanner:
             "scannedAt": now_utc().isoformat(timespec="seconds"),
             "scanSeconds": round((now_utc() - started).total_seconds(), 3),
             "groups": groups,
-            "users": user_rows,
+            "users": [row for row in user_rows if not is_excluded_user(str(row["name"]))],
             "totals": {
                 "dataBytes": sum(int(row["bytes"]) for row in groups),
                 "privateBytes": sum(int(row["privateBytes"]) for row in user_rows),

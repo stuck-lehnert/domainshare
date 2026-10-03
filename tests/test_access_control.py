@@ -39,6 +39,90 @@ class ManagedAccessTests(unittest.TestCase):
         data = self.change({'action': 'create-folder', 'name': name})
         return next(row['id'] for row in data['folders'] if row['name'] == name)
 
+    def test_excluded_users_hidden_in_snapshots_reports_and_effective_permissions(self):
+        folder = self.folder()
+        banned = {ALICE: {'sam': 'MSOL_sync', 'name': 'Sync'},
+                  BOB: {'sam': 'KrBtGt', 'name': 'Ticket Service'}}
+        access.cache_users(self.conn, banned)
+        self.conn.executemany('INSERT INTO folder_permissions VALUES(?,?,?,?)',
+                              [(folder, 'user', ALICE, 3), (folder, 'user', BOB, 2)])
+        self.conn.commit()
+        self.assertEqual(access.snapshot(self.conn, banned)['users'], [])
+        self.assertEqual(access.snapshot(self.conn)['folders'][0]['permissions'], [])
+        self.assertEqual(access.effective_levels(self.conn, folder), {})
+        report = access.report_folders(self.conn)['groups'][0]
+        self.assertEqual(report['members'], [])
+        self.assertEqual(report['userCount'], 0)
+
+    def test_excluded_users_cannot_receive_new_or_old_positive_grants(self):
+        folder = self.folder()
+        banned = {ALICE: {'sam': 'mSoL_sync', 'name': 'Sync'},
+                  BOB: {'sam': 'KRBTGT', 'name': 'Ticket Service'}}
+        access.cache_users(self.conn, banned)
+        self.conn.execute('INSERT INTO folder_permissions VALUES(?,?,?,?)', (folder, 'user', ALICE, 3))
+        self.conn.commit()
+        with mock.patch.object(access, 'sync_permissions'), mock.patch.object(directory, 'run_command', return_value=mock.Mock(returncode=0)):
+            # Both current-directory identities and the unavailable-user fallback
+            # must reject positive grants; removing a legacy grant remains possible.
+            for users, sid in [(banned, ALICE), (banned, BOB), ({}, ALICE)]:
+                for level in (1, 2, 3):
+                    with self.subTest(users=users, sid=sid, level=level):
+                        with self.assertRaisesRegex(ValueError, 'Systemkonto'):
+                            access.apply_change(self.conn, {'action': 'set-permissions', 'id': folder,
+                                'permissions': [{'kind': 'user', 'principalId': sid, 'level': level}]}, 'admin', users)
+            access.apply_change(self.conn, {'action': 'set-permissions', 'id': folder,
+                'permissions': [{'kind': 'user', 'principalId': ALICE, 'level': 0}]}, 'admin', {})
+        self.assertEqual(access.effective_levels(self.conn, folder), {})
+
+    def test_sync_revokes_old_grants_recursively_preserving_data_and_retries_disconnect(self):
+        folder = self.folder()
+        nested = os.path.join(directory.GROUP_ROOT, 'Finance', 'nested')
+        os.mkdir(nested)
+        path = os.path.join(nested, 'retained.bin')
+        with open(path, 'wb') as handle:
+            handle.write(b'production data must survive')
+        inode = os.stat(path).st_ino
+        access.cache_users(self.conn, {ALICE: {'sam': 'MSOL_sync', 'name': 'Sync'}})
+        self.conn.executemany('INSERT INTO folder_permissions VALUES(?,?,?,?)',
+                              [(folder, 'user', ALICE, 3), (folder, 'user', BOB, 2)])
+        self.conn.commit()
+        with mock.patch.dict(os.environ, {'DOMAIN_ADMINS_SID': ADMIN}), mock.patch.object(access, 'pack_descriptor', side_effect=lambda s: s), mock.patch.object(access, 'set_acl') as set_acl:
+            access.sync_permissions(self.conn)
+        self.conn.commit()
+        self.assertEqual(access.effective_levels(self.conn, folder), {BOB: 2})
+        self.assertIsNone(self.conn.execute('SELECT 1 FROM folder_permissions WHERE principalId=?', (ALICE,)).fetchone())
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM access_changes WHERE action='revoke-excluded-users'").fetchone()[0], 1)
+        self.assertTrue(any(call.args[0] == path for call in set_acl.call_args_list))
+        self.assertTrue(all(ALICE not in call.args[1] for call in set_acl.call_args_list))
+        with mock.patch.object(directory, 'run_command', side_effect=[mock.Mock(returncode=1), mock.Mock(returncode=0)]) as run:
+            with self.assertRaises(RuntimeError):
+                access.close_data_connections(self.conn)
+            self.assertIsNotNone(self.conn.execute("SELECT 1 FROM access_settings WHERE key='pendingExcludedRevocation'").fetchone())
+            access.close_data_connections(self.conn)
+            access.close_data_connections(self.conn)
+        self.assertEqual(run.call_count, 2)
+        self.assertIsNone(self.conn.execute("SELECT 1 FROM access_settings WHERE key='pendingExcludedRevocation'").fetchone())
+        with open(path, 'rb') as handle:
+            self.assertEqual(handle.read(), b'production data must survive')
+        self.assertEqual(os.stat(path).st_ino, inode)
+
+    def test_migration_resolves_excluded_nested_and_primary_members_without_grants(self):
+        folder = self.folder()
+        self.conn.execute("UPDATE shares SET samAccountName='FS_Finance' WHERE objectGUID=?", (folder,))
+        self.conn.commit()
+        ticket = 'S-1-5-21-1-2-3-502'
+        users = {ALICE: {**USERS[ALICE], 'dn': 'alice', 'primaryRid': 513},
+                 BOB: {'sam': 'MSOL_sync', 'name': 'Sync', 'dn': 'sync', 'primaryRid': 1200},
+                 ticket: {'sam': 'krbtgt', 'name': 'Ticket', 'dn': 'ticket', 'primaryRid': 513}}
+        groups = {'finance': {'dn': 'finance', 'sam': 'FS_Finance', 'sid': 'S-1-5-21-1-2-3-1200', 'members': ['sync', 'nested']},
+                  'nested': {'dn': 'nested', 'sam': 'Nested', 'sid': 'S-1-5-21-1-2-3-513', 'members': ['finance', 'ticket']}}
+        with mock.patch.object(access, 'read_directory', return_value=(users, groups)):
+            access.migrate(self.conn)
+        self.assertTrue(access.initialized(self.conn))
+        self.assertEqual(access.effective_levels(self.conn, folder), {ALICE: 3})
+        self.assertEqual([row['principalId'] for row in self.conn.execute('SELECT principalId FROM folder_permissions')], [ALICE])
+        self.assertEqual([row['sam'] for row in access.snapshot(self.conn)['users']], ['alice'])
+
     def test_individual_user_assignments_are_independent_including_zero(self):
         folder = self.folder()
         other = self.folder('Projects')

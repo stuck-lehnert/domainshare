@@ -118,6 +118,7 @@ ensure_user eve "$AD_USER_PASSWORD" Eve Evans
 ensure_user frank "$AD_USER_PASSWORD" Frank Foster
 ensure_user "$AD_WEB_ADMIN_USER" "$AD_WEB_ADMIN_PASSWORD" Preview Administrator
 ensure_user report_svc "$AD_USER_PASSWORD" Report Service
+ensure_user MSOL_sync "$AD_USER_PASSWORD" Directory Sync
 
 for group in Finance_Analysts Engineering_Leads FS_Finance FS_Engineering FS_Projects; do
   ensure_group "$group"
@@ -129,8 +130,8 @@ set_display_name FS_Finance Finance
 set_display_name FS_Engineering Engineering
 set_display_name FS_Projects Projects
 
-add_members Finance_Analysts alice
-add_members FS_Finance 'Finance_Analysts,bob,report_svc'
+add_members Finance_Analysts 'alice,MSOL_sync'
+add_members FS_Finance 'Finance_Analysts,bob,report_svc,krbtgt'
 add_members Engineering_Leads carol
 add_members FS_Engineering 'Engineering_Leads,dave'
 add_members FS_Projects 'FS_Finance,FS_Engineering,eve'

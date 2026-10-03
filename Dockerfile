@@ -33,6 +33,7 @@ COPY app/backup_to_destination.py /app/backup_to_destination.py
 COPY app/audit_policy.py /app/audit_policy.py
 COPY app/state_db.py /app/state_db.py
 COPY app/access_control.py /app/access_control.py
+COPY app/account_policy.py /app/account_policy.py
 COPY app/audit_store.py /app/audit_store.py
 COPY app/audit_collector.py /app/audit_collector.py
 COPY app/trash.py /app/trash.py

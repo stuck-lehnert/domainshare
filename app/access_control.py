@@ -13,8 +13,10 @@ import uuid
 
 try:
     from . import reconcile_shares as directory
+    from .account_policy import is_excluded_user
 except ImportError:
     import reconcile_shares as directory
+    from account_policy import is_excluded_user
 
 SID_RE = re.compile(r"S-1-5-21-\d+-\d+-\d+-\d+\Z")
 READ = 0x1200A9
@@ -146,12 +148,14 @@ def migrate(conn):
         seen = {*seen, group["dn"]}
         rid = directory.sid_rid(group["sid"])
         result = {sid for sid, user in users.items()
-                  if user["primaryRid"] == rid and sid.rsplit("-", 1)[0] == group["sid"].rsplit("-", 1)[0]}
+                  if not is_excluded_user(user["sam"]) and user["primaryRid"] == rid and sid.rsplit("-", 1)[0] == group["sid"].rsplit("-", 1)[0]}
         for dn in group["members"]:
             if dn in groups:
                 result.update(members(groups[dn], seen))
             elif dn in by_dn:
-                result.add(by_dn[dn])
+                sid = by_dn[dn]
+                if not is_excluded_user(users[sid]["sam"]):
+                    result.add(sid)
             else:
                 raise RuntimeError(f"Cannot import unresolved member {dn}; migration will retry")
         return result
@@ -297,22 +301,33 @@ def create_folder_record(conn, name, path):
     return folder_id
 
 
+def excluded_user_sids(conn):
+    # Retain identities internally to recognize old assignments and resolve LDAP
+    # memberships, including accounts no longer returned by the directory.
+    return {row["sid"] for row in conn.execute("SELECT sid,sam FROM access_users")
+            if is_excluded_user(row["sam"])}
+
+
 def snapshot(conn, users=None):
-    user_rows = [dict(row) for row in conn.execute("SELECT * FROM access_users ORDER BY sam COLLATE NOCASE")]
+    excluded = excluded_user_sids(conn)
+    user_rows = [dict(row) for row in conn.execute("SELECT * FROM access_users ORDER BY sam COLLATE NOCASE")
+                 if row["sid"] not in excluded]
     if users is not None:
         for user in user_rows:
             user["available"] = user["sid"] in users
     folders = []
     for row in conn.execute("SELECT * FROM shares ORDER BY shareName COLLATE NOCASE"):
         folders.append({"id": row["objectGUID"], "name": row["shareName"], "active": bool(row["isActive"]),
-                        "permissions": [dict(p) for p in conn.execute("SELECT kind,principalId,level FROM folder_permissions WHERE folderId=? ORDER BY kind,principalId", (row["objectGUID"],))]})
+                        "permissions": [dict(p) for p in conn.execute("SELECT kind,principalId,level FROM folder_permissions WHERE folderId=? ORDER BY kind,principalId", (row["objectGUID"],)) if p["principalId"] not in excluded]})
     return {"users": user_rows, "folders": folders,
             "fetchedAt": timestamp(), "initialized": initialized(conn)}
 
 
 def effective_levels(conn, folder_id):
+    excluded = excluded_user_sids(conn)
     return {row["principalId"]: row["level"] for row in conn.execute(
-        "SELECT principalId,level FROM folder_permissions WHERE folderId=?", (folder_id,))}
+        "SELECT principalId,level FROM folder_permissions WHERE folderId=?", (folder_id,))
+            if row["principalId"] not in excluded}
 
 
 def descriptor(levels, admin_sid, is_dir=True, top_level=False):
@@ -411,7 +426,35 @@ def recover_pending(conn):
     directory.log("Recovered interrupted admin access update")
 
 
+def revoke_excluded_permissions(conn):
+    excluded = excluded_user_sids(conn)
+    rules = [dict(row) for row in conn.execute("SELECT * FROM folder_permissions")
+             if row["principalId"] in excluded]
+    if not rules:
+        return
+    for rule in rules:
+        conn.execute("DELETE FROM folder_permissions WHERE folderId=? AND principalId=?",
+                     (rule["folderId"], rule["principalId"]))
+        conn.execute("UPDATE shares SET aclSignature='' WHERE objectGUID=?", (rule["folderId"],))
+    if any(rule["level"] for rule in rules):
+        conn.execute("INSERT OR REPLACE INTO access_settings VALUES('pendingExcludedRevocation','1')")
+    conn.execute("INSERT INTO access_changes(timestamp,actor,action,details) VALUES(?,?,?,?)",
+                 (timestamp(), "system", "revoke-excluded-users", json.dumps(rules)))
+
+
+def close_data_connections(conn, force=False):
+    pending = conn.execute("SELECT 1 FROM access_settings WHERE key='pendingExcludedRevocation'").fetchone()
+    if not force and not pending:
+        return
+    result = directory.run_command(["smbcontrol", "all", "close-share", "Data"], check=False)
+    if result.returncode:
+        raise RuntimeError("Berechtigungen gespeichert; SMB-Verbindungen konnten nicht geschlossen werden. Samba neu starten.")
+    conn.execute("DELETE FROM access_settings WHERE key='pendingExcludedRevocation'")
+    conn.commit()
+
+
 def sync_permissions(conn, force=False):
+    revoke_excluded_permissions(conn)
     admin_sid = os.getenv("DOMAIN_ADMINS_SID", "")
     root = directory.GROUP_ROOT
     os.makedirs(root, exist_ok=True)
@@ -461,6 +504,7 @@ def apply_change(conn, body, actor, users):
     cache_users(conn, users)
     conn.commit()
     recover_pending(conn)
+    excluded = excluded_user_sids(conn)
     pending = {}
     if action == "create-folder":
         pending["create"] = os.path.join(directory.GROUP_ROOT, valid_name(body.get("name")))
@@ -509,6 +553,8 @@ def apply_change(conn, body, actor, users):
                     seen.add((kind, principal))
                     if principal not in users and principal not in old_users:
                         raise ValueError("Unbekannter AD-Benutzer")
+                    if level and principal in excluded:
+                        raise ValueError("Systemkonto kann keine Ordnerberechtigung erhalten")
                     checked.append((folder_id, kind, principal, level))
                 conn.execute("DELETE FROM folder_permissions WHERE folderId=?", (folder_id,))
                 conn.executemany("INSERT INTO folder_permissions VALUES(?,?,?,?)", checked)
@@ -550,9 +596,7 @@ def apply_change(conn, body, actor, users):
             conn.commit()
         raise
     # Existing handles carry cached access masks; disconnect Data clients.
-    result = directory.run_command(["smbcontrol", "all", "close-share", "Data"], check=False)
-    if result.returncode:
-        raise RuntimeError("Berechtigungen gespeichert; SMB-Verbindungen konnten nicht geschlossen werden. Samba neu starten.")
+    close_data_connections(conn, force=True)
     return snapshot(conn, users)
 
 

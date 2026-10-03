@@ -342,7 +342,6 @@ Open `https://<WEB_HOSTNAME>/` after setup. Only members of the group identified
 The console is intentionally operational and plain:
 
 - **Overview**: current capacity totals, active folder count, recent activity, and backup state.
-- **File shares**: one selectable tree per active managed folder with its individually assigned users.
 - **Zugriffsverwaltung**: create/archive/restore Data folders and assign levels 0–3 to existing AD users individually per folder.
 - **Data usage**: cached recursive size of every top-level `/Data` group folder.
 - **User usage**: per-user `/Private + /FSLogix` totals with component sizes.

@@ -1,6 +1,6 @@
 "use strict";
 
-const state = { session: null, timer: null, groups: null, storage: null, activity: null };
+const state = { session: null, timer: null, storage: null, activity: null };
 const loginView = document.querySelector("#login-view");
 const appView = document.querySelector("#app-view");
 const content = document.querySelector("#content");
@@ -8,6 +8,13 @@ const nav = document.querySelector("#navigation");
 const toast = document.querySelector("#toast");
 
 const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
+function actionIcon(action) {
+  const paths = {
+    download: '<path d="M12 3v12m-5-5 5 5 5-5"/><path d="M5 16v4h14v-4"/>',
+    restore: '<path d="M3 11a9 9 0 1 1 2.6 7"/><path d="M3 4v7h7"/>',
+  };
+  return `<svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths[action]}</svg>`;
+}
 const bytes = value => {
   let number = Number(value || 0);
   const units = ["B", "kB", "MB", "GB", "TB", "PB"];
@@ -25,7 +32,6 @@ const utcTime = value => {
   return `${pad(date.getUTCDate())}.${pad(date.getUTCMonth() + 1)}.${date.getUTCFullYear()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())} UTC`;
 };
 const actionLabel = value => ({read: "Lesen", write: "Schreiben", move: "Umbenennen", delete: "Löschen"}[value] || value || "—");
-const nodeTypeLabel = value => ({group: "Gruppe", user: "Benutzer", computer: "Computer", unknown: "Unbekannt"}[value] || value);
 const backupStateLabel = value => ({starting: "Startet", running: "Läuft", completed: "Abgeschlossen", failed: "Fehlgeschlagen", waiting: "Wartet", disabled: "Deaktiviert"}[value] || value || "Unbekannt");
 function backupMessage(data) {
   const message = String(data.message || "");
@@ -103,7 +109,6 @@ function routeFor(path) {
   if (path.startsWith("/storage/data")) return "storage-data";
   if (path.startsWith("/storage/users")) return "storage-users";
   if (path.startsWith("/access")) return "access";
-  if (path.startsWith("/shares")) return "shares";
   if (path.startsWith("/reconciliation")) return "reconciliation";
   if (path.startsWith("/activity/fslogix")) return "activity-fslogix";
   if (path.startsWith("/activity")) return "activity";
@@ -119,6 +124,7 @@ async function navigate(path, replace = false) {
     if (replace && state.currentPath) history.replaceState({}, "", state.currentPath);
     return;
   }
+  if (path === "/shares" || path.startsWith("/shares/")) { path = "/access"; replace = true; }
   state.accessDirty = false;
   state.currentPath = path;
   clearInterval(state.timer);
@@ -130,7 +136,6 @@ async function navigate(path, replace = false) {
   setLoading();
   try {
     if (route === "overview") await renderOverview();
-    if (route === "shares") await renderShares();
     if (route === "access") await renderAccess();
     if (route === "reconciliation") await renderReconciliation();
     if (route === "storage-data") await renderStorage("data");
@@ -193,46 +198,6 @@ function usageTable(rows, type) {
   }).join("")}</tbody></table></div>`;
 }
 
-function nodeMatches(node, query) {
-  if (!query) return true;
-  if (`${node.name} ${node.sam} ${node.type} ${nodeTypeLabel(node.type)}`.toLowerCase().includes(query)) return true;
-  return (node.members || []).some(child => nodeMatches(child, query));
-}
-
-function treeNodes(nodes, query = "") {
-  return nodes.filter(node => nodeMatches(node, query)).map(node => {
-    const children = treeNodes(node.members || [], query);
-    const title = `<span class="kind">${esc(nodeTypeLabel(node.type))}</span> <strong>${esc(node.name)}</strong>${node.sam && node.sam !== node.name ? ` <span class="muted">${esc(node.sam)}</span>` : ""}${node.cycle ? ` ${badge("Zyklus", "warn")}` : ""}`;
-    return children ? `<details ${query ? "open" : ""}><summary>${title}</summary>${children}</details>` : `<div class="leaf">${title}</div>`;
-  }).join("");
-}
-
-async function renderShares() {
-  const data = await api("/api/groups");
-  state.groups = data;
-  const groups = data.groups || [];
-  content.innerHTML = `<div class="shares-view">` + pageHead("Dateifreigaben", "Verwaltete Ordner und ihre individuellen Benutzerberechtigungen.", `<span class="muted">Verzeichnisstand ${esc(utcTime(data.fetchedAt))}</span>`) + `
-    ${data.truncated ? `<p>${badge("Ergebnis gekürzt", "warn")} Mitgliedschaftsliste ist unvollständig.</p>` : ""}
-    <section class="split shares-split">
-      <article class="panel"><div class="panel-head"><h2>Datenordner</h2><span>${groups.length}</span></div><input id="group-filter" type="search" placeholder="Ordner oder Benutzer filtern"><ul id="group-list" class="list"></ul></article>
-      <article class="panel"><div id="tree-panel"></div></article>
-    </section></div>`;
-  const list = document.querySelector("#group-list");
-  const tree = document.querySelector("#tree-panel");
-  let selected = groups[0] || null;
-  let query = "";
-  const draw = () => {
-    const visible = groups.filter(group => `${group.name} ${group.sam} ${group.folder}`.toLowerCase().includes(query) || group.members.some(node => nodeMatches(node, query)));
-    if (selected && !visible.includes(selected)) selected = visible[0] || null;
-    list.innerHTML = visible.length ? visible.map(group => `<li><button class="select-row ${group === selected ? "active" : ""}" data-guid="${esc(group.guid)}"><span><strong>${esc(group.folder)}</strong><br><span class="muted">${esc(group.sam)}</span></span><span>${group.userCount} Benutzer</span></button></li>`).join("") : empty("Kein Ordner entspricht dem Filter.");
-    if (!selected) tree.innerHTML = empty("Datenordner auswählen.");
-    else tree.innerHTML = `<div class="panel-head"><div><h2>${esc(selected.folder)}</h2><span class="muted">${esc(selected.sam)} · ${selected.userCount} wirksame Benutzer</span></div>${selected.active ? badge("Aktiv") : badge("Archiviert", "warn")}</div><div class="tree">${treeNodes(selected.members, query) || empty("Keine Benutzer mit Zugriff")}</div>`;
-    list.querySelectorAll("button[data-guid]").forEach(button => button.addEventListener("click", () => { selected = groups.find(group => group.guid === button.dataset.guid); draw(); }));
-  };
-  document.querySelector("#group-filter").addEventListener("input", event => { query = event.target.value.trim().toLowerCase(); draw(); });
-  draw();
-}
-
 const permissionLabels = ["Kein Zugriff", "Lesen", "Lesen + Ändern", "Lesen + Ändern + Löschen"];
 
 async function renderAccess() {
@@ -284,7 +249,7 @@ async function renderAccess() {
     try {
       data = await api("/api/access", {method: "POST", body: JSON.stringify(body)});
       if (body.action === "create-folder") {
-        folderFilter = "active"; query = ""; userQuery = ""; userFilter = "all";
+        folderFilter = "active"; query = "";
         folderId = data.folders.find(item => item.name === body.name.trim())?.id;
       }
       if (body.action === "archive-folder") folderFilter = "archived";
@@ -310,11 +275,11 @@ async function renderAccess() {
     }
   }
 
-  function dialog(title, explanation, label, action, initial = null, danger = false) {
+  function dialog(title, explanation, label, action, initial = null, danger = false, icon = null) {
     const modal = document.createElement("dialog");
     modal.className = "access-dialog";
     modal.setAttribute("aria-label", title);
-    modal.innerHTML = `<form><h2>${esc(title)}</h2><p>${esc(explanation)}</p>${initial !== null ? `<label>Name<input value="${esc(initial)}" maxlength="120" required autofocus></label>` : ""}<div class="access-dialog-actions"><button type="button" data-cancel>Abbrechen</button><button type="submit" class="${danger ? "access-danger" : ""}">${esc(label)}</button></div></form>`;
+    modal.innerHTML = `<form><h2>${esc(title)}</h2><p>${esc(explanation)}</p>${initial !== null ? `<label>Name<input value="${esc(initial)}" maxlength="120" required autofocus></label>` : ""}<div class="access-dialog-actions"><button type="button" data-cancel>Abbrechen</button><button type="submit" class="${danger ? "access-danger" : ""} ${icon ? "icon-button" : ""}"${icon ? ` aria-label="${esc(label)}" title="${esc(label)}"` : ""}>${icon ? actionIcon(icon) : esc(label)}</button></div></form>`;
     document.body.append(modal);
     modal.querySelector("[data-cancel]").addEventListener("click", () => modal.close());
     modal.addEventListener("close", () => modal.remove());
@@ -335,11 +300,11 @@ async function renderAccess() {
     root.querySelector("#access-list").innerHTML = items.length ? items.map(item => {
       const count = item.permissions.filter(rule => rule.level > 0).length;
       const subtitle = item.active ? `${count} Benutzer` : "Archiviert";
-      return `<button type="button" class="select-row access-list-item ${item.id === folderId ? "active" : ""}" data-select="${esc(item.id)}" aria-pressed="${item.id === folderId}"><strong>${esc(item.name)}</strong><small>${esc(subtitle)}</small></button>`;
+      return `<button type="button" class="select-row access-list-item ${item.id === folderId ? "active" : ""}" data-select="${esc(item.id)}" aria-pressed="${item.id === folderId}"><strong title="${esc(item.name)}">${esc(item.name)}</strong><small>${esc(subtitle)}</small></button>`;
     }).join("") : `<div class="access-empty">${query ? "Keine Treffer. Suchbegriff ändern." : "Keine Ordner in dieser Ansicht."}</div>`;
     root.querySelectorAll("[data-select]").forEach(button => button.addEventListener("click", () => {
       if (button.dataset.select === folderId || !canLeave()) return;
-      folderId = button.dataset.select; userQuery = ""; userFilter = "all";
+      folderId = button.dataset.select;
       loadDraft(); drawList(); drawDetail();
     }));
   }
@@ -374,7 +339,7 @@ async function renderAccess() {
       detail.innerHTML = data.folders.length ? '<div class="access-empty"><h2 id="access-folder-title">Kein Ordner in dieser Ansicht</h2><p>Den Ordnerstatus wechseln oder einen neuen Ordner anlegen.</p></div>' : '<div class="access-empty"><h2 id="access-folder-title">Ersten Ordner anlegen</h2><p>Mit „Neuer Ordner“ beginnen. Anschließend die Rechte für einzelne AD-Benutzer festlegen.</p></div>';
       return;
     }
-    detail.innerHTML = `<header class="access-detail-head"><div><h2 id="access-folder-title">${esc(selected.name)}</h2><p>${selected.active ? "Zugriff für jeden AD-Benutzer einzeln festlegen. Ohne Zuweisung kein Zugriff." : "Dieser Ordner ist archiviert und für Benutzer nicht erreichbar. Gespeicherte Rechte gelten nach dem Wiederherstellen."}</p></div><button type="button" id="access-archive" class="link-button">${selected.active ? "Archivieren" : "Wiederherstellen"}</button></header>
+    detail.innerHTML = `<header class="access-detail-head"><div><h2 id="access-folder-title">${esc(selected.name)}</h2><p>${selected.active ? "Zugriff für jeden AD-Benutzer einzeln festlegen. Ohne Zuweisung kein Zugriff." : "Dieser Ordner ist archiviert und für Benutzer nicht erreichbar. Gespeicherte Rechte gelten nach dem Wiederherstellen."}</p></div><button type="button" id="access-archive" class="${selected.active ? "link-button" : "icon-button"}"${selected.active ? "" : ' aria-label="Wiederherstellen" title="Wiederherstellen"'}>${selected.active ? "Archivieren" : actionIcon("restore")}</button></header>
       <section class="access-section"><div class="access-section-head"><h3>Benutzerrechte</h3></div>
         <div class="access-filter-row"><label><span class="sr-only">Benutzer suchen</span><input id="access-user-search" type="search" placeholder="Name oder Benutzername suchen" value="${esc(userQuery)}"></label><label><span class="sr-only">Zugriff filtern</span><select id="access-user-filter"><option value="all">Alle Benutzer</option><option value="granted">${selected.active ? "Mit Zugriff" : "Mit gespeicherten Rechten"}</option><option value="hidden">${selected.active ? "Ohne Zugriff" : "Ohne gespeicherte Rechte"}</option></select></label></div>
         <p id="access-user-count" class="muted" role="status"></p>
@@ -388,7 +353,7 @@ async function renderAccess() {
     detail.querySelector("#access-discard").addEventListener("click", () => { loadDraft(); drawDetail(); });
     detail.querySelector("#access-archive").addEventListener("click", () => {
       if (!canLeave()) return;
-      dialog(selected.active ? "Ordner archivieren?" : "Ordner wiederherstellen?", selected.active ? `„${selected.name}“ wird für Benutzer ausgeblendet. Alle Dateien bleiben erhalten.` : `„${selected.name}“ wird mit den gespeicherten Rechten wieder freigegeben.`, selected.active ? "Archivieren" : "Wiederherstellen", () => save({action: selected.active ? "archive-folder" : "restore-folder", id: selected.id}), null, selected.active);
+      dialog(selected.active ? "Ordner archivieren?" : "Ordner wiederherstellen?", selected.active ? `„${selected.name}“ wird für Benutzer ausgeblendet. Alle Dateien bleiben erhalten.` : `„${selected.name}“ wird mit den gespeicherten Rechten wieder freigegeben.`, selected.active ? "Archivieren" : "Wiederherstellen", () => save({action: selected.active ? "archive-folder" : "restore-folder", id: selected.id}), null, selected.active, selected.active ? null : "restore");
     });
     drawUsers(); updateDirty();
   }
@@ -403,7 +368,7 @@ async function renderAccess() {
     if (!canLeave()) { event.target.value = folderFilter; return; }
     folderFilter = event.target.value;
     const visible = data.folders.filter(item => folderFilter === "all" || item.active === (folderFilter === "active"));
-    if (!visible.some(item => item.id === folderId)) { folderId = visible[0]?.id; userQuery = ""; userFilter = "all"; }
+    if (!visible.some(item => item.id === folderId)) folderId = visible[0]?.id;
     loadDraft(); drawList(); drawDetail();
   });
   root.querySelector("#access-create").addEventListener("click", () => {
@@ -524,7 +489,7 @@ async function renderTrash() {
         <td class="path">${esc(item.path)}</td>
         <td class="numeric">${bytes(item.size)}</td>
         <td class="timestamp">${esc(utcTime(item.expiresAt))}</td>
-        <td><div class="row-actions"><a class="button" href="/api/trash/download?id=${encodeURIComponent(item.id)}" download>Herunterladen</a><button type="button" data-restore="${esc(item.id)}">Wiederherstellen</button></div></td>
+        <td><div class="row-actions"><a class="button icon-button" href="/api/trash/download?id=${encodeURIComponent(item.id)}" download aria-label="Herunterladen" title="Herunterladen">${actionIcon("download")}</a><button type="button" class="icon-button" data-restore="${esc(item.id)}" aria-label="Wiederherstellen" title="Wiederherstellen">${actionIcon("restore")}</button></div></td>
       </tr>`).join("");
     }
     const shown = result.items.length.toLocaleString("de-DE");

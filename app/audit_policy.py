@@ -6,6 +6,11 @@ import hashlib
 import os
 from typing import Mapping, Optional, Tuple
 
+try:
+    from .account_policy import account_name
+except ImportError:
+    from account_policy import account_name
+
 AUDIT_ACTIONS = frozenset({"read", "write", "move", "delete"})
 
 OPERATION_ACTIONS = {
@@ -40,10 +45,6 @@ def skipped_user_suffixes() -> Tuple[str, ...]:
         for suffix in raw.split(",")
         if suffix.strip()
     )
-
-def account_name(user: str) -> str:
-    account = user.strip().rsplit("\\", 1)[-1]
-    return account.split("@", 1)[0]
 
 def skip_user(user: str) -> bool:
     account = account_name(user).casefold()

@@ -16,6 +16,7 @@ try:
         skipped_user_suffixes,
     )
     from .state_db import connect_state_db
+    from .account_policy import is_excluded_user
 except ImportError:
     from audit_policy import (
         account_name,
@@ -24,6 +25,7 @@ except ImportError:
         skipped_user_suffixes,
     )
     from state_db import connect_state_db
+    from account_policy import is_excluded_user
 
 
 AUDIT_SCHEMA = """
@@ -927,7 +929,7 @@ def rollup_facets(
 
     actions = distinct("action")
     return {
-        "users": distinct("user"),
+        "users": [user for user in distinct("user") if not is_excluded_user(user)],
         "shares": distinct("share"),
         "operations": actions,
         "actions": actions,

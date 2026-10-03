@@ -17,8 +17,10 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 try:
     from .state_db import STATE_DB_PATH, connect_state_db
+    from .account_policy import is_excluded_user
 except ImportError:
     from state_db import STATE_DB_PATH, connect_state_db
+    from account_policy import is_excluded_user
 
 
 DB_PATH = STATE_DB_PATH
@@ -69,7 +71,6 @@ REQUIRED_ENV = ["REALM", "WORKGROUP", "DOMAIN"]
 ATTR_RE = re.compile(r"^([^:]+)(::?)\s*(.*)$")
 GROUP_FOLDER_INVALID_RE = re.compile(r"[\\/:*?\"<>|]")
 PRIVATE_SKIP_EXACT = {
-    "krbtgt",
     "administrator",
     "guest",
     "gast",
@@ -78,7 +79,7 @@ PRIVATE_SKIP_EXACT = {
     "fileshare_serviceacc",
     "fileshare_serviceaccount",
 }
-PRIVATE_SKIP_PREFIXES = ("msol_", "fileshare_service", "aad_")
+PRIVATE_SKIP_PREFIXES = ("fileshare_service", "aad_")
 UAC_ACCOUNTDISABLE = 0x0002
 UAC_LOCKOUT = 0x0010
 AD_NEVER_EXPIRES_VALUES = {0, 9223372036854775807}
@@ -1407,7 +1408,7 @@ def list_domain_users(non_login_users: set) -> List[str]:
 
 def should_skip_private_user(username: str) -> bool:
     normalized = username.strip().lower()
-    if not normalized:
+    if not normalized or is_excluded_user(username):
         return True
     if normalized in PRIVATE_SKIP_EXACT:
         return True
@@ -1717,10 +1718,15 @@ def with_lock() -> bool:
                 import access_control
             status_progress(10, "database", "Loading admin-managed folders")
             access_control.migrate(conn)
+            # Refresh user names only; managed permissions never rediscover AD groups.
+            users, _ = access_control.read_directory()
+            access_control.cache_users(conn, users)
+            conn.commit()
             access_control.recover_pending(conn)
             status_progress(32, "data-permissions", "Syncing managed folder permissions")
             access_control.sync_permissions(conn)
             conn.commit()
+            access_control.close_data_connections(conn)
             log("Synced admin-managed Data folder permissions")
         finally:
             conn.close()

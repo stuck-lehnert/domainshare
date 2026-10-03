@@ -646,6 +646,20 @@ class AuditQueryTests(unittest.TestCase):
             "source": "log.pc01",
         }
 
+    def test_excluded_accounts_removed_from_user_choices_but_audit_records_retained(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            today = dt.datetime.now(dt.timezone.utc).date()
+            database = os.path.join(tmpdir, 'state.db')
+            store = audit_store.AuditStore(database)
+            names = ['alice', 'DOMAIN\\MSOL_sync', 'KrBtGt@example.test']
+            store.append_batch([self.make_event(f'{today}T12:00:0{index}+00:00', name)
+                                for index, name in enumerate(names)], {}, set())
+            store.close()
+            with mock.patch.object(web_ui, 'STATE_DB', database):
+                result = web_ui.query_audit({'from': [str(today)], 'to': [str(today)], 'facets': ['1']})
+        self.assertEqual(result['facets']['users'], ['alice'])
+        self.assertEqual({row['user'] for row in result['events']}, set(names))
+
     def test_queries_indexed_events_with_filters_and_keyset_cursor(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             today = dt.datetime.now(dt.timezone.utc).date()
@@ -1214,11 +1228,9 @@ class WebPresentationTests(unittest.TestCase):
         self.assertNotIn(">Metadaten<", script)
         self.assertNotIn(">Sitzung<", script)
         self.assertNotIn('name="operation"', script)
-        self.assertIn('class="shares-view"', script)
-        self.assertIn('class="split shares-split"', script)
-        self.assertIn(".shares-view { display: flex; height: calc(100vh - 4.5rem);", css)
-        self.assertIn(".shares-split .list", css)
-        self.assertIn(".shares-split .tree", css)
+        self.assertNotIn('href="/shares"', html)
+        self.assertNotIn('Dateifreigaben', html)
+        self.assertNotIn('renderShares', script)
 
     def test_admin_actions_are_german_and_backup_automatic_setting_is_env_only(self):
         script = self.asset("app.js")
@@ -1361,6 +1373,35 @@ class TlsSummaryTests(unittest.TestCase):
 
 
 class UsageScannerTests(unittest.TestCase):
+    def test_excluded_user_storage_rows_hidden_without_losing_files_or_totals(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            roots = {name: os.path.join(tmpdir, name) for name in ('GROUP_ROOT', 'PRIVATE_ROOT', 'FSLOGIX_ROOT')}
+            for path in roots.values():
+                os.mkdir(path)
+            for name in ('alice', 'MSOL_sync', 'KrBtGt'):
+                path = os.path.join(roots['PRIVATE_ROOT'], name)
+                os.mkdir(path)
+                with open(os.path.join(path, 'retained.txt'), 'wb') as handle:
+                    handle.write(b'123')
+            profile = os.path.join(roots['FSLOGIX_ROOT'], 'sync-profile')
+            os.mkdir(profile)
+            with open(os.path.join(profile, 'retained.vhdx'), 'wb') as handle:
+                handle.write(b'12345')
+            with mock.patch.dict(os.environ, roots), mock.patch.object(web_ui, 'STATE_DB', os.path.join(tmpdir, 'state.db')), mock.patch.object(web_ui, 'fslogix_username', return_value='MSOL_sync'):
+                scanner = web_ui.UsageScanner()
+                value = scanner.scan()
+            self.assertEqual([row['name'] for row in value['users']], ['alice'])
+            self.assertEqual(value['totals']['privateBytes'], 9)
+            self.assertEqual(value['totals']['fslogixBytes'], 5)
+            # Old persisted cache entries are filtered before reaching any page/report.
+            scanner.data['users'].append({'name': 'DOMAIN\\krbtgt', 'totalBytes': 3})
+            self.assertEqual([row['name'] for row in scanner.snapshot()['users']], ['alice'])
+            self.assertEqual(scanner.snapshot()['totals'], value['totals'])
+            for name in ('MSOL_sync', 'KrBtGt'):
+                with open(os.path.join(roots['PRIVATE_ROOT'], name, 'retained.txt'), 'rb') as handle:
+                    self.assertEqual(handle.read(), b'123')
+            self.assertTrue(os.path.isfile(os.path.join(profile, 'retained.vhdx')))
+
     def test_aggregates_private_and_fslogix_by_user(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             group_root = os.path.join(tmpdir, "data")
