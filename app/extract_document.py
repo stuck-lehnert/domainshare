@@ -15,6 +15,11 @@ import warnings
 import zipfile
 from xml.etree import ElementTree
 
+try:
+    from .document_types import OFFICE_SUFFIXES, IMAGE_SUFFIXES
+except ImportError:
+    from document_types import OFFICE_SUFFIXES, IMAGE_SUFFIXES
+
 MAX_TEXT = 2 * 1024 * 1024
 
 
@@ -97,7 +102,7 @@ def office_text(path):
             raise RuntimeError('Office document exceeds extraction limits')
         for entry in sorted(entries, key=lambda item: item.filename):
             name = entry.filename
-            wanted = (name.startswith(('word/', 'ppt/slides/', 'xl/worksheets/')) or name in {'xl/sharedStrings.xml', 'content.xml'}) and name.endswith('.xml')
+            wanted = (name.startswith(('word/', 'ppt/slides/')) or name == 'content.xml') and name.endswith('.xml')
             if not wanted or entry.file_size > 16 * 1024 * 1024:
                 continue
             node = ElementTree.fromstring(archive.read(entry))
@@ -132,9 +137,9 @@ def extract(config):
             page_text = body.split('\f')[:pages]
             needs_ocr = has_images and any(len(re.sub(r'\s+', '', page)) < 80 for page in page_text)
             command(['pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-scale-to', '1400', '-jpeg', str(source), 'preview'])
-    elif suffix in {'.docx', '.xlsx', '.pptx', '.odt', '.ods', '.odp'}:
+    elif suffix in OFFICE_SUFFIXES:
         body = office_text(source)
-    elif suffix in {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.webp', '.bmp'}:
+    elif suffix in IMAGE_SUFFIXES:
         from PIL import Image
         Image.MAX_IMAGE_PIXELS = 25_000_000
         warnings.simplefilter('error', Image.DecompressionBombWarning)
@@ -142,9 +147,7 @@ def extract(config):
             image.thumbnail((1400,1400))
             image.convert('RGB').save('preview.jpg', 'JPEG', quality=85)
     else:
-        body = read_text(source)
-        if suffix in {'.html', '.htm', '.xml'}:
-            body = re.sub(r'<[^>]+>', ' ', body)
+        raise ValueError('File type is not eligible for content extraction')
     return {'body': body[:MAX_TEXT], 'pages': pages, 'needsOcr': needs_ocr}
 
 

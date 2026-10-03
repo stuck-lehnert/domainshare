@@ -329,8 +329,17 @@ def main() -> int:
     office = eventually("Office document full text", lambda: http(query_path("/api/documents", {"q":"OFFICETEXT742"}), token=user_token),
                         lambda r: r.status == 200 and r.json().get("total") == 1, timeout=90).json()
     check(office["items"][0]["extension"] == "docx", "Office full text extraction failed")
+    for marker in ('POWERPOINTONLY742','ODTONLY742','ODPONLY742'):
+        eventually("presentation/document content extraction", lambda: http(query_path("/api/documents", {"q":marker,"scope":"content"}), token=user_token),
+                   lambda r: r.status == 200 and r.json().get("total") == 1, timeout=90)
+    for marker in ('TEXTONLY742','SPREADSHEETONLY742'):
+        for scope in ('all','content'):
+            check(http(query_path("/api/documents", {"q":marker,"scope":scope}), token=user_token).json()["total"] == 0, "excluded file content is searchable")
+    for filename in ('index-excluded.txt','index-excluded.xlsx','index-excluded.ods','forecast.csv','readme.txt'):
+        result=http(query_path("/api/documents", {"q":filename,"scope":"name"}), token=user_token).json()
+        check(result["total"] == 1 and result["items"][0]["snippet"] == '', "excluded file cannot be found by name or exposes text")
     # Guessing an indexed ID is insufficient to get another user's content.
-    hidden_id = engine_run("exec", FILES_CONTAINER, "python3", "-c", "import sqlite3; c=sqlite3.connect('/state/documents/search.db'); print(c.execute(\"SELECT id FROM documents WHERE source_id='private:bob' AND name='readme.txt'\").fetchone()[0])").stdout.strip()
+    hidden_id = engine_run("exec", FILES_CONTAINER, "python3", "-c", "import sqlite3; c=sqlite3.connect('/state/documents/search.db'); print(c.execute(\"SELECT id FROM documents WHERE source_id='private:bob' AND name='readme.docx'\").fetchone()[0])").stdout.strip()
     for suffix in ("", "/preview", "/download", "/content"):
         check(http("/api/documents/"+hidden_id+suffix, token=user_token).status == 404, "guessed private document ID exposes data")
     if os.getenv("PLAYWRIGHT_MODULE"):
@@ -366,7 +375,7 @@ def main() -> int:
     http(control_path, method="POST", value={"action":"resume"}, token=token)
     eventually("paused scan completes after resume", lambda: http("/api/documents/"+queued_scan["id"], token=user_token),
                lambda r: r.status == 200 and r.json()["state"] == "ready" and "SCANNEDUNIQUE742" in r.json()["text"], timeout=90)
-    eventually("paused filename and content become searchable", lambda: http(query_path("/api/documents", {"q":"PAUSED_QUEUE742"}), token=user_token),
+    eventually("paused filename becomes searchable", lambda: http(query_path("/api/documents", {"q":"paused-note.txt","scope":"name"}), token=user_token),
                lambda r: r.status == 200 and r.json()["total"] == 1, timeout=45)
 
     announce("legacy GUID-path migration preserves file hashes and inodes")
@@ -872,8 +881,8 @@ fi
     rules(2)
     allowed("cd Permissions; put /tmp/live-note.txt created.txt")
     allowed("cd Permissions; put /tmp/live-note.txt existing.txt")
-    engine_run("exec", CLIENT_CONTAINER, "sh", "-c", "printf 'LIVE_CONTENT742 from SMB\n' > /tmp/live-search.txt")
-    allowed("cd Permissions; put /tmp/live-search.txt live-search.txt")
+    engine_run("exec", CLIENT_CONTAINER, "python3", "-c", "import zipfile; z=zipfile.ZipFile('/tmp/live-search.docx','w'); z.writestr('word/document.xml','<document><body><p><t>LIVE_CONTENT742 from SMB</t></p></body></document>'); z.close()")
+    allowed("cd Permissions; put /tmp/live-search.docx live-search.docx")
     live_row = eventually("SMB write becomes full-text searchable", lambda: http(query_path("/api/documents", {"q":"LIVE_CONTENT742"}), token=user_token),
                           lambda r: r.status == 200 and r.json().get("total") == 1, timeout=45).json()["items"][0]
 

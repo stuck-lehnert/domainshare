@@ -50,6 +50,16 @@ font=next(Path('/usr/share/fonts').rglob('NimbusSans-Regular.otf'))
 draw=ImageDraw.Draw(image)
 draw.text((120,200),'INVOICE SCAN\nCustomer reference SCANNEDUNIQUE742\nInvoice total 1500 EUR\nPayment due 30 October 2026',fill='black',font=ImageFont.truetype(str(font),44),spacing=40)
 image.save(root/'scanned-invoice.pdf','PDF',resolution=150)
+(root/'index-excluded.txt').write_text('TEXTONLY742 should never be content-indexed')
+for suffix,entry in [('xlsx','xl/sharedStrings.xml'),('ods','content.xml')]:
+    with zipfile.ZipFile(root/('index-excluded.'+suffix),'w') as spreadsheet:
+        spreadsheet.writestr(entry,'<document><t>SPREADSHEETONLY742</t></document>')
+for name,marker in [('alice','ALICEPRIVATE742'),('bob','BOBPRIVATE742')]:
+    with zipfile.ZipFile(Path('/data/private')/name/'readme.docx','w') as private:
+        private.writestr('word/document.xml','<document><body><p><t>'+marker+'</t></p></body></document>')
+for suffix,entry,marker in [('pptx','ppt/slides/slide1.xml','POWERPOINTONLY742'),('odt','content.xml','ODTONLY742'),('odp','content.xml','ODPONLY742')]:
+    with zipfile.ZipFile(root/('office-notes.'+suffix),'w') as office:
+        office.writestr(entry,'<document><body><p><t>'+marker+'</t></p></body></document>')
 with zipfile.ZipFile(root/'office-notes.docx','w') as office:
     office.writestr('word/document.xml','<document><body><p><t>Office document OFFICETEXT742</t></p></body></document>')
 PYDOCUMENTS

@@ -14,8 +14,8 @@ const sources=[{id:'data:finance',label:'Finanzen',kind:'data'},{id:'data:projec
 const fixtures=[
  ['Rechnung Oktober 2026.pdf','pdf','data:finance','Rechnung für Büroausstattung\nReferenz FINANZ742\nGesamtbetrag 1.500,00 EUR',true],
  ['Projektplan für die Einführung des neuen Dokumentenportals und die Schulung aller Mitarbeiter.docx','docx','data:projects','Projektplan mit Schulung und Zeitplan. Start im Oktober.',false],
- ['Meine Notizen.txt','txt','private:alice','Meine persönlichen Notizen. Termin zur Budgetplanung am Mittwoch.',false],
- ['Umsatzübersicht.csv','csv','data:finance','Quartal,Umsatz\nQ1,120000\nQ2,135000',false],
+ ['Meine Notizen.txt','txt','private:alice','',false],
+ ['Umsatzübersicht.csv','csv','data:finance','',false],
  ['Gescanntes Protokoll.pdf','pdf','data:projects','',true]
 ].map(([name,extension,sourceId,text,hasPreview],index)=>({id:(index+1).toString(16).padStart(32,'0'),name,extension,sourceId,text,path:'Dokumente/'+name,source:sources.find(source=>source.id===sourceId).label,kind:sources.find(source=>source.id===sourceId).kind,size:143360+index*1024,modified:1791023400-index*86400,state:index===4?'ocr':'ready',pages:extension==='pdf'?3:0,hasPreview,version:'aaaaaaaaaaaaaaaa',snippet:text}));
 // A small native three-page PDF exercises the real viewer, including its find bar.

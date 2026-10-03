@@ -306,9 +306,9 @@ def process_next(conn, prefer_ocr=False, stop=None):
     phase = 'ocr' if row['state'] == 'ocr' else 'text'
     source_label = source['label'] + (' / ' + source['id'][8:] if source['kind'] == 'private' else '')
     worker_state(conn, phase, row['id'])
-    supported = {'.pdf'} | documents.TEXT_SUFFIXES | documents.OFFICE_SUFFIXES | documents.IMAGE_SUFFIXES
+    supported = documents.CONTENT_SUFFIXES | documents.IMAGE_SUFFIXES
     if row['extension'] not in supported or row['size'] > setting('DOCUMENT_MAX_FILE_MB', 512, 1, 4096) * 1024 * 1024:
-        conn.execute("UPDATE documents SET state='name-only',indexed_at=? WHERE id=? AND fingerprint=?", (time.time(), row['id'], row['fingerprint']))
+        conn.execute("UPDATE documents SET body='',state='name-only',pages=0,attempts=0,retry_at=0,indexed_at=? WHERE id=? AND fingerprint=?", (time.time(), row['id'], row['fingerprint']))
         conn.commit()
         worker_state(conn, 'idle')
         return True
@@ -320,10 +320,11 @@ def process_next(conn, prefer_ocr=False, stop=None):
             documents.discover_file(conn, source, row['path'])
             documents.worker_event(conn, 'changed', row['path'], source_label)
         else:
-            state = 'ocr' if result.get('needsOcr') else 'ready'
+            content = row['extension'] in documents.CONTENT_SUFFIXES
+            state = ('ocr' if row['extension'] == '.pdf' and result.get('needsOcr') else 'ready') if content else 'name-only'
             conn.execute('''UPDATE documents SET body=?,state=?,pages=?,preview=CASE WHEN ?='' THEN preview ELSE ? END,
                             indexed_at=?,attempts=0,retry_at=0 WHERE id=? AND fingerprint=?''',
-                         (str(result.get('body', ''))[:documents.MAX_TEXT], state, result.get('pages', 0),
+                         (str(result.get('body', ''))[:documents.MAX_TEXT] if content else '', state, result.get('pages', 0),
                           result.get('preview', ''), result.get('preview', ''), time.time(), row['id'], row['fingerprint']))
             documents.worker_event(conn, 'queued-ocr' if state == 'ocr' else 'complete', row['path'], source_label)
             conn.execute('UPDATE document_worker SET processed=processed+1 WHERE id=1')

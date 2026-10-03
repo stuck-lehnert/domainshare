@@ -14,18 +14,18 @@ try:
     from . import access_control, reconcile_shares as directory
     from .account_policy import account_name, is_excluded_user
     from .state_db import connect_state_db
+    from .document_types import CONTENT_SUFFIXES, OFFICE_SUFFIXES, IMAGE_SUFFIXES
 except ImportError:
     import access_control
     import reconcile_shares as directory
     from account_policy import account_name, is_excluded_user
     from state_db import connect_state_db
+    from document_types import CONTENT_SUFFIXES, OFFICE_SUFFIXES, IMAGE_SUFFIXES
 
 SEARCH_ROOT = os.getenv('DOCUMENT_STATE_ROOT', os.path.join(os.getenv('STATE_ROOT', '/state'), 'documents'))
 SEARCH_DB = os.path.join(SEARCH_ROOT, 'search.db')
 MAX_TEXT = 2 * 1024 * 1024
-TEXT_SUFFIXES = {'.txt', '.md', '.csv', '.tsv', '.json', '.xml', '.html', '.htm', '.log', '.ini', '.yaml', '.yml'}
-OFFICE_SUFFIXES = {'.docx', '.xlsx', '.pptx', '.odt', '.ods', '.odp'}
-IMAGE_SUFFIXES = {'.jpg', '.jpeg', '.png', '.tif', '.tiff', '.webp', '.bmp'}
+
 
 
 def connect():
@@ -80,6 +80,20 @@ def ensure_schema(conn):
             INSERT INTO document_fts(rowid,name,path,body) VALUES(new.rowid,new.name,new.path,new.body);
         END;
     ''')
+
+    # Upgrade the derived index only: keep catalog IDs, permissions, previews
+    # and originals, but remove content and jobs for excluded file types.
+    if conn.execute('PRAGMA user_version').fetchone()[0] < 1:
+        with conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if conn.execute('PRAGMA user_version').fetchone()[0] < 1:
+                content = sorted(CONTENT_SUFFIXES)
+                images = sorted(IMAGE_SUFFIXES)
+                conn.execute(f"""UPDATE documents SET body='',pages=0,attempts=0,retry_at=0,
+                                state=CASE WHEN extension IN ({','.join('?' for _ in images)}) AND preview=''
+                                           THEN 'pending' ELSE 'name-only' END
+                                WHERE extension NOT IN ({','.join('?' for _ in content)})""", [*images,*content])
+                conn.execute('PRAGMA user_version=1')
 
 
 def worker_paused(conn):
@@ -241,13 +255,15 @@ def discover_file(conn, source, relative, seen=0):
             conn.execute('UPDATE documents SET seen=? WHERE source_id=? AND path=?', (seen, source['id'], relative))
         return
     name = relative.rsplit('/', 1)[-1]
-    conn.execute('''INSERT INTO documents(id,source_id,path,name,extension,size,modified,fingerprint,seen)
-                    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source_id,path) DO UPDATE SET
+    extension = os.path.splitext(name)[1].lower()
+    state = 'pending' if extension in CONTENT_SUFFIXES | IMAGE_SUFFIXES else 'name-only'
+    conn.execute('''INSERT INTO documents(id,source_id,path,name,extension,size,modified,fingerprint,seen,state)
+                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_id,path) DO UPDATE SET
                     name=excluded.name,extension=excluded.extension,size=excluded.size,
                     modified=excluded.modified,fingerprint=excluded.fingerprint,seen=excluded.seen,
-                    body='',state='pending',preview='',pages=0,attempts=0,retry_at=0,indexed_at=0''',
-                 (uuid.uuid4().hex, source['id'], relative, name, os.path.splitext(name)[1].lower(),
-                  info.st_size, info.st_mtime, stamp, seen))
+                    body='',state=excluded.state,preview='',pages=0,attempts=0,retry_at=0,indexed_at=0''',
+                 (uuid.uuid4().hex, source['id'], relative, name, extension,
+                  info.st_size, info.st_mtime, stamp, seen, state))
 
 
 def walk_source(conn, source, watch=None, should_stop=None):
@@ -385,7 +401,8 @@ def search(conn, identity, params):
     conditions = [f'd.source_id IN ({placeholders})', private_condition]
     values = ids[:]
     from_sql = 'documents d'
-    snippet_sql = "substr(d.body,1,220)"
+    content_types = ','.join("'" + extension + "'" for extension in sorted(CONTENT_SUFFIXES))
+    snippet_sql = f"CASE WHEN d.extension IN ({content_types}) THEN substr(d.body,1,220) ELSE '' END"
     if query:
         if scope == 'name':
             conditions.append("d.name LIKE ? ESCAPE '\\'")
@@ -400,7 +417,14 @@ def search(conn, identity, params):
             from_sql += ' JOIN document_fts ON document_fts.rowid=d.rowid'
             conditions.append('document_fts MATCH ?')
             values.append(match)
-            snippet_sql = "snippet(document_fts,2,char(1),char(2),' … ',32)"
+            if scope == 'content':
+                conditions.append(f'd.extension IN ({content_types})')
+            else:
+                # A stale body from an older worker must never make other file
+                # types appear in content search, even before index cleanup.
+                conditions.append(f"(d.extension IN ({content_types}) OR d.rowid IN (SELECT rowid FROM document_fts WHERE document_fts MATCH ?))")
+                values.append('{name path} : (' + ' AND '.join('"' + word + '"*' for word in words) + ')')
+            snippet_sql = f"CASE WHEN d.extension IN ({content_types}) THEN snippet(document_fts,2,char(1),char(2),' … ',32) ELSE '' END"
     if extension:
         conditions.append('d.extension=?')
         values.append('.' + extension)
@@ -429,7 +453,7 @@ def search(conn, identity, params):
 def detail(conn, identity, document_id):
     row, source = current_document(conn, document_id, identity)
     result = public_document(row, source)
-    result['text'] = row['body']
+    result['text'] = row['body'] if row['extension'] in CONTENT_SUFFIXES else ''
     return result
 
 
