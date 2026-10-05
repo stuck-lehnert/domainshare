@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Isolated search benchmark; never opens production state or document roots.
+
+Usage: python3 scripts/benchmark-document-search --rows 2000000
+Original-file checks use one tiny fixture; catalog/FTS/index SQL is real.
+"""
+import argparse
+import contextlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+import statistics
+import sys
+import tempfile
+import time
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app import documents, document_search
+from app.state_db import connect_state_db
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--rows', type=int, default=200000)
+parser.add_argument('--database', help='Create/reuse a benchmark DB at this new, disposable path')
+parser.add_argument('--repeat', type=int, default=3)
+parser.add_argument('--query-only', action='store_true', help='Read an existing benchmark without migration or writes')
+args = parser.parse_args()
+if args.rows < 1000 or args.repeat < 1:
+    parser.error('Use at least 1000 rows and one repetition')
+if args.query_only and not args.database:
+    parser.error('--query-only requires --database')
+
+with tempfile.TemporaryDirectory(prefix='adfs-search-benchmark-') as temporary:
+    root = Path(temporary)
+    filename = Path(args.database + '.fixture.pdf') if args.database else root / 'fixture.pdf'
+    if not filename.exists() and not args.query_only:
+        filename.write_bytes(b'%PDF-1.7\nbenchmark fixture\n')
+    stamp = documents.fingerprint(filename.stat())
+    path = args.database or str(root / 'search.db')
+    if args.query_only:
+        if not Path(path).is_file():
+            raise SystemExit('Query-only mode requires an existing database file')
+        if os.path.exists(path + '-wal') and os.path.getsize(path + '-wal'):
+            raise SystemExit('Checkpoint the offline benchmark before query-only mode')
+        conn = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro&immutable=1', uri=True)
+        conn.row_factory = sqlite3.Row
+    else:
+        conn = connect_state_db(path)
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+    if tables:
+        if 'document_sources' not in tables or {row[0] for row in conn.execute('SELECT id FROM document_sources')} != {f'data:benchmark-{i:02}' for i in range(20)}:
+            raise SystemExit('Refusing to open a database not created by this benchmark')
+    document_search.register(conn)
+    if not args.query_only:
+        documents.ensure_schema(conn)
+        document_search.global_indexes(conn, documents.SEARCHABLE_NAME_SQL.format(name='name'))
+        conn.commit()
+    sources = {f'data:benchmark-{i:02}': {'id': f'data:benchmark-{i:02}', 'kind': 'data',
+               'label': f'Folder {i}', 'root': str(root), 'owner_sid': ''} for i in range(20)}
+    count = conn.execute('SELECT count(*) FROM documents').fetchone()[0]
+    if count not in (0, args.rows):
+        raise SystemExit('Existing benchmark catalog has a different size')
+    if args.query_only:
+        if count != args.rows:
+            raise SystemExit('Query-only mode requires the completed benchmark catalog')
+        stamp = conn.execute('SELECT fingerprint FROM documents LIMIT 1').fetchone()[0]
+    elif count and conn.execute('SELECT fingerprint FROM documents LIMIT 1').fetchone()[0] != stamp:
+        # Refresh only the disposable fixture fingerprint on benchmarks made
+        # by older versions of this script, which used an ephemeral file.
+        conn.execute('UPDATE documents SET fingerprint=? WHERE fingerprint<>?', (stamp, stamp))
+        conn.commit()
+    if not count:
+        conn.executemany('INSERT INTO document_sources VALUES(:id,:kind,:label,:root,:owner_sid)', sources.values())
+        conn.commit()
+        started = time.perf_counter()
+        for start in range(0, args.rows, 10000):
+            rows = []
+            for number in range(start, min(args.rows, start + 10000)):
+                extension = ('.pdf', '.docx', '.pptx', '.png', '.bin')[(number // 20) % 5]
+                name = f'Invoice_{number:09}_customer{number % 113:03}' + extension
+                body = 'Invoice contract customer project financial report native indexed document. ' * 3
+                if number >= args.rows - 2000:
+                    body += ' LATEONLY742'
+                if number % 1000 == 0:
+                    body += ' SPARSE742'
+                rows.append((f'{number + 1:032x}', f'data:benchmark-{number % 20:02}', name, name,
+                             extension, 10000, float(number), stamp, body, 'pending' if number % 17 == 0 else 'ready'))
+            conn.executemany('''INSERT INTO documents(id,source_id,path,name,extension,size,modified,fingerprint,body,state)
+                                VALUES(?,?,?,?,?,?,?,?,?,?)''', rows)
+            conn.commit()
+            if (start + 10000) % 100000 == 0:
+                print(f'Catalog: {start + 10000:,} / {args.rows:,} ({time.perf_counter() - started:.1f}s)', flush=True)
+        conn.execute('ANALYZE')
+        conn.execute("INSERT INTO document_fts(document_fts) VALUES('optimize')")
+        conn.execute("INSERT INTO document_names_fts(document_names_fts) VALUES('optimize')")
+        conn.commit()
+        print(f'Build finished: {time.perf_counter() - started:.1f}s', flush=True)
+    results = []
+    @contextlib.contextmanager
+    def open_fixture(*unused):
+        with filename.open('rb') as handle:
+            yield handle, os.fstat(handle.fileno())
+
+    cases = []
+    for sort in ('recent', 'oldest', 'name', 'relevance'):
+        for label, query, scope in (('browse', '', 'all'), ('common', 'invoice', 'all'),
+                                     ('content', 'contract', 'content'), ('substring', '0001', 'name'),
+                                     ('one-letter', 'o', 'name'), ('absent', 'XYZZY742', 'name'),
+                                     ('late', 'LATEONLY742', 'content'), ('sparse', 'SPARSE742', 'content')):
+            for filtered in (False, True):
+                params = {'q': [query], 'scope': [scope], 'sort': [sort]}
+                if filtered:
+                    params.update(source=['data:benchmark-00'], type=['pdf'])
+                cases.append((f'{label}/{sort}/' + ('folder+type' if filtered else 'all'), params))
+    with mock.patch.object(documents, 'allowed_sources', return_value=sources), mock.patch.object(documents, 'open_file', open_fixture), \
+         mock.patch.object(documents, 'fingerprint', return_value=stamp):
+        for label, params in cases:
+            times = []
+            for iteration in range(args.repeat):
+                started = time.perf_counter()
+                result = documents.search(conn, {}, params)
+                times.append((time.perf_counter() - started) * 1000)
+                if label.startswith('absent/'):
+                    assert not result['items'] and result['total'] == 0
+                else:
+                    assert result['items'], label
+                if params.get('source'):
+                    assert all(item['sourceId'] == params['source'][0] and item['extension'] == 'pdf' for item in result['items'])
+            record = {'case': label, 'medianMs': round(statistics.median(times), 2),
+                      'maxMs': round(max(times), 2), 'returned': len(result['items']), 'totalExact': result['totalExact']}
+            results.append(record)
+            print(json.dumps(record), flush=True)
+        # Seek near the end directly. No OFFSET walk through preceding pages.
+        signature = document_search.cursor_scope('', 'all', '', '', 'oldest')
+        params = {'sort': ['oldest'], 'cursor': [document_search.encode_cursor(signature,
+                  [float(args.rows - 1000), args.rows - 999, f'{args.rows - 999:032x}'], args.rows - 999)]}
+        started = time.perf_counter()
+        result = documents.search(conn, {}, params)
+        assert len(result['items']) == 40
+        deep_ms = (time.perf_counter() - started) * 1000
+        print(json.dumps({'case': 'deep-cursor', 'elapsedMs': round(deep_ms, 2), 'returned': len(result['items'])}), flush=True)
+        # Relevance uses FTS5's ranked stream rather than a score seek. Verify
+        # its cost near the end as well, including the skipped ranked rows.
+        signature = document_search.cursor_scope('invoice', 'all', '', '', 'relevance')
+        params = {'q': ['invoice'], 'sort': ['relevance'], 'cursor': [document_search.encode_cursor(signature,
+                  [0, 1, f'{1:032x}', args.rows - 1000], args.rows - 1000)]}
+        started = time.perf_counter()
+        result = documents.search(conn, {}, params)
+        assert len(result['items']) == 40
+        deep_rank_ms = (time.perf_counter() - started) * 1000
+        print(json.dumps({'case': 'deep-relevance-cursor', 'elapsedMs': round(deep_rank_ms, 2),
+                          'returned': len(result['items'])}), flush=True)
+    print(json.dumps({'rows': args.rows, 'cases': len(cases), 'medianMs': round(statistics.median(r['medianMs'] for r in results), 2),
+                      'worstMs': max(deep_ms, deep_rank_ms, *(r['maxMs'] for r in results)),
+                      'databaseBytes': os.path.getsize(path)}), flush=True)
+    conn.close()

@@ -77,6 +77,10 @@ The catalog includes active Data folders and each user's own Private folder. Eve
 
 Linux filesystem events update the filename catalog as files change, with periodic scans recovering missed events. Text extraction and OCR run through a persistent background queue; files become searchable by filename before content extraction finishes. Search updates while typing, and open views refresh every two seconds to show completed extraction. Full-text queries match word prefixes and ignore accents; filename-only queries also match substrings.
 
+Search stays in SQLite. FTS5 indexes text together with folder and file-type tokens; a compact character index also covers filename substrings and one- or two-character searches. Composite B-tree indexes cover folder/type filters and the UI's name, newest-first and oldest-first sorting. Pagination uses filter-bound cursors. Name and date sorting seek into their B-tree indexes; relevance uses FTS5's native ordered stream so ongoing OCR updates cannot invalidate a saved score threshold. Counts, file-type options and queue progress use incrementally maintained summaries. Broad text searches show a lower bound rather than delay results for an exact count. Large Private folders use bounded, current permission checks for facets and page candidates; their totals may also be lower bounds. Original files are checked before an item is returned, and current permissions are checked again for previews and downloads.
+
+The first start after this upgrade rebuilds the derived search indexes and summaries once. It preserves document IDs, previews, OCR jobs, pause state, permissions and original files. `python3 scripts/benchmark-document-search --rows 2000000` creates an isolated synthetic catalog and measures 64 combinations of search scope, sorting and folder/type filters plus deep cursor pages for metadata and relevance ordering. It uses a small original-file fixture rather than creating two million physical files. `--database /tmp/adfs-search-benchmark.db` retains that disposable catalog for repeat runs.
+
 Content search indexes only PDFs, Word documents (`docx`, `odt`) and PowerPoint presentations (`pptx`, `odp`). All file types remain searchable by filename, including text, Markdown, spreadsheets and images. Existing extracted content from excluded types is removed from the derived search index on upgrade; original files and filename entries remain intact. PDFs and common images receive a first-page/image thumbnail. PDFs open in a fullscreen dialog with the locally bundled Mozilla PDF.js viewer, including page navigation, zoom, thumbnails and search within native PDF text. PDF loading and byte-range requests check current folder access. Legacy binary Office formats (`doc`, `ppt`) remain searchable by filename. Extracted text is limited to 2 MiB per file; encrypted, damaged, or oversized documents may have no searchable content.
 
 Only PDF pages that themselves contain raster images and little extracted text are queued for local OCR using Poppler and Tesseract, with German and English enabled by default. Search OCR renders those pages at 300 DPI, capped at 3500 pixels on the longest side, instead of inheriting high DPI from embedded logos or rebuilding an OCR PDF. Each render and recognition step has a 30-second timeout. Photos can still require a recognition attempt to establish whether they contain text; text-free pages finish without adding search content. Native text remains searchable while OCR is pending. OCR text is used for search. No file type displays a separate extracted document-text panel in its dialog. The PDF viewer displays the original PDF. Downloads always return the original file. No OCR replacement or separate OCR PDF is published. Failed jobs retry with backoff, and pending work survives restarts.
@@ -372,7 +376,7 @@ Domain Admins can use **Papierkorb** in the web console to filter and list retai
 
 ## Web Administration Console
 
-Open `https://<WEB_HOSTNAME>/` after setup. Only members of the group identified by `DOMAIN_ADMINS_SID` can sign in. The form accepts `DOMAIN\username`, `username@realm`, or an unqualified username (which is qualified with `WORKGROUP`).
+Open `https://<WEB_HOSTNAME>/` after setup to search files. Domain Admins can open the administration console at `/admin/`; its APIs require membership in the group identified by `DOMAIN_ADMINS_SID`. The form accepts `DOMAIN\username`, `username@realm`, or an unqualified username (which is qualified with `WORKGROUP`).
 
 The console is intentionally operational and plain:
 
@@ -389,15 +393,17 @@ The console is intentionally operational and plain:
 
 The PDF report deliberately excludes the activity log and backup log. Its dedicated snapshot endpoint removes those fields before returning data. Typst, its WebAssembly compiler, and the report fonts are shipped with the application; Typst source and PDF bytes are created only in the authenticated browser and are never uploaded to another service. The first export downloads roughly 22 MiB of compiler/font assets, which are then cached as immutable files. The CSP grants only `'wasm-unsafe-eval'` for WebAssembly compilation and does not enable JavaScript `'unsafe-eval'`.
 
-The mutation endpoints manage Data access (`POST /api/access`), restore retained files, or start an immediate backup/share reconciliation; all require the same Domain Admin JWT as every protected page. Restore cannot overwrite a live file. Backup schedules, retention, and `BACKUP_AUTO_ENABLED` are configured through the environment. Automatic backups can be enabled or disabled only through the environment and therefore require a redeployment/restart.
+The mutation endpoints under `/admin/api/` manage Data access, restore retained files, control indexing, or start an immediate backup/share reconciliation. They require an active Domain Admin session and CSRF protection. Restore cannot overwrite a live file. Backup schedules, retention, and `BACKUP_AUTO_ENABLED` are configured through the environment. Automatic backups can be enabled or disabled only through the environment and therefore require a redeployment/restart.
 
 ### Authentication and sessions
 
 - Credentials are submitted only over HTTPS. The password is passed to `kinit` through stdin, is never placed in a process argument, and the temporary Kerberos credential cache is immediately removed.
-- After Kerberos succeeds, the service resolves the account SID and its complete group SID set through winbind. Login succeeds only when that set contains `DOMAIN_ADMINS_SID`.
+- After Kerberos succeeds, the service resolves the account SID, Unix UID and complete group SID set through winbind. Human AD users can sign in; only members of `DOMAIN_ADMINS_SID` receive administration access. Sessions recheck that identity through winbind on their first request after `WEB_AUTH_RECHECK_SECONDS` (default 60 seconds). Directory failures deny data and administration requests; directory caching can delay visibility of an AD change.
 - Authentication is form-based; the browser never performs NTLM, SPNEGO, or Kerberos negotiation.
-- JWTs use HMAC-SHA256, default to eight hours, and are accepted from the protected cookie or an `Authorization: Bearer` header.
-- Login attempts are rate-limited per client address.
+- JWTs use HMAC-SHA256, default to eight hours, and are accepted from the protected cookie or an `Authorization: Bearer` header. An active session entry in SQLite is also required. Logout removes that entry immediately, including for bearer-token reuse, and revocation survives restarts. Logout also works during directory outages. Existing sessions issued before this upgrade require a new login.
+- Every POST requires `application/json`. Browser requests must originate from the exact configured HTTPS origin, derived from `WEB_HOSTNAME` and the external `WEB_HTTPS_PORT` (default 443), or explicitly listed in `WEB_TRUSTED_ORIGINS`. The service ignores Host and forwarded headers when determining trusted origins. Authenticated changes and logout require the session's `csrfToken` from login or `GET /api/session` in `X-CSRF-Token`. Login requires `X-CSRF-Token: login`; origin-less API clients must use an explicit bearer token and the session's CSRF token for authenticated changes. No cross-origin CORS access is granted.
+- Login attempts are reserved atomically before authentication, with separate five-minute limits for client address and target account across client addresses. Successful logins consume a reservation and do not reset either limit. Case variations and the supported domain-qualified spellings of an account share a budget.
+- TLS handshakes run in bounded connection workers, outside the accept loop, with a five-second timeout. Request I/O also has a timeout.
 - Responses set HSTS, a restrictive Content Security Policy, clickjacking protection, and MIME sniffing protection. APIs and ordinary UI assets use no-store caching; pinned Typst compiler/font assets use immutable long-term caching.
 
 ### TLS with an internal ACME CA
@@ -467,7 +473,13 @@ Useful optional settings:
 | `WEB_TLS_AUTORENEW` | `true` | Renew managed certificates automatically |
 | `ACME_RENEW_CHECK_SECONDS` | `900` | Interval for ACME renewal checks; minimum 60 seconds |
 | `WEB_JWT_TTL_SECONDS` | `28800` | Session lifetime, 5 minutes to 7 days |
-| `WEB_LOGIN_ATTEMPTS_PER_5_MIN` | `10` | Per-address login attempt limit |
+| `WEB_AUTH_RECHECK_SECONDS` | `60` | Session identity/role recheck interval via winbind, 5 to 300 seconds |
+| `WEB_TRUSTED_ORIGINS` | derived | Comma-separated exact HTTPS origins; default uses `WEB_HOSTNAME` and `WEB_HTTPS_PORT` |
+| `WEB_LOGIN_ATTEMPTS_PER_5_MIN` | `10` | Per-address login attempt limit, including successful attempts |
+| `WEB_LOGIN_ACCOUNT_ATTEMPTS_PER_5_MIN` | `10` | Per-target-account login attempt limit across client addresses |
+| `WEB_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `5` | TLS handshake deadline, 1 to 30 seconds |
+| `WEB_REQUEST_TIMEOUT_SECONDS` | `30` | Request I/O timeout, 1 to 300 seconds |
+| `WEB_MAX_CONNECTIONS` | `64` | Concurrent connection workers, 4 to 512; excess connections are closed |
 | `WEB_USAGE_SCAN_INTERVAL_SECONDS` | `900` | Recursive storage scan interval |
 | `WEB_DIRECTORY_CACHE_SECONDS` | `300` | AD membership tree cache time |
 | `TRASH_RETENTION_DAYS` | `7` | Recycled-file lifetime; cleanup accepts 1 to 365 days |

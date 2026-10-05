@@ -45,8 +45,10 @@ COPY app/audit_store.py /app/audit_store.py
 COPY app/audit_collector.py /app/audit_collector.py
 COPY app/trash.py /app/trash.py
 COPY app/web_ui.py /app/web_ui.py
+COPY app/web_security.py /app/web_security.py
 COPY app/document_types.py /app/document_types.py
 COPY app/documents.py /app/documents.py
+COPY app/document_search.py /app/document_search.py
 COPY app/document_index.py /app/document_index.py
 COPY app/extract_document.py /app/extract_document.py
 COPY app/web /app/web

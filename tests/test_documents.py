@@ -100,7 +100,7 @@ class DocumentTests(DocumentFixture):
         self.assertEqual(self.find({'q':['fore'],'scope':['name']})['total'],1)
         result = self.find({'q':['Umsatz Munchen'],'scope':['content']})
         self.assertEqual(result['total'],1)
-        self.assertIn('\x01',result['items'][0]['snippet'])
+        self.assertEqual(result['items'][0]['snippet'],'')
         self.assertEqual(self.find({'q':['forecast'],'scope':['content']})['total'],1)
         for query in ('"', '*', ':', '" OR NOT ()', 'x\x00y'):
             self.find({'q':[query]})
@@ -199,7 +199,7 @@ class DocumentTests(DocumentFixture):
             self.assertEqual(path.read_bytes(),original)
             self.assertEqual(path.stat().st_ino,inode)
         documents.ensure_schema(self.conn)
-        self.assertEqual(self.conn.execute('PRAGMA user_version').fetchone()[0],2)
+        self.assertEqual(self.conn.execute('PRAGMA user_version').fetchone()[0],3)
 
     def test_only_document_types_are_queued_for_content_and_all_types_keep_filename_search(self):
         for extension in ('.pdf','.docx','.pptx','.odt','.odp','.txt','.md','.csv','.xlsx','.ods','.html','.json','.bin'):
@@ -481,6 +481,9 @@ class DocumentHttpTests(DocumentFixture):
         if identity:
             token,_ = self.tokens.issue(identity['sub'],identity['sid'],identity['role'],identity.get('uid'))
             headers['Authorization'] = 'Bearer '+token
+            headers['X-CSRF-Token'] = self.tokens.csrf(self.tokens.verify(token))
+        if path == '/api/login':
+            headers['X-CSRF-Token'] = 'login'
         if body is not None:
             body=json.dumps(body);headers['Content-Type']='application/json'
         conn=http.client.HTTPConnection(*self.server.server_address)

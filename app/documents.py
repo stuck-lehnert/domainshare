@@ -11,12 +11,13 @@ import time
 import uuid
 
 try:
-    from . import access_control, reconcile_shares as directory
+    from . import access_control, document_search, reconcile_shares as directory
     from .account_policy import account_name, is_excluded_user
     from .state_db import connect_state_db
     from .document_types import CONTENT_SUFFIXES, OFFICE_SUFFIXES, IMAGE_SUFFIXES
 except ImportError:
     import access_control
+    import document_search
     import reconcile_shares as directory
     from account_policy import account_name, is_excluded_user
     from state_db import connect_state_db
@@ -36,10 +37,15 @@ def is_excluded_filename(name):
 def connect():
     os.makedirs(SEARCH_ROOT, mode=0o700, exist_ok=True)
     os.chmod(SEARCH_ROOT, 0o700)
-    return connect_state_db(SEARCH_DB)
+    conn = connect_state_db(SEARCH_DB)
+    document_search.register(conn)
+    return conn
 
 
 def ensure_schema(conn):
+    document_search.register(conn)
+    if conn.execute('PRAGMA user_version').fetchone()[0] >= document_search.VERSION:
+        return
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS document_sources (
             id TEXT PRIMARY KEY, kind TEXT NOT NULL, label TEXT NOT NULL,
@@ -102,6 +108,9 @@ def ensure_schema(conn):
             if version < 2:
                 conn.execute(f"DELETE FROM documents WHERE NOT ({SEARCHABLE_NAME_SQL.format(name='name')})")
                 conn.execute('PRAGMA user_version=2')
+
+    content_types = ','.join("'" + suffix + "'" for suffix in sorted(CONTENT_SUFFIXES))
+    document_search.ensure_schema(conn, SEARCHABLE_NAME_SQL.format(name='name'), content_types)
 
 
 def worker_paused(conn):
@@ -382,82 +391,192 @@ def public_document(row, source, snippet=''):
 
 
 def search(conn, identity, params):
+    # Keep rollups, posting lists and page selection in one WAL snapshot.
+    # The caller's transaction, if any, remains under its own control.
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute('BEGIN')
+    try:
+        return search_snapshot(conn, identity, params)
+    finally:
+        if own_transaction:
+            conn.rollback()
+
+
+def search_snapshot(conn, identity, params):
     sources = allowed_sources(conn, identity)
     query = str(params.get('q', [''])[0]).strip()[:256]
     scope = params.get('scope', ['all'])[0]
     source_filter = params.get('source', [''])[0]
     extension = params.get('type', [''])[0].lower().lstrip('.')
     sort = params.get('sort', ['recent'])[0]
+    if sort not in {'name', 'oldest', 'recent', 'relevance'}:
+        sort = 'recent'
+    if sort == 'relevance' and (not query or scope == 'name'):
+        sort = 'recent'
     try:
         limit = min(100, max(1, int(params.get('limit', ['40'])[0])))
         offset = max(0, int(params.get('offset', ['0'])[0]))
+        if offset > 1000 and not params.get('cursor', [''])[0]:
+            raise ValueError()
     except ValueError as exc:
-        raise ValueError('Ungültige Seitennummer') from exc
+        raise ValueError('Für weitere Seiten bitte den Seitenzeiger verwenden') from exc
+    signature = document_search.cursor_scope(query, scope, source_filter, extension, sort)
+    position, consumed = document_search.decode_cursor(params.get('cursor', [''])[0], signature)
+    if position:
+        offset = 0
     selected = {key: value for key, value in sources.items() if not source_filter or key == source_filter}
-    base = {'items': [], 'total': 0, 'hasMore': False, 'sources': [{'id': key, 'label': value['label'], 'kind': value['kind']} for key, value in sources.items()], 'types': [], 'pending': 0}
-    if not sources:
+    base = {'items': [], 'total': 0, 'totalExact': True, 'hasMore': False, 'nextCursor': None,
+            'sources': [{'id': key, 'label': value['label'], 'kind': value['kind']} for key, value in sources.items()],
+            'types': [], 'pending': 0, 'pendingExact': True, 'searchIncomplete': False}
+    if not selected:
         return base
-    # Filter before snippets, pagination, counts and facets. Hidden files
-    # must never influence any user-visible result.
-    ids = list(selected)
-    if not ids:
-        return base
-    placeholders = ','.join('?' for _ in ids)
-    conn.execute('CREATE TEMP TABLE IF NOT EXISTS readable_private(id TEXT PRIMARY KEY)')
-    conn.execute('DELETE FROM readable_private')
-    for row in conn.execute(f"SELECT id,source_id,path FROM documents WHERE source_id IN ({placeholders}) AND source_id LIKE 'private:%'", ids).fetchall():
-        if private_readable(selected[row['source_id']], row['path'], identity.get('uid')):
-            conn.execute('INSERT INTO readable_private VALUES(?)', (row['id'],))
-    private_condition = SEARCHABLE_NAME_SQL.format(name='d.name') + " AND (d.source_id NOT LIKE 'private:%' OR EXISTS (SELECT 1 FROM readable_private r WHERE r.id=d.id))"
-    conditions = [f'd.source_id IN ({placeholders})', private_condition]
-    values = ids[:]
-    from_sql = 'documents d'
-    content_types = ','.join("'" + extension + "'" for extension in sorted(CONTENT_SUFFIXES))
-    snippet_sql = f"CASE WHEN d.extension IN ({content_types}) THEN substr(d.body,1,220) ELSE '' END"
+    visible_sql = SEARCHABLE_NAME_SQL.format(name='d.name')
+    readable = {}
+
+    def permitted(row):
+        if selected[row['source_id']]['kind'] != 'private':
+            return True
+        if row['id'] not in readable:
+            readable[row['id']] = private_readable(selected[row['source_id']], row['path'], identity.get('uid'))
+        return readable[row['id']]
+
+    # Small, incrementally maintained rollups replace full scans for counts,
+    # progress and dropdowns. Private facets are only published after a current
+    # filesystem permission check. Large private folders get bounded samples;
+    # their exact total is deliberately not inferred from unverified records.
+    total = 0
+    selected_count = 0
+    metadata_exact = True
+    types = set()
+    for source_id, source in selected.items():
+        groups = conn.execute('SELECT extension,state,amount FROM document_counts WHERE source_id=?', (source_id,)).fetchall()
+        selected_count += sum(group['amount'] for group in groups)
+        if source['kind'] == 'data':
+            for group in groups:
+                if group['extension']:
+                    types.add(group['extension'].lstrip('.'))
+                if not extension or group['extension'] == '.' + extension:
+                    total += group['amount']
+                if group['state'] in {'pending', 'ocr'}:
+                    base['pending'] += group['amount']
+            continue
+        count = sum(group['amount'] for group in groups)
+        small = count <= document_search.PRIVATE_FACET_LIMIT
+        metadata_exact = metadata_exact and small
+        base['pendingExact'] = base['pendingExact'] and small
+        suffixes = sorted({group['extension'] for group in groups})
+        budget = document_search.PRIVATE_FACET_LIMIT
+        for number, suffix in enumerate(suffixes):
+            if not small and budget <= 0:
+                break
+            sample = count if small else max(1, budget // (len(suffixes) - number))
+            rows = conn.execute(f'''SELECT d.id,d.source_id,d.path,d.extension,d.state FROM documents d
+                INDEXED BY document_search_recent_type WHERE d.source_id=? AND d.extension=? AND {visible_sql}
+                ORDER BY d.modified DESC,d.id DESC LIMIT ?''', (source_id, suffix, sample)).fetchall()
+            budget -= len(rows)
+            for row in rows:
+                if permitted(row):
+                    if suffix:
+                        types.add(suffix.lstrip('.'))
+                    if not extension or suffix == '.' + extension:
+                        total += 1
+                    base['pending'] += int(row['state'] in {'pending', 'ocr'})
+
+    table, match = None, None
     if query:
         if scope == 'name':
-            conditions.append("d.name LIKE ? ESCAPE '\\'")
-            values.append('%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%')
+            table = 'document_names_fts'
+            normalized = query.casefold()
+            size = min(3, len(normalized))
+            match = ' AND '.join(document_search.key(normalized[i:i + size], 'g')
+                                 for i in range(len(normalized) - size + 1))
         else:
             words = re.findall(r'\w+', query, flags=re.UNICODE)[:24]
             if not words:
+                base['types'] = sorted(types)
                 return base
+            table = 'document_fts'
             match = ' AND '.join('"' + word + '"*' for word in words)
-            if scope == 'content':
-                match = 'body : (' + match + ')'
-            from_sql += ' JOIN document_fts ON document_fts.rowid=d.rowid'
-            conditions.append('document_fts MATCH ?')
-            values.append(match)
-            if scope == 'content':
-                conditions.append(f'd.extension IN ({content_types})')
-            else:
-                # A stale body from an older worker must never make other file
-                # types appear in content search, even before index cleanup.
-                conditions.append(f"(d.extension IN ({content_types}) OR d.rowid IN (SELECT rowid FROM document_fts WHERE document_fts MATCH ?))")
-                values.append('{name path} : (' + ' AND '.join('"' + word + '"*' for word in words) + ')')
-            snippet_sql = f"CASE WHEN d.extension IN ({content_types}) THEN snippet(document_fts,2,char(1),char(2),' … ',32) ELSE '' END"
-    if extension:
-        conditions.append('d.extension=?')
-        values.append('.' + extension)
-    where = ' AND '.join(conditions)
-    order = {'name': 'd.name COLLATE NOCASE', 'oldest': 'd.modified', 'recent': 'd.modified DESC'}.get(sort, 'd.modified DESC')
-    if query and scope != 'name' and sort == 'relevance':
-        order = 'bm25(document_fts,6,2,1)'
-    base['total'] = conn.execute(f'SELECT count(*) FROM {from_sql} WHERE {where}', values).fetchone()[0]
-    base['hasMore'] = offset + limit < base['total']
-    columns = 'd.id,d.source_id,d.path,d.name,d.extension,d.size,d.modified,d.fingerprint,d.state,d.preview,d.pages,d.attempts'
-    rows = conn.execute(f'SELECT {columns}, {snippet_sql} AS excerpt FROM {from_sql} WHERE {where} ORDER BY {order},d.id LIMIT ? OFFSET ?', [*values,limit,offset])
+            match = ('body' if scope == 'content' else '{name path body}') + ' : (' + match + ')'
+    candidates = []
+    complete = True
+    boundaries = []
+    combined = sort == 'relevance' or table and len(selected) > 1
+    selections = [list(selected)] if combined else list(selected)
+    catalog_count = conn.execute('SELECT coalesce(sum(amount),0) FROM document_counts').fetchone()[0] if combined else 0
+    push_sources = selected_count < catalog_count * 0.5
+    rank_offset = position[3] if position and len(position) == 4 else consumed
+    if sort == 'relevance' and max(consumed, rank_offset) > selected_count:
+        raise ValueError('Ungültiger Seitenzeiger')
+    for source_id in selections:
+        private = any(source['kind'] == 'private' for source in selected.values()) if combined else selected[source_id]['kind'] == 'private'
+        amount = limit + offset + (document_search.PRIVATE_FACET_LIMIT if private else 0) + 1
+        if sort == 'relevance':
+            rows, exhaustive = document_search.ranked_rows(conn, source_id, '.' + extension if extension else '',
+                                                          match, visible_sql, rank_offset, amount, selected_count != catalog_count)
+        elif combined:
+            rows, exhaustive = document_search.global_rows(conn, source_id, '.' + extension if extension else '', sort,
+                table, match, query if scope == 'name' else '', visible_sql, position, amount, push_sources)
+        else:
+            rows, exhaustive = document_search.source_rows(conn, source_id, '.' + extension if extension else '', sort,
+                table, match, query if scope == 'name' else '', visible_sql, position, amount)
+        candidates.extend(rows)
+        complete = complete and exhaustive
+        if not exhaustive and len(rows) >= amount:
+            boundaries.append(document_search.row_key(rows[-1], sort))
+    candidates.sort(key=lambda row: document_search.row_key(row, sort))
+    boundary = min(boundaries) if boundaries else None
     visible = []
-    for row in rows:
+    frontier = None
+    exhausted = True
+    for row in candidates:
+        if boundary is not None and document_search.row_key(row, sort) > boundary:
+            exhausted = False
+            break
+        frontier = row
+        if not permitted(row):
+            continue
         try:
             with open_file(selected[row['source_id']]['root'], row['path']) as (_, info):
-                if fingerprint(info) == row['fingerprint'] and private_readable(selected[row['source_id']], row['path'], identity.get('uid')):
-                    visible.append(row)
+                if fingerprint(info) != row['fingerprint']:
+                    continue
         except OSError:
             continue
-    base['items'] = [public_document(row, selected[row['source_id']], row['excerpt']) for row in visible]
-    base['types'] = sorted({row['extension'].lstrip('.') for row in conn.execute(f'SELECT DISTINCT extension FROM documents d WHERE source_id IN ({placeholders}) AND {private_condition}', ids) if row['extension']})
-    base['pending'] = conn.execute(f"SELECT count(*) FROM documents d WHERE source_id IN ({placeholders}) AND {private_condition} AND state IN ('pending','ocr')", ids).fetchone()[0]
+        visible.append(row)
+        if len(visible) > offset + limit:
+            exhausted = False
+            break
+    more = len(visible) > offset + limit
+    page = visible[offset:offset + limit]
+    incomplete = not more and boundary is not None and (not exhausted or frontier is not None and document_search.row_key(frontier, sort) >= boundary)
+    base['hasMore'] = more or incomplete
+    base['searchIncomplete'] = incomplete
+    if query:
+        if complete and not position:
+            total = sum(1 for row in candidates if permitted(row))
+            exact = True
+        elif not base['hasMore']:
+            total, exact = consumed + offset + len(page), True
+        else:
+            total, exact = consumed + offset + len(page) + int(more), False
+    else:
+        exact = metadata_exact
+        if not exact:
+            total = max(total, consumed + offset + len(page) + int(more))
+    base['total'], base['totalExact'] = total, exact
+    if base['hasMore'] and (page or frontier is not None):
+        last = page[-1] if more else frontier
+        base['nextCursor'] = document_search.encode_cursor(signature, document_search.row_position(last, sort),
+                                                          consumed + offset + len(page))
+    items = []
+    for row in page:
+        # The portal shows file metadata, never extracted text. Computing FTS
+        # snippets here repeats a potentially broad MATCH once per result.
+        items.append(public_document(row, selected[row['source_id']]))
+        if row['extension']:
+            types.add(row['extension'].lstrip('.'))
+    base['items'], base['types'] = items, sorted(types)
     return base
 
 

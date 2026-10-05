@@ -17,11 +17,12 @@ function icon(name) {
   };
   return `<svg class="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths[name]}</svg>`;
 }
-let session = null, offset = 0, listMode = false, timer, debounce, request, serial = 0, lastResult = "", activeDocument = null, initialFilters = null;
+let session = null, offset = 0, pageCursors = [""], listMode = false, timer, debounce, request, serial = 0, lastResult = "", activeDocument = null, initialFilters = null;
 const pageSize = 40;
+function resetPages() { offset = 0; pageCursors = [""]; serial++; request?.abort(); request = null; }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {...options,credentials:"same-origin",headers:{"Content-Type":"application/json",...(options.headers || {})}});
+  const response = await fetch(path, {...options,credentials:"same-origin",headers:{"Content-Type":"application/json","X-CSRF-Token":path === "/api/login" ? "login" : session?.csrfToken || "",...(options.headers || {})}});
   let body = {};
   try { body = await response.json(); } catch (_) { /* Empty response. */ }
   if (response.status === 401) { showLogin(); throw new Error("Bitte erneut anmelden."); }
@@ -47,7 +48,7 @@ function showFiles(value) {
   $("#login-view").hidden = true; $("#portal-view").hidden = false;
   const params = new URLSearchParams(location.search);
   initialFilters = {source:params.get("source") || "",type:params.get("type") || ""};
-  offset = 0;
+  resetPages();
   for (const [id,key] of [["search-query","q"],["search-scope","scope"],["sort-filter","sort"]]) {
     if (params.has(key)) $("#" + id).value = params.get(key);
   }
@@ -55,7 +56,7 @@ function showFiles(value) {
   timer = setInterval(() => { if (!document.hidden && session) { refresh(false); if (activeDocument) loadDetail(activeDocument, false); } }, 2000);
 }
 function filters() {
-  return new URLSearchParams({q:$("#search-query").value,scope:$("#search-scope").value || "all",source:$("#source-filter").value,type:$("#type-filter").value,sort:$("#sort-filter").value || "recent",limit:pageSize,offset});
+  return new URLSearchParams({q:$("#search-query").value,scope:$("#search-scope").value || "all",source:$("#source-filter").value,type:$("#type-filter").value,sort:$("#sort-filter").value || "recent",limit:pageSize,offset,cursor:pageCursors[Math.floor(offset / pageSize)] || ""});
 }
 function updateOptions(select, items, firstLabel) {
   const current = select.value || (initialFilters && initialFilters[select.id === "source-filter" ? "source" : "type"]) || "";
@@ -80,17 +81,16 @@ async function refresh(userAction = true) {
     history.replaceState({}, "", "/" + (params.get("q") || params.get("source") || params.get("type") ? "?" + params : ""));
     updateOptions($("#source-filter"), result.sources.map(source => ({id:source.id,label:source.kind === "private" ? "Mein Private-Ordner" : source.label})), "Alle Ordner");
     updateOptions($("#type-filter"), result.types.map(type => ({id:type,label:type.toUpperCase()})), "Alle Dateitypen");
-    if (initialFilters) {
-      const changed = $("#source-filter").value !== params.get("source") || $("#type-filter").value !== params.get("type");
-      initialFilters = null;
-      if (changed) { request = null; refresh(); return; }
-    }
-    $("#result-summary").textContent = `${result.total.toLocaleString("de-DE")} ${result.total === 1 ? "Datei" : "Dateien"}`;
+    const changed = $("#source-filter").value !== params.get("source") || $("#type-filter").value !== params.get("type");
+    initialFilters = null;
+    if (changed) { resetPages(); refresh(); return; }
+    pageCursors[Math.floor(offset / pageSize) + 1] = result.nextCursor || "";
+    $("#result-summary").textContent = `${result.totalExact === false ? "Mindestens " : ""}${result.total.toLocaleString("de-DE")} ${result.total === 1 ? "Datei" : "Dateien"}`;
     $("#index-progress").hidden = !result.pending;
-    $("#index-progress").textContent = result.pending ? `Text wird für ${result.pending} ${result.pending === 1 ? "Datei" : "Dateien"} erfasst.` : "";
+    $("#index-progress").textContent = result.pending ? `Text wird für ${result.pendingExact === false ? "mindestens " : ""}${result.pending} ${result.pending === 1 ? "Datei" : "Dateien"} erfasst.` : "";
     $("#previous-page").disabled = offset === 0;
     $("#next-page").disabled = !result.hasMore;
-    $("#page-label").textContent = result.total ? `Seite ${Math.floor(offset / pageSize) + 1}` : "";
+    $("#page-label").textContent = result.total || result.hasMore ? `Seite ${Math.floor(offset / pageSize) + 1}` : "";
     const signature = JSON.stringify(result.items);
     if (signature !== lastResult) {
       lastResult = signature;
@@ -134,10 +134,10 @@ $("#document-dialog").addEventListener("close", () => { activeDocument = null; $
 $("#document-close").addEventListener("click", () => $("#document-dialog").close());
 $("#documents").addEventListener("click", event => { const button = event.target.closest("[data-document]"); if (button) loadDetail(button.dataset.document); });
 $("#documents").addEventListener("error", event => { if (event.target.tagName === "IMG") event.target.hidden = true; }, true);
-$("#document-search").addEventListener("submit", event => { event.preventDefault(); clearTimeout(debounce); offset = 0; refresh(); });
-$("#search-query").addEventListener("input", () => { clearTimeout(debounce); offset = 0; debounce = setTimeout(() => refresh(), 200); });
-for (const id of ["search-scope", "source-filter", "type-filter", "sort-filter"]) $("#" + id).addEventListener("change", () => { offset = 0; refresh(); });
-$("#reset-filters").addEventListener("click", () => { $("#search-query").value = ""; $("#search-scope").value = "all"; $("#source-filter").value = ""; $("#type-filter").value = ""; offset = 0; refresh(); });
+$("#document-search").addEventListener("submit", event => { event.preventDefault(); clearTimeout(debounce); resetPages(); refresh(); });
+$("#search-query").addEventListener("input", () => { clearTimeout(debounce); resetPages(); debounce = setTimeout(() => refresh(), 200); });
+for (const id of ["search-scope", "source-filter", "type-filter", "sort-filter"]) $("#" + id).addEventListener("change", () => { resetPages(); refresh(); });
+$("#reset-filters").addEventListener("click", () => { $("#search-query").value = ""; $("#search-scope").value = "all"; $("#source-filter").value = ""; $("#type-filter").value = ""; resetPages(); refresh(); });
 $("#previous-page").addEventListener("click", () => { offset = Math.max(0, offset - pageSize); refresh(); });
 $("#next-page").addEventListener("click", () => { offset += pageSize; refresh(); });
 for (const [id,mode] of [["view-grid",false],["view-list",true]]) $("#" + id).addEventListener("click", () => {

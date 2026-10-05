@@ -34,17 +34,24 @@ function viewerPdf() {
  return Buffer.from(pdf+`trailer\n<< /Size 10 /Root 1 0 R >>\nstartxref\n${offset}\n%%EOF\n`);
 }
 const pdf=viewerPdf();
-let role='user', loggedIn=true, deniedId='', pendingRequests=[], errors=[];
-const browser=await chromium.launch({headless:true});
+const csrfToken='fixture-session-bound-csrf';
+let role='user', loggedIn=true, deniedId='', pendingRequests=[], errors=[], cursorMode=false, cursorRequests=[];
+const browser=await chromium.launch({headless:true,...(process.env.CHROMIUM_EXECUTABLE_PATH?{executablePath:process.env.CHROMIUM_EXECUTABLE_PATH}:{})});
 try {
  const page=await browser.newPage({viewport:{width:1500,height:1050}});
  page.on('pageerror',error=>errors.push(error.message));
  await page.route('http://adfs.test/**',async route=>{
   const url=new URL(route.request().url()); let body,type='application/json',status=200;
   if(url.pathname==='/api/session'){
-   if(!loggedIn){status=401;body={error:'Anmeldung erforderlich'};}else body={user:'EXAMPLE\\alice',role,expiresAt:9999999999};
-  }else if(url.pathname==='/api/login'){loggedIn=true;body={user:'EXAMPLE\\alice',role,expiresAt:9999999999};}
-  else if(url.pathname==='/api/logout'){loggedIn=false;body={ok:true};}
+   if(!loggedIn){status=401;body={error:'Anmeldung erforderlich'};}else body={user:'EXAMPLE\\alice',role,expiresAt:9999999999,csrfToken};
+  }else if(url.pathname==='/api/login'){
+   assert.equal(route.request().headers()['x-csrf-token'],'login');
+   loggedIn=true;body={user:'EXAMPLE\\alice',role,expiresAt:9999999999,csrfToken};
+  }
+  else if(url.pathname==='/api/logout'){
+   assert.equal(route.request().headers()['x-csrf-token'],csrfToken);
+   loggedIn=false;body={ok:true};
+  }
   else if(url.pathname==='/api/documents'){
    pendingRequests.push(url.searchParams.get('q'));
    const query=(url.searchParams.get('q')||'').toLowerCase(),scope=url.searchParams.get('scope');
@@ -53,6 +60,15 @@ try {
    if(url.searchParams.get('source'))rows=rows.filter(row=>row.sourceId===url.searchParams.get('source'));
    if(url.searchParams.get('type'))rows=rows.filter(row=>row.extension===url.searchParams.get('type'));
    body={items:rows,total:rows.length,hasMore:false,sources,types:['pdf','docx','txt','csv'],pending:rows.filter(row=>row.state==='ocr').length};
+   if(cursorMode&&query==='cursor742'){
+    const cursor=url.searchParams.get('cursor')||'';
+    cursorRequests.push({cursor,type:url.searchParams.get('type'),sort:url.searchParams.get('sort')});
+    assert.ok(['','test-cursor-40','test-cursor-80'].includes(cursor),'Unexpected page cursor');
+    const start=cursor?Number(cursor.split('-').at(-1)):0;
+    const hasMore=start+40<rows.length;
+    body={...body,items:rows.slice(start,start+40),total:hasMore?start+41:rows.length,totalExact:!hasMore,
+     hasMore,nextCursor:hasMore?`test-cursor-${start+40}`:null};
+   }
   }else if(url.pathname.startsWith('/api/documents/')){
    const parts=url.pathname.split('/'),row=fixtures.find(row=>row.id===parts[3]);
    if(!row||row.id===deniedId){status=404;body={error:'Datei nicht verfügbar'};}
@@ -216,11 +232,40 @@ try {
  await page.locator('#login-form input[name=password]').fill('password');
  await page.locator('#login-form button').click();await all();
  assert.equal(await page.locator('#admin-link').isHidden(),true);
+ // Cursor pages work in both directions; changing any filter starts at page 1.
+ cursorMode=true;
+ for(let index=0;index<85;index++)fixtures.push({...fixtures[0],id:(1000+index).toString(16).padStart(32,'0'),name:`Cursor742 ${String(index).padStart(3,'0')}.pdf`,path:`Cursor742 ${index}.pdf`,hasPreview:false});
+ await page.locator('#search-query').fill('Cursor742');
+ await page.waitForFunction(()=>document.querySelectorAll('.document-card').length===40&&document.querySelector('.document-card h2')?.textContent==='Cursor742 000.pdf');
+ assert.equal(await page.locator('#result-summary').innerText(),'Mindestens 41 Dateien');
+ await page.locator('#next-page').click();
+ await page.waitForFunction(()=>document.querySelector('.document-card h2')?.textContent==='Cursor742 040.pdf');
+ assert.equal(cursorRequests.at(-1).cursor,'test-cursor-40');
+ await page.locator('#next-page').click();
+ await page.waitForFunction(()=>document.querySelector('.document-card h2')?.textContent==='Cursor742 080.pdf');
+ assert.equal(await page.locator('#documents .document-card').count(),5);
+ assert.equal(await page.locator('#next-page').isDisabled(),true);
+ assert.equal(await page.locator('#result-summary').innerText(),'85 Dateien');
+ await page.locator('#previous-page').click();
+ await page.waitForFunction(()=>document.querySelector('.document-card h2')?.textContent==='Cursor742 040.pdf');
+ assert.equal(cursorRequests.at(-1).cursor,'test-cursor-40');
+ await page.locator('#type-filter').selectOption('pdf');
+ await page.waitForFunction(()=>document.querySelector('.document-card h2')?.textContent==='Cursor742 000.pdf');
+ assert.equal(cursorRequests.at(-1).cursor,'');
+ await page.locator('#next-page').click();
+ await page.waitForFunction(()=>document.querySelector('.document-card h2')?.textContent==='Cursor742 040.pdf');
+ await page.locator('#sort-filter').selectOption('oldest');
+ await page.waitForFunction(()=>document.querySelector('.document-card h2')?.textContent==='Cursor742 000.pdf');
+ assert.equal(cursorRequests.at(-1).cursor,'');
+ await page.evaluate(()=>window.scrollTo(0,0));
+ await page.screenshot({path:path.join(out,'07-cursor-search.png'),fullPage:false});
+ fixtures.splice(5);cursorMode=false;
+ await page.locator('#reset-filters').click();await all();
  role='domain-admin';await page.goto('http://adfs.test/');await all();
  assert.equal(await page.locator('#admin-link').getAttribute('href'),'/admin/overview');
  assert.equal(await page.locator('#admin-link').isVisible(),true);
  assert.ok(pendingRequests.includes('FINANZ742')&&pendingRequests.includes('SCANLIVE742'));
  assert.deepEqual(errors,[]);
- console.log('PASS: user login, admin separation, live content search, own-private filter, preview/download links, OCR refresh, revocation, grid/list, desktop/mobile, portrait/landscape image fitting.');
+ console.log('PASS: user login, admin separation, live content search, own-private filter, cursor pagination and reset, exact/lower-bound counts, preview/download links, OCR refresh, revocation, grid/list, desktop/mobile, portrait/landscape image fitting.');
  console.log('Screenshots: '+out);
 } finally {await browser.close();}

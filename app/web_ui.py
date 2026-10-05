@@ -27,11 +27,11 @@ from typing import Dict, List, Optional, Tuple
 
 try:
     from app import reconcile_shares as directory
-    from app import trash, access_control, documents
+    from app import trash, access_control, documents, web_security
     from app.account_policy import is_excluded_user
 except ImportError:  # Container execution uses /app as the import root.
     import reconcile_shares as directory
-    import trash, access_control, documents
+    import trash, access_control, documents, web_security
     from account_policy import is_excluded_user
 
 try:
@@ -77,7 +77,7 @@ JWT_ISSUER = "ad-file-server-web"
 JWT_AUDIENCE = "ad-users"
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SID_RE = re.compile(r"S-\d+(?:-\d+)+", re.IGNORECASE)
-LOGIN_LIMIT: Dict[str, deque] = {}
+LOGIN_LIMIT: Dict[tuple, deque] = {}
 LOGIN_LIMIT_LOCK = threading.Lock()
 ACTION_LAUNCH_LOCK = threading.Lock()
 ACTIVE_PROCESS_STATES = frozenset({"starting", "running"})
@@ -256,11 +256,13 @@ def base64url_decode(value: str) -> bytes:
 
 
 class TokenManager:
-    def __init__(self, secret: str, ttl_seconds: int):
+    def __init__(self, secret: str, ttl_seconds: int, sessions=None, identity_resolver=None):
         if len(secret.encode("utf-8")) < 32:
             raise RuntimeError("WEB_JWT_SECRET must contain at least 32 bytes")
         self.secret = secret.encode("utf-8")
         self.ttl_seconds = ttl_seconds
+        self.sessions = sessions if sessions is not None else web_security.Sessions()
+        self.identity_resolver = identity_resolver
 
     def issue(self, username: str, sid: str, role: str = "user", uid: Optional[int] = None) -> Tuple[str, int]:
         issued = int(time.time())
@@ -284,9 +286,10 @@ class TokenManager:
             ]
         )
         signature = hmac.new(self.secret, signing_input.encode(), hashlib.sha256).digest()
+        self.sessions.issue(payload)
         return f"{signing_input}.{base64url(signature)}", expires
 
-    def verify(self, token: str) -> Dict[str, object]:
+    def verify(self, token: str, refresh_identity: bool = True) -> Dict[str, object]:
         try:
             encoded_header, encoded_payload, encoded_signature = token.split(".")
             signing_input = f"{encoded_header}.{encoded_payload}"
@@ -308,9 +311,33 @@ class TokenManager:
                 raise ValueError("expired")
             if int(payload.get("iat", 0)) > int(time.time()) + 60:
                 raise ValueError("issued")
+            jti = payload.get('jti')
+            if not isinstance(jti, str) or not jti or len(jti) > 128:
+                raise ValueError('session id')
+            current = self.sessions.get(jti, time.time())
+            if current is None or current['sid'] != payload['sid'] or current['expires'] != payload['exp']:
+                raise ValueError('revoked')
+            interval = env_int('WEB_AUTH_RECHECK_SECONDS', 60, 5, 300)
+            if refresh_identity and self.identity_resolver and time.time() - current['checked'] >= interval:
+                identity = self.identity_resolver(payload['sid'])
+                if identity is None or identity.get('sid') != payload['sid']:
+                    # Fail closed on an unavailable directory; do not keep
+                    # trusting old admin claims while winbind is unreachable.
+                    raise ValueError('directory unavailable')
+                self.sessions.refresh(jti, identity, time.time())
+                current = self.sessions.get(jti, time.time())
+                if current is None:
+                    raise ValueError('revoked')
+            payload.update(sub=current['username'], uid=current['uid'], role=current['role'])
             return payload
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
             raise ValueError("Invalid or expired session") from exc
+
+    def csrf(self, payload):
+        return base64url(hmac.new(self.secret, ('csrf:' + payload['jti']).encode(), hashlib.sha256).digest())
+
+    def revoke(self, payload):
+        self.sessions.revoke(payload['jti'])
 
 
 def normalize_username(username: str) -> str:
@@ -406,20 +433,21 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
         user_sid_match = SID_RE.search(sid_result.stdout)
         if sid_result.returncode != 0 or user_sid_match is None:
             return None
-        group_result = subprocess.run(
-            ["wbinfo", "--user-sids", user_sid_match.group(0)],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return current_identity(user_sid_match.group(0))
+
+
+def current_identity(sid: str):
+    try:
+        group_result = subprocess.run(["wbinfo", "--user-sids", sid], capture_output=True,
+                                      text=True, timeout=15, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if group_result.returncode != 0:
         return None
     admin_sid = os.environ["DOMAIN_ADMINS_SID"].casefold()
     group_sids = {value.casefold() for value in SID_RE.findall(group_result.stdout)}
-    sid = user_sid_match.group(0)
     try:
         resolved = subprocess.run(["wbinfo", "--sid-to-name", sid], capture_output=True, text=True, timeout=15, check=False)
     except (OSError, subprocess.TimeoutExpired):
@@ -444,25 +472,27 @@ def authenticate_domain_admin(username: str, password: str) -> Optional[str]:
     return identity["sub"] if identity and identity["role"] == "domain-admin" else None
 
 
-def login_allowed(remote: str) -> bool:
+def reserve_login(remote: str, username: str) -> bool:
     now = time.monotonic()
     window = 300
-    limit = env_int("WEB_LOGIN_ATTEMPTS_PER_5_MIN", 10, 3, 100)
+    ip_limit = env_int("WEB_LOGIN_ATTEMPTS_PER_5_MIN", 10, 3, 100)
+    account_limit = env_int('WEB_LOGIN_ACCOUNT_ATTEMPTS_PER_5_MIN', 10, 3, 100)
+    # The supported domain-qualified spellings share the same target budget.
+    account = username.strip().rsplit('\\', 1)[-1].split('@', 1)[0].casefold()[:256]
+    keys = (('ip', remote), ('account', account))
     with LOGIN_LIMIT_LOCK:
-        attempts = LOGIN_LIMIT.setdefault(remote, deque())
-        while attempts and now - attempts[0] > window:
-            attempts.popleft()
-        return len(attempts) < limit
-
-
-def record_login_failure(remote: str) -> None:
-    with LOGIN_LIMIT_LOCK:
-        LOGIN_LIMIT.setdefault(remote, deque()).append(time.monotonic())
-
-
-def clear_login_failures(remote: str) -> None:
-    with LOGIN_LIMIT_LOCK:
-        LOGIN_LIMIT.pop(remote, None)
+        for key in list(LOGIN_LIMIT):
+            attempts = LOGIN_LIMIT[key]
+            while attempts and now - attempts[0] >= window:
+                attempts.popleft()
+            if not attempts:
+                del LOGIN_LIMIT[key]
+        attempts = [LOGIN_LIMIT.get(key, ()) for key in keys]
+        if len(attempts[0]) >= ip_limit or len(attempts[1]) >= account_limit:
+            return False
+        for key in keys:
+            LOGIN_LIMIT.setdefault(key, deque()).append(now)
+        return True
 
 
 def path_size(path: str) -> int:
@@ -760,7 +790,8 @@ def tls_summary() -> Dict[str, object]:
 class App:
     def __init__(self):
         secret = os.environ.get("WEB_JWT_SECRET", "")
-        self.tokens = TokenManager(secret, env_int("WEB_JWT_TTL_SECONDS", 28800, 300, 604800))
+        self.tokens = TokenManager(secret, env_int("WEB_JWT_TTL_SECONDS", 28800, 300, 604800),
+                                   web_security.Sessions(STATE_DB), current_identity)
         removed = drop_legacy_web_cache()
         if removed:
             log(f"Dropped {removed} legacy web cache file(s)")
@@ -877,23 +908,24 @@ class Handler(BaseHTTPRequestHandler):
         morsel = cookie.get(JWT_COOKIE)
         return morsel.value if morsel else None
 
-    def user(self) -> Optional[Dict[str, object]]:
+    def user(self, refresh_identity: bool = True) -> Optional[Dict[str, object]]:
         token = self.token()
         if not token:
             return None
         try:
-            return APP.tokens.verify(token) if APP else None
+            return APP.tokens.verify(token, refresh_identity=refresh_identity) if APP else None
         except ValueError:
             return None
 
-    def require_user(self) -> Optional[Dict[str, object]]:
-        value = self.user()
+    def require_user(self, refresh_identity: bool = True) -> Optional[Dict[str, object]]:
+        value = self.user(refresh_identity=refresh_identity)
         if value is None:
             self.send_error_json(HTTPStatus.UNAUTHORIZED, "Anmeldung erforderlich")
         return value
 
-    def require_admin(self) -> Optional[Dict[str, object]]:
-        value = self.require_user()
+    def require_admin(self, value=None) -> Optional[Dict[str, object]]:
+        if value is None:
+            value = self.require_user()
         if value is not None and value.get("role") != "domain-admin":
             self.send_error_json(HTTPStatus.FORBIDDEN, "Domänenadministrator erforderlich")
             return None
@@ -913,6 +945,40 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             raise ValueError("Ein JSON-Objekt ist erforderlich")
         return value
+
+    def check_write_origin(self) -> bool:
+        if self.headers.get_content_type() != 'application/json':
+            self.send_error_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, 'application/json erforderlich')
+            return False
+        value = self.headers.get('Origin')
+        if value is not None:
+            configured = os.getenv('WEB_TRUSTED_ORIGINS', '').strip()
+            if not configured:
+                hostname = os.getenv('WEB_HOSTNAME', os.getenv('AD_DNS_NAME', 'localhost'))
+                port = env_int('WEB_HTTPS_PORT', 443, 1, 65535)
+                configured = f'https://{hostname}' + (f':{port}' if port != 443 else '')
+            try:
+                allowed = {web_security.origin(item.strip()) for item in configured.split(',')}
+                if web_security.origin(value) not in allowed:
+                    raise ValueError()
+            except ValueError:
+                self.send_error_json(HTTPStatus.FORBIDDEN, 'Nicht vertrauenswürdiger Origin')
+                return False
+        if self.headers.get('Sec-Fetch-Site') in {'cross-site', 'same-site'}:
+            self.send_error_json(HTTPStatus.FORBIDDEN, 'Anfrage muss vom selben Origin stammen')
+            return False
+        return True
+
+    def check_csrf(self, user) -> bool:
+        supplied = self.headers.get('X-CSRF-Token', '')
+        # Origin-less API clients must explicitly carry their bearer token;
+        # browser cookie requests always need an exact trusted Origin as well.
+        bearer = self.headers.get('Authorization', '').startswith('Bearer ')
+        if (not self.headers.get('Origin') and not bearer or
+                not hmac.compare_digest(supplied.encode('utf-8'), APP.tokens.csrf(user).encode('ascii'))):
+            self.send_error_json(HTTPStatus.FORBIDDEN, 'Ungültiger CSRF-Schutz')
+            return False
+        return True
 
     def send_trash_download(self, params: Dict[str, List[str]]) -> None:
         item_id = params.get("id", [""])[0]
@@ -953,23 +1019,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # pylint: disable=invalid-name
         parsed = urllib.parse.urlparse(self.path)
+        if not self.check_write_origin():
+            return
         if parsed.path == "/api/login":
-            remote = self.client_address[0]
-            if not login_allowed(remote):
-                self.send_error_json(HTTPStatus.TOO_MANY_REQUESTS, "Zu viele Anmeldeversuche; bitte später erneut versuchen")
+            # Login has no authenticated session yet. A custom header and JSON
+            # prevent simple cross-origin requests; Origin is checked above.
+            if self.headers.get('X-CSRF-Token') != 'login':
+                self.send_error_json(HTTPStatus.FORBIDDEN, 'Ungültiger CSRF-Schutz')
                 return
+            remote = self.client_address[0]
             try:
                 body = self.read_json_body()
             except ValueError as exc:
                 self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
                 return
-            identity = authenticate_user(str(body.get("username", "")), str(body.get("password", "")))
+            username = str(body.get('username', ''))
+            if not reserve_login(remote, username):
+                self.send_error_json(HTTPStatus.TOO_MANY_REQUESTS, "Zu viele Anmeldeversuche; bitte später erneut versuchen")
+                return
+            identity = authenticate_user(username, str(body.get("password", "")))
             if identity is None:
-                record_login_failure(remote)
                 time.sleep(0.4)
                 self.send_error_json(HTTPStatus.UNAUTHORIZED, "Ungültige Zugangsdaten")
                 return
-            clear_login_failures(remote)
             token, expires = APP.tokens.issue(identity["sub"], identity["sid"], identity["role"], identity["uid"])
             conn = directory.open_db()
             try:
@@ -982,16 +1054,25 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
             max_age = max(0, expires - int(time.time()))
             cookie = f"{JWT_COOKIE}={token}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=Strict"
-            self.send_json({"user": identity["sub"], "sid": identity["sid"], "role": identity["role"], "expiresAt": expires, "token": token, "tokenType": "Bearer"}, cookie=cookie)
+            payload = APP.tokens.verify(token)
+            self.send_json({"user": identity["sub"], "sid": identity["sid"], "role": identity["role"], "expiresAt": expires, "token": token, "tokenType": "Bearer", 'csrfToken': APP.tokens.csrf(payload)}, cookie=cookie)
             return
         if parsed.path == "/api/logout":
+            # Revoking a valid session must also work during an AD outage.
+            user = self.require_user(refresh_identity=False)
+            if user is None or not self.check_csrf(user):
+                return
+            APP.tokens.revoke(user)
             cookie = f"{JWT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
             self.send_json({"ok": True}, cookie=cookie)
             return
         if not parsed.path.startswith("/admin/api/"):
             self.send_error_json(HTTPStatus.NOT_FOUND, "Nicht gefunden")
             return
-        administrator = self.require_admin()
+        user = self.require_user()
+        if user is None or not self.check_csrf(user):
+            return
+        administrator = self.require_admin(user)
         if administrator is None:
             return
         parsed = parsed._replace(path=parsed.path[len("/admin"):])
@@ -1115,19 +1196,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             params = urllib.parse.parse_qs(parsed.query)
             if path == "/api/session":
-                self.send_json({"user": user["sub"], "sid": user["sid"], "role": user["role"], "expiresAt": user["exp"]})
+                self.send_json({"user": user["sub"], "sid": user["sid"], "role": user["role"], "expiresAt": user["exp"], 'csrfToken': APP.tokens.csrf(user)})
             elif path == "/api/documents" or path.startswith("/api/documents/"):
                 self.document_request(path, params, user)
             else:
                 self.send_error_json(HTTPStatus.NOT_FOUND, "Nicht gefunden")
             return
         if path.startswith("/admin/api/"):
-            if self.require_admin() is None:
-                return
-            path = path[len("/admin"):]
-            user = self.require_user()
+            user = self.require_admin()
             if user is None:
                 return
+            path = path[len("/admin"):]
             params = urllib.parse.parse_qs(parsed.query)
             try:
                 if path == "/api/session":
@@ -1342,6 +1421,36 @@ class ReusableHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def __init__(self, address, handler, tls_context=None):
+        self.tls_context = tls_context
+        self.connections = threading.BoundedSemaphore(env_int('WEB_MAX_CONNECTIONS', 64, 4, 512))
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        # Never wait for TLS or a free worker in the accept loop.
+        if not self.connections.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.connections.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        connection = request
+        try:
+            if self.tls_context is not None:
+                request.settimeout(env_int('WEB_TLS_HANDSHAKE_TIMEOUT_SECONDS', 5, 1, 30))
+                connection = self.tls_context.wrap_socket(request, server_side=True, do_handshake_on_connect=False)
+                connection.do_handshake()
+            connection.settimeout(env_int('WEB_REQUEST_TIMEOUT_SECONDS', 30, 1, 300))
+            super().process_request_thread(connection, client_address)
+        except OSError:
+            self.shutdown_request(connection)
+        finally:
+            self.connections.release()
+
 
 def serve_https() -> None:
     address = os.getenv("WEB_BIND_ADDRESS", "0.0.0.0")
@@ -1352,9 +1461,8 @@ def serve_https() -> None:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(TLS_CERT_FILE, TLS_KEY_FILE)
-        server = ReusableHTTPServer((address, port), Handler)
+        server = ReusableHTTPServer((address, port), Handler, tls_context=context)
         server.timeout = 1
-        server.socket = context.wrap_socket(server.socket, server_side=True)
         cert_mtime = os.path.getmtime(TLS_CERT_FILE)
         try:
             while os.path.getmtime(TLS_CERT_FILE) == cert_mtime:

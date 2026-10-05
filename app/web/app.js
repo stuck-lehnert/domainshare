@@ -63,7 +63,7 @@ async function api(path, options = {}) {
   if (path.startsWith("/api/") && !["/api/login", "/api/logout", "/api/session"].includes(path)) path = "/admin" + path;
   const response = await fetch(path, {
     ...options,
-    headers: {"Content-Type": "application/json", ...(options.headers || {})},
+    headers: {"Content-Type": "application/json", "X-CSRF-Token": path === "/api/login" ? "login" : state.session?.csrfToken || "", ...(options.headers || {})},
     credentials: "same-origin",
   });
   let body = {};
@@ -93,7 +93,7 @@ function showLogin() {
 
 function showApp(session) {
   if (session.role !== "domain-admin") { location.replace("/"); return; }
-  state.session = {user: session.user, expiresAt: session.expiresAt};
+  state.session = {user: session.user, expiresAt: session.expiresAt, csrfToken: session.csrfToken};
   document.querySelector("#session-user").textContent = session.user;
   loginView.hidden = true;
   appView.hidden = false;
