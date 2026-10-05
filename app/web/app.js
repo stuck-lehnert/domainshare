@@ -108,6 +108,7 @@ function empty(message) { return `<div class="empty">${esc(message)}</div>`; }
 function badge(text, kind = "") { return `<span class="badge ${kind}">${esc(text)}</span>`; }
 
 function routeFor(path) {
+  if (path.startsWith('/admin/settings') || path.startsWith('/settings')) return 'settings';
   path = path.replace(/^\/admin(?=\/|$)/, "") || "/overview";
   if (path.startsWith("/storage/data")) return "storage-data";
   if (path.startsWith("/storage/users")) return "storage-users";
@@ -152,6 +153,10 @@ async function navigate(path, replace = false) {
     if (route === "backup") await renderBackup();
     if (route === "report") await renderReport();
     if (route === "system") await renderSystem();
+    if (route === 'settings') {
+      content.innerHTML = pageHead('Einstellungen', 'Serverkonfiguration dauerhaft speichern.') + '<div id="configuration-settings"></div>';
+      await ConfigurationUI.mount(document.querySelector('#configuration-settings'), {api, notice, onDirty: dirty => { state.accessDirty = dirty; }});
+    }
     content.focus();
   } catch (error) {
     content.innerHTML = pageHead("Seite konnte nicht geladen werden", error.message) + `<section class="panel">${empty("Dienststatus prüfen und erneut versuchen.")}</section>`;
@@ -563,7 +568,8 @@ async function renderBackup() {
     "Sicherungen",
     "Sicherungen manuell starten sowie Fortschritt und Ausgabe verfolgen.",
     '<button id="start-backup" type="button">Sicherung jetzt starten</button>'
-  ) + '<div id="backup-body"></div>';
+  ) + '<details class="panel"><summary>Sicherungsziel, Zeitplan und Verschlüsselung</summary><div id="backup-settings" class="settings-advanced"></div></details><div id="backup-body"></div>';
+  void ConfigurationUI.mount(document.querySelector('#backup-settings'), {api, notice, section:'backup', onDirty: dirty => { state.accessDirty = dirty; }}).catch(error => notice(error.message));
   const button = document.querySelector("#start-backup");
   const body = document.querySelector("#backup-body");
   let logLines = [];

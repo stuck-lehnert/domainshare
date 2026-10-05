@@ -3,18 +3,13 @@ services:
     build:
       context: .
     container_name: ad-samba-file-server
-    hostname: ${SAMBA_HOSTNAME:-adsambafsrv}
+    hostname: adsambafsrv
     restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      TZ: Etc/UTC
-      NETBIOS_NAME: ${NETBIOS_NAME:-ADSAMBAFSRV}
     ports:
       - "445:445"
       - "139:139"
-      - "${ACME_HTTP_PORT:-80}:80"
-      - "${WEB_HTTPS_PORT:-443}:${WEB_BIND_PORT:-8443}"
+      - "80:80"
+      - "443:8443"
     volumes:
       - private_data:/data/private
       - fslogix_data:/data/fslogix
@@ -22,7 +17,7 @@ services:
       - state_data:/state
       - samba_lib_data:/var/lib/samba
     healthcheck:
-      test: ["CMD-SHELL", "wbinfo -t >/dev/null 2>&1 && testparm -s >/dev/null 2>&1"]
+      test: ["CMD", "python3", "/app/healthcheck.py"]
       interval: 30s
       timeout: 10s
       retries: 5

@@ -226,7 +226,7 @@ class AdministrationActionTests(unittest.TestCase):
     ):
         with mock.patch.dict(
             os.environ,
-            {"BACKUP_DESTINATION": "rsync://backup.example.test/target"},
+            {"BACKUP_DESTINATION": "rsync://backup.example.test/target", "BACKUP_ENCRYPTION_ENABLED": "true"},
             clear=True,
         ):
             with self.assertRaisesRegex(

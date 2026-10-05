@@ -1,0 +1,86 @@
+import assert from 'node:assert/strict';
+import {spawn} from 'node:child_process';
+import {createRequire} from 'node:module';
+import {createInterface} from 'node:readline';
+import {fileURLToPath} from 'node:url';
+import {mkdir} from 'node:fs/promises';
+const require = createRequire(import.meta.url);
+const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const root = fileURLToPath(new URL('../',import.meta.url));
+const fixture = spawn('python3',['-m','tests.configuration_browser_fixture'],{cwd:root,stdio:['ignore','pipe','pipe']});
+let logs='', browser; fixture.stderr.on('data',chunk=>{logs+=chunk;});
+const output = '/tmp/adfs-configuration-screenshots'; await mkdir(output,{recursive:true});
+try {
+ const info = await new Promise((resolve,reject)=>{
+  const lines=createInterface({input:fixture.stdout}); const timeout=setTimeout(()=>reject(new Error('Fixture timeout: '+logs)),10000);
+  lines.on('line',line=>{if(line.startsWith('{')){clearTimeout(timeout);resolve(JSON.parse(line));}});
+  fixture.once('exit',code=>reject(new Error('Fixture failed: '+code+' '+logs)));
+ });
+ browser=await chromium.launch({headless:true,...(process.env.CHROMIUM_EXECUTABLE_PATH?{executablePath:process.env.CHROMIUM_EXECUTABLE_PATH}:{}),args:['--no-proxy-server','--host-resolver-rules=MAP files.example.test 127.0.0.1']});
+ const context=await browser.newContext({ignoreHTTPSErrors:true,viewport:{width:1360,height:1000}});
+ const page=await context.newPage(); const errors=[];page.on('pageerror',error=>errors.push(error.message));
+ const target=`https://files.example.test:${info.port}`;
+ await page.goto(target+'/');
+ await page.getByLabel('Einrichtungscode',{exact:true}).fill(info.code);
+ await page.getByRole('button',{name:'Weiter',exact:true}).click();
+
+ await page.getByLabel('Kerberos-Domäne').fill('EXAMPLE.TEST');
+ await page.getByLabel('NetBIOS-Domäne',{exact:true}).fill('EXAMPLE');
+ await page.getByLabel('Domänencontroller / AD-DNS-Name').fill('example.test');
+ await page.getByLabel('Konto für Domänenbeitritt und LDAP',{exact:true}).fill('admin');
+ await page.getByLabel('Passwort für Domänenbeitritt und LDAP',{exact:true}).fill('fixture-password');
+ await page.screenshot({path:output+'/https-domain-desktop.png',fullPage:true});
+ await page.getByRole('button',{name:'Domäne beitreten',exact:true}).click();
+ await page.getByRole('heading',{name:'Gruppen auswählen'}).waitFor();
+ await page.getByLabel('Passwort',{exact:true}).fill('fixture-password');
+ await page.getByRole('button',{name:'Einrichtung abschließen'}).click();
+ await page.getByRole('link',{name:'Zur Anmeldung'}).waitFor();
+ assert.equal(await page.evaluate(async code=>(await fetch('/api/bootstrap/settings',{headers:{'X-Setup-Token':code}})).status,info.code),403);
+ await page.goto(target+'/admin/settings');
+ await page.getByLabel('Benutzername',{exact:true}).fill('admin');
+ await page.getByLabel('Passwort',{exact:true}).fill('fixture-password');
+ await page.getByRole('button',{name:'Anmelden',exact:true}).click();
+ await page.getByRole('button',{name:'Sicherungen',exact:true}).click();
+ await page.getByLabel('Sicherungsziel',{exact:true}).fill('sftp://backup:fixture-secret@backup.example.test/files');
+ await page.getByRole('button',{name:'Wiederherstellungsphrase erzeugen',exact:true}).click();
+ const dialog=page.getByRole('dialog'); await dialog.waitFor();
+ assert.equal(await dialog.locator('.recovery-words li').count(),24);
+ const phrase=await dialog.locator('.recovery-words li').allTextContents();
+ assert.equal((await dialog.getByRole('button',{name:'Schlüssel aktivieren'}).isEnabled()),true);
+ await dialog.getByRole('button',{name:'Schlüssel aktivieren'}).click();
+ assert.equal(await dialog.isVisible(),true);
+ await dialog.getByLabel('Ich habe alle 24 Wörter',{exact:false}).check();
+ await dialog.getByRole('button',{name:'Schlüssel aktivieren'}).click();
+ await dialog.waitFor({state:'detached'});
+ assert.equal(await page.getByLabel('Sicherungsziel',{exact:true}).inputValue(),'sftp://backup:fixture-secret@backup.example.test/files');
+ await page.getByLabel('Sicherungsziel',{exact:true}).fill('sftp://backup:fixture-secret@backup.example.test/files');
+ await page.getByLabel('Automatische Sicherungen',{exact:true}).check();
+ await page.getByRole('button',{name:'Änderungen speichern'}).click();
+ await page.getByText('Gespeichert.',{exact:true}).waitFor();
+ assert.equal(await page.getByLabel('Sicherungsziel',{exact:true}).inputValue(),'');
+ await page.getByRole('button',{name:'Neue Wiederherstellungsphrase erzeugen',exact:true}).click();
+ const renew=page.getByRole('dialog'); await renew.waitFor();
+ await renew.getByLabel('Ich habe alle 24 Wörter',{exact:false}).check();
+ await renew.getByRole('button',{name:'Schlüssel aktivieren'}).click();
+ assert.equal(await renew.isVisible(),true);
+ await renew.getByLabel('Ich bewahre auch die bisherige Phrase',{exact:false}).check();
+ await renew.getByRole('button',{name:'Schlüssel aktivieren'}).click();
+ await renew.waitFor({state:'detached'});
+ const text=await page.locator('body').innerText(); assert.ok(!text.includes(phrase.join(' ')));assert.ok(!text.includes('fixture-secret'));
+ await page.locator('#toast').waitFor({state:'hidden'});
+ await page.screenshot({path:output+'/backup-settings-desktop.png',fullPage:true});
+ await page.setViewportSize({width:390,height:844});
+ await page.screenshot({path:output+'/backup-settings-mobile.png',fullPage:true});
+ assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth));
+ assert.deepEqual(errors,[]);
+ // Inspect the actual zero-env container's HTTP-only onboarding page too.
+ if (process.env.CONFIG_HTTP_URL) {
+ const httpPage=await context.newPage();
+ await httpPage.goto(process.env.CONFIG_HTTP_URL);
+ await httpPage.getByRole('heading',{name:'HTTPS zuerst einrichten'}).waitFor();
+ assert.equal(await httpPage.locator('input[name=password],input[name=username]').count(),0);
+ assert.equal(await httpPage.evaluate(async()=>(await fetch('/api/login',{method:'POST',body:'{}'})).status),403);
+ await httpPage.screenshot({path:output+'/http-acme-desktop.png',fullPage:true});
+ }
+ console.log('PASS: HTTPS bootstrap, admin settings, phrase confirmation and rotation, secret redaction, responsive layout; optional HTTP onboarding check. Screenshots: '+output);
+} finally { if(browser) await browser.close(); fixture.kill('SIGTERM'); }

@@ -46,6 +46,10 @@ COPY app/audit_collector.py /app/audit_collector.py
 COPY app/trash.py /app/trash.py
 COPY app/web_ui.py /app/web_ui.py
 COPY app/web_security.py /app/web_security.py
+COPY app/configuration.py app/backup_keys.py app/tls_configuration.py app/entrypoint.py app/run_service.py app/healthcheck.py /app/
+COPY app/http_setup.py /app/http_setup.py
+COPY app/restore_backup.py /app/restore_backup.py
+COPY app/vendor /app/vendor
 COPY app/document_types.py /app/document_types.py
 COPY app/documents.py /app/documents.py
 COPY app/document_search.py /app/document_search.py
@@ -60,4 +64,4 @@ RUN chmod +x /app/init.sh /app/reconcile_shares.py /app/backup_to_destination.py
     && true
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/app/init.sh"]
+CMD ["python3", "/app/entrypoint.py"]

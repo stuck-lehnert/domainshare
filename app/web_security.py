@@ -67,6 +67,10 @@ class Sessions:
         with self.connection() as conn, conn:
             conn.execute('DELETE FROM web_sessions WHERE id=?', (self.key(jti),))
 
+    def recheck_all(self):
+        with self.connection() as conn, conn:
+            conn.execute('UPDATE web_sessions SET checked=0')
+
     def close(self):
         with self.lock:
             if self.memory is not None:

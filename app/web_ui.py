@@ -27,11 +27,11 @@ from typing import Dict, List, Optional, Tuple
 
 try:
     from app import reconcile_shares as directory
-    from app import trash, access_control, documents, web_security
+    from app import trash, access_control, documents, web_security, configuration
     from app.account_policy import is_excluded_user
 except ImportError:  # Container execution uses /app as the import root.
     import reconcile_shares as directory
-    import trash, access_control, documents, web_security
+    import trash, access_control, documents, web_security, configuration
     from account_policy import is_excluded_user
 
 try:
@@ -130,6 +130,8 @@ class ActionConflict(RuntimeError):
 def launch_background(command: List[str], extra_env: Dict[str, str]) -> None:
     environment = os.environ.copy()
     environment.update(extra_env)
+    if CONFIG is not None:
+        environment.update(CONFIG.environment())
     try:
         process = subprocess.Popen(
             command,
@@ -148,7 +150,7 @@ def launch_background(command: List[str], extra_env: Dict[str, str]) -> None:
 def start_backup_action(username: str) -> Dict[str, object]:
     if not os.getenv("BACKUP_DESTINATION", "").strip():
         raise ActionConflict("Es ist kein Sicherungsziel eingerichtet")
-    if not os.getenv("BACKUP_ARCHIVE_PASSWORD", ""):
+    if env_bool('BACKUP_ENCRYPTION_ENABLED', False) and not os.getenv("BACKUP_ARCHIVE_PASSWORD", ""):
         raise ActionConflict("BACKUP_ARCHIVE_PASSWORD ist nicht gesetzt")
     with ACTION_LAUNCH_LOCK:
         if lock_is_held(BACKUP_LOCK_FILE):
@@ -438,7 +440,7 @@ def authenticate_user(username: str, password: str) -> Optional[Dict[str, str]]:
     return current_identity(user_sid_match.group(0))
 
 
-def current_identity(sid: str):
+def current_identity(sid: str, admin_sid=None):
     try:
         group_result = subprocess.run(["wbinfo", "--user-sids", sid], capture_output=True,
                                       text=True, timeout=15, check=False)
@@ -446,7 +448,7 @@ def current_identity(sid: str):
         return None
     if group_result.returncode != 0:
         return None
-    admin_sid = os.environ["DOMAIN_ADMINS_SID"].casefold()
+    admin_sid = (admin_sid or os.environ["DOMAIN_ADMINS_SID"]).casefold()
     group_sids = {value.casefold() for value in SID_RE.findall(group_result.stdout)}
     try:
         resolved = subprocess.run(["wbinfo", "--sid-to-name", sid], capture_output=True, text=True, timeout=15, check=False)
@@ -863,6 +865,7 @@ class App:
 
 
 APP: Optional[App] = None
+CONFIG = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -870,6 +873,133 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args) -> None:
         log(f"{self.client_address[0]} {fmt % args}")
+
+    def reload_configuration(self):
+        if CONFIG is not None:
+            for name in ('LDAP_URI', 'LDAP_BASE_DN', 'AD_DNS_NAME'):
+                os.environ.pop(name, None)
+            os.environ.update(CONFIG.environment(materialize=False))
+
+    def domain_groups(self):
+        entries = directory.search_directory_entries('(objectClass=group)', access_control.ATTRS)
+        result = []
+        for entry in entries:
+            principal = directory.parse_principal_from_entry(entry)
+            if principal and directory.is_group_principal(principal):
+                sid = str(principal.get('objectSid') or '')
+                if SID_RE.fullmatch(sid):
+                    result.append({'sid': sid, 'name': str(principal.get('samAccountName') or sid)})
+        return sorted(result, key=lambda row: row['name'].casefold())
+
+    def bootstrap(self, path, mutation=False):
+        if CONFIG is None:
+            self.send_error_json(HTTPStatus.NOT_FOUND, 'Nicht gefunden')
+            return
+        snap = CONFIG.snapshot()
+        if path == '/api/bootstrap/status' and not mutation:
+            self.send_json({'phase': snap['phase'], 'configured': snap['phase'] == 'configured'})
+            return
+        if not CONFIG.accepts_bootstrap(self.headers.get('X-Setup-Token', '')):
+            self.send_error_json(HTTPStatus.FORBIDDEN, 'Ungültiger Einrichtungscode oder Einrichtung abgeschlossen')
+            return
+        if mutation:
+            if self.headers.get_content_type() != 'application/json' or self.headers.get('Sec-Fetch-Site') in {'cross-site', 'same-site'}:
+                self.send_error_json(HTTPStatus.FORBIDDEN, 'Einrichtung erfordert JSON vom selben Origin')
+                return
+            origin = self.headers.get('Origin')
+            if origin:
+                try:
+                    if web_security.origin(origin) != web_security.origin('https://' + self.headers.get('Host', '')):
+                        raise ValueError()
+                except ValueError:
+                    self.send_error_json(HTTPStatus.FORBIDDEN, 'Ungültiger Einrichtungs-Origin')
+                    return
+        try:
+            if not mutation and path == '/api/bootstrap/settings':
+                value = CONFIG.public()
+                value['services'] = read_json(str(CONFIG.root / 'services-status.json'), {'state': 'waiting'})
+                self.send_json(value)
+            elif not mutation and path == '/api/bootstrap/groups':
+                if not os.path.exists('/run/adfs-domain-ready'):
+                    raise ValueError('Domänenbeitritt ist noch nicht abgeschlossen')
+                self.send_json({'groups': self.domain_groups()})
+            elif mutation and path == '/api/bootstrap/domain':
+                body = self.read_json_body(262144)
+                changes = body.get('values', {})
+                if not isinstance(changes, dict) or any(key not in configuration.FIELDS or configuration.FIELDS[key]['section'] not in {'domain', 'network', 'tls'} for key in changes):
+                    raise ValueError('Nur Domänen-, Server- und HTTPS-Einstellungen sind hier zulässig')
+                if not all(changes.get(key) or snap['values'].get(key) for key in ('REALM', 'WORKGROUP', 'DOMAIN', 'JOIN_USER', 'JOIN_PASSWORD')):
+                    raise ValueError('Domäne und Zugangsdaten für den Beitritt sind erforderlich')
+                CONFIG.save(changes, body.get('revision'), bootstrap=True)
+                CONFIG.phase('joining')
+                self.reload_configuration()
+                self.send_json(CONFIG.public(), HTTPStatus.ACCEPTED)
+            elif mutation and path == '/api/bootstrap/finish':
+                if not os.path.exists('/run/adfs-domain-ready'):
+                    raise ValueError('Domänenbeitritt ist noch nicht abgeschlossen')
+                body = self.read_json_body()
+                changes = body.get('values', {})
+                if not isinstance(changes, dict) or set(changes) != {'DOMAIN_USERS_SID', 'DOMAIN_ADMINS_SID', 'FSLOGIX_GROUP_SID'}:
+                    raise ValueError('Benutzer-, Administratoren- und FSLogix-Gruppe auswählen')
+                groups = {row['sid'] for row in self.domain_groups()}
+                if any(sid not in groups for sid in changes.values()):
+                    raise ValueError('Ausgewählte Gruppe ist nicht im aktuellen AD vorhanden')
+                identity = authenticate_user(body.get('username', snap['values']['JOIN_USER']), body.get('password', snap['values']['JOIN_PASSWORD']))
+                administrator = current_identity(identity['sid'], admin_sid=changes['DOMAIN_ADMINS_SID']) if identity else None
+                if not administrator or administrator['role'] != 'domain-admin':
+                    raise ValueError('Das Einrichtungskonto muss zur ausgewählten Administratorengruppe gehören')
+                result = CONFIG.save(changes, body.get('revision'), bootstrap=True)
+                CONFIG.finish(result['revision'])
+                self.send_json({'configured': True, 'hostname': CONFIG.snapshot()['values']['WEB_HOSTNAME']})
+            elif mutation and path == '/api/bootstrap/import':
+                body = self.read_json_body(262144)
+                if not CONFIG.import_legacy(configuration.parse_legacy(body.get('text', ''))):
+                    raise ValueError('Frühere Konfiguration ist unvollständig')
+                self.reload_configuration()
+                self.send_json({'configured': True})
+            else:
+                self.send_error_json(HTTPStatus.NOT_FOUND, 'Nicht gefunden')
+        except configuration.Conflict as exc:
+            self.send_error_json(HTTPStatus.CONFLICT, str(exc))
+        except (ValueError, TypeError, OSError, RuntimeError) as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+
+    def settings_write(self, path, user):
+        if CONFIG is None:
+            self.send_error_json(HTTPStatus.SERVICE_UNAVAILABLE, 'Einstellungen nicht verfügbar')
+            return
+        try:
+            body = self.read_json_body(262144)
+            with ACTION_LAUNCH_LOCK:
+                if lock_is_held(BACKUP_LOCK_FILE):
+                    raise configuration.Conflict('Während einer Sicherung können Einstellungen und Schlüssel nicht geändert werden')
+                if path == '/api/settings':
+                    values = body.get('values', {})
+                    if isinstance(values, dict) and any(key in values for key in ('DOMAIN_USERS_SID', 'DOMAIN_ADMINS_SID', 'FSLOGIX_GROUP_SID')):
+                        groups = {row['sid'] for row in self.domain_groups()}
+                        if any(values[key] not in groups for key in values if key in ('DOMAIN_USERS_SID', 'DOMAIN_ADMINS_SID', 'FSLOGIX_GROUP_SID')):
+                            raise ValueError('Ausgewählte Gruppe ist nicht im aktuellen AD vorhanden')
+                        if 'DOMAIN_ADMINS_SID' in values:
+                            identity = current_identity(user['sid'], admin_sid=values['DOMAIN_ADMINS_SID'])
+                            if not identity or identity['role'] != 'domain-admin':
+                                raise ValueError('Sie müssen Mitglied der ausgewählten Administratorengruppe sein')
+                    result = CONFIG.save(values, body.get('revision'))
+                    if 'DOMAIN_ADMINS_SID' in values:
+                        APP.tokens.sessions.recheck_all()
+                    result['restartRequired'] = any(configuration.FIELDS[key]['section'] != 'backup' for key in values)
+                elif path == '/api/settings/backup-key/generate':
+                    result = CONFIG.generate_key(str(user['jti']))
+                elif path == '/api/settings/backup-key/activate':
+                    result = CONFIG.activate_key(str(user['jti']), body.get('nonce'), body.get('writtenDown'), body.get('acknowledgeOldBackups'))
+                else:
+                    self.send_error_json(HTTPStatus.NOT_FOUND, 'Nicht gefunden')
+                    return
+            self.reload_configuration()
+            self.send_json(result)
+        except configuration.Conflict as exc:
+            self.send_error_json(HTTPStatus.CONFLICT, str(exc))
+        except (ValueError, TypeError, OSError) as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
 
     def security_headers(self, cache_control: str = "no-store", pdf_viewer: bool = False) -> None:
         self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
@@ -1019,6 +1149,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # pylint: disable=invalid-name
         parsed = urllib.parse.urlparse(self.path)
+        self.reload_configuration()
+        if parsed.path.startswith('/api/bootstrap/'):
+            self.bootstrap(parsed.path, mutation=True)
+            return
+        if CONFIG is not None and CONFIG.snapshot()['phase'] != 'configured':
+            self.send_error_json(HTTPStatus.SERVICE_UNAVAILABLE, 'Ersteinrichtung erforderlich')
+            return
         if not self.check_write_origin():
             return
         if parsed.path == "/api/login":
@@ -1076,6 +1213,9 @@ class Handler(BaseHTTPRequestHandler):
         if administrator is None:
             return
         parsed = parsed._replace(path=parsed.path[len("/admin"):])
+        if parsed.path == '/api/settings' or parsed.path.startswith('/api/settings/'):
+            self.settings_write(parsed.path, administrator)
+            return
         if parsed.path == "/api/documents/control":
             conn = documents.connect()
             try:
@@ -1186,9 +1326,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # pylint: disable=invalid-name,too-many-return-statements
         parsed = urllib.parse.urlparse(self.path)
+        self.reload_configuration()
         path = parsed.path
+        if path.startswith('/api/bootstrap/'):
+            self.bootstrap(path)
+            return
         if path == "/healthz":
+            if CONFIG is not None and CONFIG.snapshot()['phase'] == 'configured' and not os.path.exists('/run/adfs-services-ready'):
+                self.send_json({'status': 'starting', 'message': 'Dateidienste werden gestartet'}, HTTPStatus.SERVICE_UNAVAILABLE)
+                return
             self.send_json({"status": "ok"})
+            return
+        if CONFIG is not None and CONFIG.snapshot()['phase'] != 'configured' and not path.startswith('/assets/'):
+            if path.startswith('/api/') or path.startswith('/admin/api/'):
+                self.send_error_json(HTTPStatus.SERVICE_UNAVAILABLE, 'Ersteinrichtung erforderlich')
+            else:
+                self.serve_static('/setup')
             return
         if path.startswith("/api/"):
             user = self.require_user()
@@ -1220,6 +1373,12 @@ class Handler(BaseHTTPRequestHandler):
                         conn.close()
                 elif path == "/api/overview":
                     self.send_json(APP.overview())
+                elif path == '/api/settings':
+                    if CONFIG is None:
+                        raise ValueError('Einstellungen nicht verfügbar')
+                    self.send_json(CONFIG.public(params.get('section', [''])[0] or None))
+                elif path == '/api/settings/groups':
+                    self.send_json({'groups': self.domain_groups()})
                 elif path == "/api/access":
                     conn = directory.open_db()
                     try:
@@ -1383,6 +1542,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         files = {
+            '/setup': ('setup.html', 'text/html; charset=utf-8'),
+            '/assets/setup.js': ('setup.js', 'text/javascript; charset=utf-8'),
+            '/assets/settings.js': ('settings.js', 'text/javascript; charset=utf-8'),
             "/assets/portal.js": ("portal.js", "text/javascript; charset=utf-8"),
             "/assets/pdf-viewer.js": ("pdf-viewer.js", "text/javascript; charset=utf-8"),
             "/assets/pdf-viewer.css": ("pdf-viewer.css", "text/css; charset=utf-8"),
@@ -1473,7 +1635,9 @@ def serve_https() -> None:
 
 
 def main() -> int:
-    global APP
+    global APP, CONFIG
+    CONFIG = configuration.Store()
+    os.environ.update(CONFIG.environment())
     if not os.path.isfile(TLS_CERT_FILE) or not os.path.isfile(TLS_KEY_FILE):
         raise RuntimeError("TLS certificate or key is missing")
     APP = App()

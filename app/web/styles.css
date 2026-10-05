@@ -251,3 +251,19 @@ mark { background: #fff0a0; color: #111; }
   .document-dialog-head { gap: .5rem; }
   .document-dialog-head .row-actions { flex-wrap: nowrap; }
 }
+
+/* Setup and configuration use the existing typography, borders and controls. */
+.setup-main { max-width: 780px; margin: 2rem auto; padding: 0 1rem 2rem; }
+.settings-form { max-width: 700px; }
+.settings-form textarea, .settings-advanced textarea { width: 100%; padding: .4rem; font: inherit; border: 1px solid #999; resize: vertical; }
+.settings-check { display: flex; align-items: flex-start; gap: .5rem; }
+.settings-check input { width: auto; flex-shrink: 0; margin-top: .25rem; }
+.settings-tabs { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: 1rem; }
+.settings-tabs button[aria-pressed=true] { font-weight: bold; border-color: #111; background: #ddd; }
+.settings-encryption { padding: .8rem 0; border-top: 1px solid #ccc; border-bottom: 1px solid #ccc; }
+.settings-encryption p { margin: .4rem 0; overflow-wrap: anywhere; }
+.settings-advanced { margin-top: .8rem; }
+.recovery-words { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: .5rem 1.5rem; padding-left: 2rem; font-family: monospace; }
+.settings-key-dialog { width: min(660px,calc(100vw - 2rem)); }
+html:has(.settings-key-dialog[open]), body:has(.settings-key-dialog[open]) { overflow: hidden; }
+@media (max-width: 480px) { .recovery-words { grid-template-columns: repeat(2,minmax(0,1fr)); } .settings-encryption button { white-space: normal; } }

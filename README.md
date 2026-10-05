@@ -29,14 +29,14 @@ This repository provides a production-oriented Samba file server container that 
 - The administration console at `/admin/...` manages Data folders and individual user access, and provides statistics, logs, trash downloads/restores, manual backups, and share reconciliation. It also includes a fully client-side Typst PDF report.
 - Web sign-in validates the submitted username/password with Kerberos and issues an expiring JWT in a Secure, HttpOnly, SameSite=Strict cookie. Human AD users can sign in; `MSOL_*` and `krbtgt` accounts are excluded. Administration pages and APIs require membership in `DOMAIN_ADMINS_SID`. The browser does not use NTLM/SPNEGO or Kerberos negotiation.
 - HTTPS certificates are requested from a configured local Smallstep CA and renewed automatically. Pre-issued certificate files are also supported.
-- Optional remote backups run when `BACKUP_DESTINATION` and `BACKUP_ARCHIVE_PASSWORD` are configured; each active or archived group folder is uploaded as its own encrypted, non-solid 7z archive.
+- Optional remote backups are configured in the admin UI, including destination, scheduling and full-data encryption.
 - Private home creation skips well-known/service accounts by default (including `krbtgt`, `msol_*`, `FileShare_ServiceAcc`).
 - Reconciliation is executed:
   - once on startup
   - every 5 minutes via cron
 - Backup is executed:
   - manually through the Domain Admin web UI or CLI
-  - daily at `BACKUP_START_HOUR` in UTC when `BACKUP_AUTO_ENABLED=true` (default: `true`; the switch is environment-only)
+  - daily at the configured UTC hour when automatic backups are enabled in the UI
 
 ## Data Folder Lifecycle
 
@@ -71,7 +71,7 @@ The Data share uses Samba Windows ACL checks instead of POSIX ACLs. Keep its dat
 
 ## File Search and PDF Recognition
 
-Users sign in at `/` with their existing AD credentials using `username`, `DOMAIN\username`, or `username@domain`. Domain-qualified names accept the configured AD DNS domain/realm; the short NetBIOS domain is also accepted after `@`. The file view provides live search by filename and content, folder and file-type filters, grid/list views, previews, and downloads of the original files. Grid and list entries show file metadata without extracted content snippets. Only Domain Admins see the administration link and can use management pages and APIs under `/admin/...`; old administration URLs redirect there. Administrative APIs are under `/admin/api/...`, while sign-in, session, and document endpoints remain under `/api/...`. This upgrade expires existing web sessions.
+Users sign in at `/` with their existing AD credentials using `username`, `DOMAIN\username`, or `username@domain`. Domain-qualified names accept the configured AD DNS domain/realm; the short NetBIOS domain is accepted only with the `DOMAIN\username` spelling. The file view provides live search by filename and content, folder and file-type filters, grid/list views, previews, and downloads of the original files. Grid and list entries show file metadata without extracted content snippets. Only Domain Admins see the administration link and can use management pages and APIs under `/admin/...`; old administration URLs redirect there. Administrative APIs are under `/admin/api/...`, while sign-in, session, and document endpoints remain under `/api/...`. This upgrade expires existing web sessions.
 
 The catalog includes active Data folders and each user's own Private folder. Every search, detail, preview, and download request checks current individual folder permissions. Revoking access or archiving a folder takes effect without waiting for reindexing. Domain Admins can see all active Data folders, but the user file view still shows only their own Private folder. Archived folders, recycle repositories, FSLogix profiles, symlinks, nested mounts, and special files are excluded. `Thumbs.db` (case-insensitive) and Office lock files whose names start with `~$` are omitted from results, counts and file-type filters in both Data and Private folders. Upgrades remove their existing catalog entries without deleting original files. Private files additionally require ownership and read/traverse permissions for the signed-in user's mapped Unix identity.
 
@@ -102,7 +102,7 @@ Domain Admins monitor the worker at `/admin/documents`: current file and phase, 
 | `DOCUMENT_MAX_FILE_MB` | `512` | Largest file copied for extraction; larger files use filename search |
 | `DOCUMENT_MAX_PDF_PAGES` | `500` | Maximum PDF page count for extraction |
 
-These settings are passed through the existing Compose environment file. Setting `WEB_ENABLED=false` also disables the document worker.
+These settings are configured under Dokumentindex und OCR at `/admin/settings`. Their internal names below also identify imported legacy settings.
 
 ## Shared SQLite State Database
 
@@ -127,7 +127,7 @@ Standard SQLite does not provide transparent general-purpose compression, so thi
 ## AD Requirements
 
 - Existing AD DS domain reachable from the Docker host.
-- Initial admin credentials with rights to create/reset `FileShare_ServiceAccount` during `./setup`.
+- An AD account with permission to join the server to the domain and read directory users/groups.
 - `FileShare_ServiceAccount` must be allowed to join computers to the domain (`net ads join`) in your AD policy.
 - Directory reads use machine-account LDAP (`net ads search -P`); join credentials are only used as a fallback LDAP bind path.
 - Existing AD users are selectable by the administrator; no AD group naming convention is required for new Data folders.
@@ -140,7 +140,7 @@ Standard SQLite does not provide transparent general-purpose compression, so thi
 - Preferred setup: Docker host uses AD-integrated DNS or forwards to AD DNS.
 - If Docker bridge networking is used, set `AD_DNS_IP` to the Docker host LAN IP that clients should use for SMB, not the container `172.x` address.
 - When `AD_DNS_IP` is set, domain join uses `--no-dns-updates`; each container startup unregisters/re-registers `AD_DNS_NAME -> AD_DNS_IP` in AD DNS using the machine account.
-- `./setup` and `./redeploy` auto-refresh `AD_DNS_IP` from the host route when `AD_DNS_IP_AUTO=1`.
+- Configure the host LAN address used for AD DNS registration in the web setup or server settings.
 
 ## Time Sync Requirements
 
@@ -202,6 +202,16 @@ Password: PreviewAdmin123!
 
 The generated CA is intentionally disposable. `scripts/dev` prints the temporary root certificate path so it can be trusted only for the duration of that run. Ctrl-C stops and removes all run-scoped containers, volumes, the network, and the temporary root. A watchdog performs the same cleanup if the parent script is killed.
 
+To test first-launch onboarding with empty configuration and data, run:
+
+```bash
+./scripts/dev --onboarding
+```
+
+Open `http://files.localhost:8080/`. This mode starts the same disposable AD, CA, and rsync target, but supplies no application configuration through environment variables and skips file seeding, automatic domain join, the SMB activity client, and the backup driver. Only the external HTTPS port mapping is recorded for correct setup links and browser origin checks.
+
+The launcher prints both setup codes, the ACME directory, the root certificate file to upload, domain credentials, group names, and the optional backup destination. Configure HTTPS first, temporarily trust the disposable CA root, then follow the link to `https://files.localhost:8443/` to complete domain setup. Configure backups afterwards in `/admin/settings`. Each launch starts fresh; Ctrl-C removes that run's configuration and test data. `--onboarding` and `--e2e` are mutually exclusive.
+
 Neither the dummy DC nor the application container receives extra capabilities.
 
 Useful overrides:
@@ -209,6 +219,7 @@ Useful overrides:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DEV_HTTPS_PORT` | `8443` | HTTPS port bound to host loopback |
+| `DEV_HTTP_PORT` | `8080` | HTTP setup port bound to host loopback in `--onboarding` mode |
 | `DEV_WEB_HOSTNAME` | `files.localhost` | HTTPS name validated by the disposable ACME CA |
 | `DEV_SKIP_BUILD` | `0` | Set to `1` to reuse already-built local images |
 | `DEV_CA_IMAGE` | `docker.io/smallstep/step-ca:latest` | CA image; pin a tag or digest for reproducible CI |
@@ -271,62 +282,17 @@ node tests/access_ui_smoke.mjs
 
 ## Setup
 
-1. Run interactive setup:
+No environment file is required. Run `./setup` to build and start the service, then open `http://<server>/`. HTTP exposes only HTTPS configuration: enter the separate HTTPS setup code from `docker compose logs samba`, choose the HTTPS hostname and ACME directory URL, and optionally upload a PEM root CA certificate. Public CAs use the system trust bundle. The ACME CA must resolve the hostname and reach its HTTP-01 challenge on port 80.
 
-   ```bash
-   ./setup
-   ```
+Once issuance succeeds, follow the HTTPS link. Enter the second, independent setup code from the container log. This code is used only over HTTPS. Configure the AD realm, NetBIOS domain, controller, domain-join/LDAP credentials and server names. After the domain join succeeds, select the AD groups for login, administration and FSLogix, and verify an account in the selected administrator group. Folder permissions remain individual assignments.
 
-2. If `.env` is missing, you will be prompted for:
-   - `REALM`
-   - `WORKGROUP`
-   - `DOMAIN`
-   - `AD_DNS_IP` (host LAN IP to publish in AD DNS)
-   - optional `AD_DNS_NAME` (defaults to `SAMBA_HOSTNAME.DOMAIN`)
-   - initial admin credentials (used once for provisioning)
-   - `DOMAIN_USERS_SID`
-   - `DOMAIN_ADMINS_SID`
-   - optional `FSLOGIX_GROUP_SID` (defaults to `DOMAIN_USERS_SID`)
-   - optional `BACKUP_DESTINATION` (empty disables backup)
-   - `BACKUP_ARCHIVE_PASSWORD` when a backup destination is configured
-   - optional environment-only `BACKUP_AUTO_ENABLED` (`true` or `false`, default `true`)
-   - optional `BACKUP_START_HOUR` (0-23, default `2`; used only when automatic backups are enabled)
-   - optional `BACKUP_RETENTION_DAILY` (default `3`)
-   - optional `BACKUP_RETENTION_WEEKLY` (default `2`)
-   - optional `BACKUP_RETENTION_MONTHLY` (default `2`)
-   - optional `BACKUP_RETENTION_YEARLY` (default `1`)
-   - optional `BACKUP_LOG_FILE` (default `/var/log/backup.log`)
-   - optional `BACKUP_PROGRESS` (`auto`, `always`, or `never`; default `auto`)
-   - optional `BACKUP_PROGRESS_INTERVAL_SECONDS` (default `10`)
-   - `WEB_HOSTNAME` (the DNS name in the HTTPS certificate)
-   - optional `WEB_HTTPS_PORT` (host port, default `443`)
-   - `ACME_CA_SERVER` (ACME directory URL)
-   - either an ACME CA root bundle on the host or an `ACME_CA_CERTIFICATES_URL` for one-time retrieval
-   - optional `ACME_HTTP_PORT` (HTTP-01 host port, default `80`)
+The web UI remains available if joining AD fails. Correct the settings and retry without removing any data volumes. The setup capability stops working after completion. Domain-join credentials are retained for LDAP; use an account with the necessary directory read and join permissions, or replace its credentials in administration after joining.
 
-   Setup generates a random `WEB_JWT_SECRET` and either imports the selected public CA root or configures its one-time download to `/state/tls/acme-ca-certificates.pem`.
+Administrators manage server settings at `/admin/settings` and backup destinations, schedules, retention and encryption at `/admin/backup`. Settings are stored in the root-only `/state/configuration.db`. Backup changes apply to the next run. Other changes restart the service processes, preserving files and the existing domain join; active SMB connections may reconnect. Switching to a different AD domain is deliberately rejected after setup.
 
-   Optional:
-   - `SAMBA_HOSTNAME` (defaults to `adsambafsrv`)
-   - `NETBIOS_NAME` (defaults to `ADSAMBAFSRV`, max 15 chars)
+For an existing installation, run `./setup` or `./redeploy`: the previous container’s resolved configuration is imported once when available; otherwise, its `.env` is imported without executing it. The original domain join, storage paths, access database, volumes, backup password, destinations and backup history are preserved. A configured installation ignores later `.env` edits. An unconfigured installation can also import its old file from the HTTPS setup screen. Keep the same Compose project name and volume names during the upgrade. Never use `docker compose down -v` on retained data.
 
-3. Setup behavior:
-   - creates or updates AD service account from desired name `FileShare_ServiceAccount`
-   - uses a valid AD `sAMAccountName` (max 20 chars); default effective value is `FileShare_ServiceAcc`
-   - always sets a long random password
-   - writes only service-account credentials to `.env` (initial admin credentials are not stored)
-   - writes `AD_DNS_IP` so container restarts keep AD DNS pointed at the host LAN IP
-
-4. The setup script then starts the service with:
-
-   ```bash
-   docker compose up -d
-   ```
-
-5. After startup:
-    - container joins AD (idempotent)
-    - startup reconciliation runs
-    - cron runs reconciliation every 5 minutes
+Compose publishes fixed ports 80 and 443, plus SMB 139 and 445. A deployment requiring different host ports can use a Compose override; it does not configure application credentials or backup destinations. TLS, AD settings and backup configuration are managed in the browser.
 
 ## SMB Shares
 
@@ -393,7 +359,7 @@ The console is intentionally operational and plain:
 
 The PDF report deliberately excludes the activity log and backup log. Its dedicated snapshot endpoint removes those fields before returning data. Typst, its WebAssembly compiler, and the report fonts are shipped with the application; Typst source and PDF bytes are created only in the authenticated browser and are never uploaded to another service. The first export downloads roughly 22 MiB of compiler/font assets, which are then cached as immutable files. The CSP grants only `'wasm-unsafe-eval'` for WebAssembly compilation and does not enable JavaScript `'unsafe-eval'`.
 
-The mutation endpoints under `/admin/api/` manage Data access, restore retained files, control indexing, or start an immediate backup/share reconciliation. They require an active Domain Admin session and CSRF protection. Restore cannot overwrite a live file. Backup schedules, retention, and `BACKUP_AUTO_ENABLED` are configured through the environment. Automatic backups can be enabled or disabled only through the environment and therefore require a redeployment/restart.
+The mutation endpoints under `/admin/api/` manage Data access, restore retained files, control indexing, or start an immediate backup/share reconciliation. They require an active Domain Admin session and CSRF protection. Restore cannot overwrite a live file. Backup schedules, destinations, retention and encryption are configured through `/admin/backup`, without redeploying.
 
 ### Authentication and sessions
 
@@ -406,88 +372,13 @@ The mutation endpoints under `/admin/api/` manage Data access, restore retained 
 - TLS handshakes run in bounded connection workers, outside the accept loop, with a five-second timeout. Request I/O also has a timeout.
 - Responses set HSTS, a restrictive Content Security Policy, clickjacking protection, and MIME sniffing protection. APIs and ordinary UI assets use no-store caching; pinned Typst compiler/font assets use immutable long-term caching.
 
-### TLS with an internal ACME CA
+### HTTPS and certificate management
 
-The default uses standard ACME HTTP-01 enrollment. The names deliberately describe the protocol and inputs rather than a particular CA product:
+The HTTP onboarding step accepts only an ACME directory URL without credentials, a hostname and an optional PEM root CA upload. Its setup code cannot access the HTTPS configuration API. HTTP rejects login, AD settings, backup settings and every administrative action. After onboarding, ordinary HTTP requests redirect to HTTPS; the ACME challenge route remains available for renewals. Challenges are forwarded to a loopback-only responder.
 
-```env
-WEB_ENABLED=true
-WEB_HOSTNAME=files.example.com
-WEB_HTTPS_PORT=443
-WEB_JWT_SECRET=<at-least-32-random-bytes>
-WEB_TLS_MODE=acme
-ACME_CA_SERVER=https://ca.internal/acme/acme/directory
-ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem
-ACME_CA_CERTIFICATES_URL=https://ca.internal/roots.pem
-ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=true
-ACME_HTTP_LISTEN=:80
-ACME_HTTP_PORT=80
-```
+In `/admin/settings`, choose ACME, Smallstep CA, uploaded certificate/key PEM, or a self-signed certificate. ACME and CA credentials, custom trust roots, renewal intervals and uploaded private keys are entered over HTTPS. A temporary self-signed certificate keeps HTTPS setup reachable before managed issuance succeeds. Uploaded certificate/key pairs are validated before replacing working files. Certificate changes reload the HTTPS listener.
 
-`ACME_CA_CERTIFICATES` is the persistent destination inside the file-server container. If that path does not exist and `ACME_CA_CERTIFICATES_URL` is set, the service downloads at most 4 MiB over HTTPS, validates that the result contains readable certificate data, and atomically installs it. Once the destination exists, it is never downloaded or overwritten again—not even when it is empty or invalid. Removing the file is therefore an explicit operator action that permits a new bootstrap download.
-
-HTTPS verification is enabled by default. `ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=true` explicitly enables a one-time trust-on-first-use bootstrap equivalent to `curl -k`; it is useful when the server certificate is signed by the very root being fetched. This protects subsequent starts but cannot protect the first download from a man-in-the-middle attack, so compare the downloaded root fingerprint through an independent channel when possible. Instead of downloading, setup can import a local PEM bundle into the same destination.
-
-The CA must be able to resolve `WEB_HOSTNAME` and reach `http://WEB_HOSTNAME/.well-known/acme-challenge/...` on port 80. `ACME_HTTP_LISTEN` controls the in-container standalone challenge listener and `ACME_HTTP_PORT` controls the Compose host-port mapping.
-
-The equivalent Traefik settings translate as follows:
-
-| Traefik setting | File-server setting |
-| --- | --- |
-| `acme.httpchallenge=true` | `WEB_TLS_MODE=acme` |
-| `acme.httpchallenge.entrypoint=http` | `ACME_HTTP_LISTEN=:80` and `ACME_HTTP_PORT=80` |
-| `acme.caserver=https://ca.internal/acme/acme/directory` | `ACME_CA_SERVER=https://ca.internal/acme/acme/directory` |
-| `acme.cacertificates=/traefik/stepca/roots.pem` | `ACME_CA_CERTIFICATES=<persistent PEM destination inside this container>` |
-| one-time equivalent of `curl https://ca.internal/roots.pem -k` | `ACME_CA_CERTIFICATES_URL=https://ca.internal/roots.pem` and `ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=true` |
-
-The client uses [`step ca certificate --acme --root --standalone`](https://smallstep.com/docs/step-cli/reference/ca/certificate/) and periodically checks whether the certificate needs renewal. Renewal is a fresh ACME order, so this mode is not coupled to a proprietary renewal endpoint. The HTTPS listener reloads the replaced certificate files.
-
-A generic direct-CA/JWK or token enrollment mode remains available when ACME HTTP-01 cannot be routed:
-
-```env
-WEB_TLS_MODE=ca
-TLS_CA_URL=https://ca.internal:9000
-TLS_CA_FINGERPRINT=<root-certificate-fingerprint>
-TLS_CA_PROVISIONER=fileserver
-TLS_CA_PROVISIONER_PASSWORD=<provisioner-password>
-# TLS_CA_PROVISIONER_PASSWORD_FILE=/run/secrets/ca-provisioner-password
-# TLS_CA_TOKEN=<single-use-bootstrap-token>
-# TLS_CA_REBOOTSTRAP=false
-# TLS_CA_STATE_DIR=/state/tls-client
-```
-
-Externally managed certificate files can be used instead:
-
-```env
-WEB_TLS_MODE=files
-WEB_TLS_CERT_FILE=/state/tls/web.crt
-WEB_TLS_KEY_FILE=/state/tls/web.key
-```
-
-Useful optional settings:
-
-| Variable | Default | Purpose |
-| --- | ---: | --- |
-| `ACME_CA_CERTIFICATES_URL` | unset | HTTPS URL used only when the persistent root bundle does not exist |
-| `ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD` | `false` | Disable TLS verification only for that initial root download |
-| `WEB_TLS_AUTORENEW` | `true` | Renew managed certificates automatically |
-| `ACME_RENEW_CHECK_SECONDS` | `900` | Interval for ACME renewal checks; minimum 60 seconds |
-| `WEB_JWT_TTL_SECONDS` | `28800` | Session lifetime, 5 minutes to 7 days |
-| `WEB_AUTH_RECHECK_SECONDS` | `60` | Session identity/role recheck interval via winbind, 5 to 300 seconds |
-| `WEB_TRUSTED_ORIGINS` | derived | Comma-separated exact HTTPS origins; default uses `WEB_HOSTNAME` and `WEB_HTTPS_PORT` |
-| `WEB_LOGIN_ATTEMPTS_PER_5_MIN` | `10` | Per-address login attempt limit, including successful attempts |
-| `WEB_LOGIN_ACCOUNT_ATTEMPTS_PER_5_MIN` | `10` | Per-target-account login attempt limit across client addresses |
-| `WEB_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `5` | TLS handshake deadline, 1 to 30 seconds |
-| `WEB_REQUEST_TIMEOUT_SECONDS` | `30` | Request I/O timeout, 1 to 300 seconds |
-| `WEB_MAX_CONNECTIONS` | `64` | Concurrent connection workers, 4 to 512; excess connections are closed |
-| `WEB_USAGE_SCAN_INTERVAL_SECONDS` | `900` | Recursive storage scan interval |
-| `WEB_DIRECTORY_CACHE_SECONDS` | `300` | AD membership tree cache time |
-| `TRASH_RETENTION_DAYS` | `7` | Recycled-file lifetime; cleanup accepts 1 to 365 days |
-| `STATE_DB_PATH` | `/state/shares.db` | Shared SQLite database for shares, activity, collector offsets, and caches |
-| `AUDIT_QUERY_MAX_DAYS` | `31` | Largest activity query window |
-| `AUDIT_SKIP_USER_SUFFIXES` | `_svc,_ServiceAcc` | Case-insensitive account suffixes excluded from collection and queries; set empty to disable |
-
-If `WEB_ENABLED` is absent on an upgraded installation and no TLS settings/certificate exist, the web service stays disabled while Samba and audit collection continue. Set `WEB_ENABLED=true` after adding TLS configuration.
+The client uses [`step ca certificate --acme --root --standalone`](https://smallstep.com/docs/step-cli/reference/ca/certificate/). Automatic ACME renewal checks default to every 900 seconds. If using a private CA, also install its root in clients' trust stores. Certificate provisioning errors leave the web setup available for correction.
 
 ## Activity Database
 
@@ -510,61 +401,19 @@ Collection starts even when the web UI is disabled. Existing databases remain qu
 
 ## Backups
 
-- Backups are available only if `BACKUP_DESTINATION` is non-empty and `BACKUP_ARCHIVE_PASSWORD` is set.
-- Each run creates a timestamped snapshot under `snapshots/YYYYMMDDTHHMMSSZ` at the destination.
-- `BACKUP_AUTO_ENABLED=true` schedules the job daily at `BACKUP_START_HOUR` in UTC. With `false`, no backup cron entry is installed; manual web and CLI runs remain available. This setting is environment-only and cannot be changed through the web API.
-- The container and Compose service force `TZ=Etc/UTC`.
-- Sources synced to destination on each run:
-  - `/data/private` -> `data/private`
-  - `/data/groups` -> `data/groups`; direct group directories below `data` and `archive` become one `<group>.7z` each
-  - `/data/fslogix` -> `data/fslogix`
-  - `/state` -> `state` (the live WAL database is replaced by a consistent SQLite online snapshot)
-  - `/var/lib/samba/private` -> `samba/private`
-- Retention policy env vars (defaults):
-  - `BACKUP_RETENTION_YEARLY=1`
-  - `BACKUP_RETENTION_MONTHLY=2`
-  - `BACKUP_RETENTION_WEEKLY=2`
-  - `BACKUP_RETENTION_DAILY=3`
-- The backup script writes directly to `BACKUP_LOG_FILE` (default: `/var/log/backup.log`). Cron does not redirect backup output into the logfile.
-- Before uploading, the backup script creates a temporary, integrity-checked SQLite online snapshot of the shared state database.
-- Each direct active and archived group folder is then compressed with LZMA2 at level 5 and multithreading into one non-solid (`-ms=off`) 7z archive. Header/data encryption is enabled (`-mhe=on`); the password comes only from `BACKUP_ARCHIVE_PASSWORD` and is supplied to 7z through stdin, never as a process argument. Non-group entries below `/data/groups` are preserved unchanged.
-- `BACKUP_ARCHIVE_TEMP_DIR` selects the local staging directory (default `/tmp`). It must have enough free space for the compressed group archives. Staging data is removed after success or failure.
-- Losing `BACKUP_ARCHIVE_PASSWORD` makes the group archives unrecoverable; keep it in the same secret-management system as the remote-backup credentials.
-- After staging, the script measures all upload sources so it can report total transfer progress.
-- Upload progress is logged per file every `BACKUP_PROGRESS_INTERVAL_SECONDS` seconds and again when a file reaches 100%, including percentage and transferred/remaining bytes with auto-scaled units.
-- `BACKUP_PROGRESS=auto` shows an interactive multi-line progress view only for TTY/manual runs. Current file uploads are shown as separate rows, capped at 12 rows, with the total progress row at the bottom. Use `always` to force it or `never` to suppress the bar. File and total progress are still logged.
-- Every run atomically updates `BACKUP_STATUS_FILE` (default `/state/backup-status.json`) with its state, current source, active files, byte totals, percentage, snapshot, and final result for the live web view.
-- Active status is reconciled against the kernel-held `/state/backup.lock`; if a container restart or forced termination releases the lock while status still says `starting` or `running`, the web API atomically records the run as interrupted instead of reporting a phantom backup.
-- Rclone-backed destinations cap concurrent file transfers at 12. Rsync remains single-streamed by rsync itself.
-- Retention logic:
-  - daily: newest N snapshots
-  - weekly: newest N snapshots created on week start (Monday)
-  - monthly: newest N snapshots created on day 1
-  - yearly: newest N snapshots created on Jan 1
-  - snapshots selected by any tier are retained; all others are pruned
-- Supported destination schemes:
-  - `rsync://user:pass@host/module/path`
-  - `smb://user:pass@host/share/path` (domain user example: `smb://DOMAIN%5Cuser:pass@host/share/path`)
-  - `davfs://user:pass@host/path` (WebDAV over HTTPS)
-  - `sftp://user:pass@host/path`
-- Username/password components should be URL-encoded when they contain reserved characters (`@`, `:`, `/`, `\`, `%`, `#`, `?`).
+Configure backups entirely in `/admin/backup`: destination, automatic daily start hour (UTC), retention counts and optional encryption. Supported targets are rsync, SFTP, SMB and WebDAV; for example `sftp://backupuser:password@backup.example.com/exports/samba`. URL-encode reserved characters in credentials. Stored destination passwords are never returned to the browser; the UI shows only the protocol, server and path. Removing the destination disables future backups without deleting remote history.
 
-- Example:
+Backups include Private files, active and archived Data folders, FSLogix, persistent server configuration/access records and Samba private state. Both SQLite databases use integrity-checked online snapshots. The rebuildable document index and previews, and retained trash, are omitted. Originals remain unchanged. The UI provides manual start, progress, current transfers and logs. Configuration and key changes are blocked while a backup is running.
 
-  ```env
-  BACKUP_DESTINATION=sftp://backupuser:StrongPassword@sftp.example.com/exports/samba
-  BACKUP_ARCHIVE_PASSWORD=use-a-long-random-secret
-  BACKUP_AUTO_ENABLED=true
-  BACKUP_START_HOUR=2
-  BACKUP_ARCHIVE_TEMP_DIR=/tmp
-  BACKUP_RETENTION_DAILY=3
-  BACKUP_RETENTION_WEEKLY=2
-  BACKUP_RETENTION_MONTHLY=2
-  BACKUP_RETENTION_YEARLY=1
-  BACKUP_LOG_FILE=/var/log/backup.log
-  BACKUP_PROGRESS=auto
-  BACKUP_PROGRESS_INTERVAL_SECONDS=10
-  ```
+When encryption is enabled, all sources—including credentials and server state—are staged as AES-256 7z archives with encrypted filenames/headers. Only encrypted archives and public format/key identifiers are uploaded. Generate a 24-word recovery phrase and confirm you recorded it before activating the key. It is displayed once, never persisted as a phrase, and expires after 15 minutes if not confirmed. The server retains the derived key so unattended backups work; protect the state volume and the Docker host accordingly. Encrypted staging requires space for a complete compressed backup.
+
+Key renewal creates a separate `keys/<key-id>/snapshots/` generation. Existing backups stay in their previous location and require their previous phrase or legacy password. Retention affects only the active generation; older key generations are never pruned by a new key. Losing an old phrase or password makes that generation unrecoverable. Disabling encryption after using a generated key writes a separate `plain/` generation, keeping encrypted history separate. Existing installations retain their previous backup format/password until encryption is deliberately enabled or renewed.
+
+Retention defaults are 3 daily, 2 weekly, 2 monthly and 1 yearly snapshots. Each tier selects its newest eligible snapshots; the union is kept. Snapshot names are UTC timestamps, and an incomplete upload is not marked complete. A interrupted job is detected from the backup lock rather than shown as running indefinitely.
+
+To recover a generated-key archive offline, use `python3 app/restore_backup.py ARCHIVE.7z NEW_RECOVERY_DIRECTORY` with Python and 7z installed. The tool prompts for the phrase without echoing it, derives the key and extracts only into a new directory. Inspect the files before copying anything into live volumes. It refuses to overwrite an existing recovery directory. Legacy archives still use their original archive password.
+
+The versioned key format is `adfs-backup-archive-v1`: standard BIP39 English phrase/checksum and seed derivation (empty BIP39 passphrase), then PBKDF2-HMAC-SHA512 with that seed as the password, ASCII salt `adfs-backup-archive-v1`, one iteration, 32-byte output, lowercase hexadecimal. This becomes the archive password used by 7z's own AES-256 key derivation. The key identifier is the first 24 hexadecimal characters of SHA-256 of that ASCII password. The wordlist and license are bundled, so offline recovery does not depend on a network service.
 
 ## Useful Commands
 
@@ -572,7 +421,7 @@ Collection starts even when the web UI is disabled. Existing databases remain qu
 docker compose logs -f samba
 docker compose logs -f samba | grep -E '\\[web\\]|\\[audit\\]'
 docker compose exec samba python3 /app/reconcile_shares.py
-docker compose exec samba python3 /app/backup_to_destination.py
+docker compose exec samba python3 /app/run_service.py backup_to_destination.py
 docker compose exec samba sqlite3 /state/shares.db 'PRAGMA quick_check;'
 docker compose exec samba sqlite3 /state/shares.db 'SELECT action, count(*) FROM audit_events GROUP BY action;'
 docker compose exec samba testparm -s
@@ -586,7 +435,7 @@ docker compose exec samba python3 -m json.tool /state/reconcile-status.json
 
 ### Domain join fails
 
-- Verify service account credentials in `.env`.
+- Verify the stored domain-join/LDAP credentials in `/admin/settings`.
 - Verify DNS resolution from container:
 
   ```bash
@@ -603,7 +452,7 @@ docker compose exec samba python3 -m json.tool /state/reconcile-status.json
 ### AD DNS points at 172.x
 
 - This means Samba registered the container bridge IP.
-- Ensure `.env` contains `AD_DNS_IP=<host LAN IP>` and `AD_DNS_NAME=<server FQDN>`.
+- Set the AD DNS registration address and name in `/admin/settings` → Server und DNS.
 - Recreate/restart the container so startup re-registers AD DNS:
 
   ```bash

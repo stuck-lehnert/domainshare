@@ -968,6 +968,7 @@ def prepare_state_snapshot(
         database_relative,
         f"{database_relative}-wal",
         f"{database_relative}-shm",
+        'configuration.db', 'configuration.db-wal', 'configuration.db-shm',
     }
 
     def ignore_live_database(directory: str, names: List[str]) -> Set[str]:
@@ -1002,6 +1003,18 @@ def prepare_state_snapshot(
             finally:
                 destination.close()
                 source.close()
+        configuration_path = os.path.join(state_root, 'configuration.db')
+        if os.path.isfile(configuration_path):
+            source = sqlite3.connect(f'file:{configuration_path}?mode=ro', uri=True, timeout=30)
+            destination = sqlite3.connect(os.path.join(staged_state, 'configuration.db'))
+            os.chmod(os.path.join(staged_state, 'configuration.db'), 0o600)
+            try:
+                source.backup(destination)
+                if destination.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+                    raise RuntimeError('Configuration snapshot failed its integrity check')
+            finally:
+                destination.close()
+                source.close()
         return temporary_root, staged_state
     except Exception:
         shutil.rmtree(temporary_root, ignore_errors=True)
@@ -1019,7 +1032,7 @@ def archive_password() -> str:
     return password
 
 
-def create_group_archive(source_path: str, archive_path: str, password: str) -> None:
+def create_group_archive(source_path: str, archive_path: str, password: Optional[str]) -> None:
     os.makedirs(os.path.dirname(archive_path), exist_ok=True)
     source_parent = os.path.dirname(source_path)
     source_name = os.path.basename(source_path)
@@ -1032,14 +1045,15 @@ def create_group_archive(source_path: str, archive_path: str, password: str) -> 
             "-mx=5",
             "-mmt=on",
             "-ms=off",
-            "-mhe=on",
-            "-p",
+            *(['-mhe=on', '-p'] if password else []),
+            '-snl',
+            '-xr!.trash',
             "-y",
             archive_path,
             "--",
             source_name,
         ],
-        input_text=f"{password}\n",
+        input_text=f"{password}\n" if password else None,
         check=False,
         env=os.environ.copy(),
         cwd=source_parent,
@@ -1151,6 +1165,29 @@ def available_sources(
         else:
             log(f"Skipping missing source: {source_path}")
     return sources
+
+
+def prepare_encrypted_sources(sources, password, temporary_parent=None):
+    """Encrypt every original/configuration source, including archive headers."""
+    root = tempfile.mkdtemp(prefix='backup-encrypted-', dir=temporary_parent or None)
+    staged = os.path.join(root, 'encrypted')
+    os.makedirs(staged)
+    try:
+        for source_path, destination_path in sources:
+            name = destination_path.replace('/', '-') + '.7z'
+            if BACKUP_STATUS is not None:
+                BACKUP_STATUS.write(state='running', currentSource=destination_path,
+                                    message=f'Encrypting {destination_path}', activeFiles=[])
+            create_group_archive(source_path, os.path.join(staged, name), password)
+        metadata = {'format': os.getenv('BACKUP_KEY_FORMAT', '7z-aes256'),
+                    'keyId': os.getenv('BACKUP_KEY_ID', ''), 'encrypted': True,
+                    'archives': [destination.replace('/', '-') + '.7z' for _, destination in sources]}
+        with open(os.path.join(staged, 'backup-format.json'), 'w') as handle:
+            json.dump(metadata, handle)
+        return root, [(staged, 'encrypted')]
+    except BaseException:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
 
 
 def format_host(hostname: str) -> str:
@@ -1693,6 +1730,11 @@ def run_backup() -> int:
     interactive_progress = should_show_progress_bar(progress_mode)
 
     destination = parse_destination(destination_url)
+    namespace = os.getenv('BACKUP_NAMESPACE', '').strip('/')
+    if namespace:
+        if not re.fullmatch(r'keys/[a-f0-9]{24}|plain', namespace):
+            raise ValueError('Invalid backup key namespace')
+        destination.path = destination.path.rstrip('/') + '/' + namespace
     BACKUP_STATUS = BackupStatus(
         os.getenv("BACKUP_STATUS_FILE", DEFAULT_BACKUP_STATUS_FILE).strip()
     )
@@ -1703,6 +1745,7 @@ def run_backup() -> int:
     backend = None
     state_snapshot_root = None
     group_archive_root = None
+    encrypted_root = None
     try:
         state_snapshot = None
         if os.path.isdir(STATE_ROOT):
@@ -1710,21 +1753,23 @@ def run_backup() -> int:
             state_snapshot_root, state_snapshot = prepare_state_snapshot()
 
         groups_snapshot = None
-        if os.path.isdir(GROUPS_SOURCE_PATH):
+        encrypted = os.getenv('BACKUP_ENCRYPTION_ENABLED', 'false').lower() == 'true'
+        if os.path.isdir(GROUPS_SOURCE_PATH) and not encrypted:
             BACKUP_STATUS.write(
                 state="running",
                 currentSource="data/groups",
-                message="Creating encrypted group archives",
+                message="Creating group archives",
             )
-            group_archive_root, groups_snapshot, archive_count = prepare_group_archives(
-                password=archive_password()
-            )
-            log(f"Created {archive_count} encrypted non-solid group archive(s)")
+            group_archive_root, groups_snapshot, archive_count = prepare_group_archives(password='' if os.getenv('BACKUP_KEY_ID') else os.getenv('BACKUP_ARCHIVE_PASSWORD', ''))
+            log(f"Created {archive_count} non-solid group archive(s)")
 
         sources = available_sources(state_snapshot, groups_snapshot)
         if not sources:
             log("No backup sources are available, skipping backup")
             return 0
+        if encrypted:
+            encrypted_root, sources = prepare_encrypted_sources(sources, archive_password(),
+                os.getenv('BACKUP_ARCHIVE_TEMP_DIR', DEFAULT_ARCHIVE_TEMP_DIR))
 
         backend = build_backend(destination)
         log(f"Starting backup to {redact_destination(destination.raw_url)}")
@@ -1784,6 +1829,8 @@ def run_backup() -> int:
             shutil.rmtree(state_snapshot_root, ignore_errors=True)
         if group_archive_root is not None:
             shutil.rmtree(group_archive_root, ignore_errors=True)
+        if encrypted_root is not None:
+            shutil.rmtree(encrypted_root, ignore_errors=True)
 
 
 def with_lock() -> int:

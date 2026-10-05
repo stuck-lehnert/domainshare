@@ -355,7 +355,7 @@ selected_tls_mode() {
         printf 'ca'
       fi
       ;;
-    acme|ca|files) printf '%s' "$WEB_TLS_MODE" ;;
+    acme|ca|files|self-signed) printf '%s' "$WEB_TLS_MODE" ;;
     *) return 1 ;;
   esac
 }
@@ -458,7 +458,7 @@ configure_web_tls() {
   local provisioner_password_file=""
 
   if ! tls_mode="$(selected_tls_mode)"; then
-    printf '[init] ERROR: WEB_TLS_MODE must be acme, ca, or files\n' >&2
+    printf '[init] ERROR: WEB_TLS_MODE must be self-signed, acme, ca, or files\n' >&2
     return 1
   fi
   export ACTIVE_WEB_TLS_MODE="$tls_mode"
@@ -468,6 +468,10 @@ configure_web_tls() {
   export WEB_TLS_KEY_FILE="${WEB_TLS_KEY_FILE:-/state/tls/web.key}"
   export STEPPATH="${TLS_CA_STATE_DIR:-/state/tls-client}"
   mkdir -p "$(dirname "$WEB_TLS_CERT_FILE")" "$(dirname "$WEB_TLS_KEY_FILE")" "$STEPPATH"
+
+  if [[ "$tls_mode" == "self-signed" ]]; then
+    return
+  fi
 
   if [[ "$tls_mode" == "files" ]]; then
     if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" ]]; then
@@ -481,8 +485,9 @@ configure_web_tls() {
     require_env ACME_CA_SERVER
     require_env ACME_CA_CERTIFICATES
     ensure_acme_ca_certificates
-    if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" ]]; then
+    if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" || -f "$(dirname "$WEB_TLS_CERT_FILE")/bootstrap-certificate" ]]; then
       request_acme_certificate
+      rm -f "$(dirname "$WEB_TLS_CERT_FILE")/bootstrap-certificate"
     fi
     return
   fi
@@ -495,7 +500,7 @@ configure_web_tls() {
     step ca bootstrap --force --ca-url "$TLS_CA_URL" --fingerprint "$TLS_CA_FINGERPRINT"
   fi
 
-  if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" ]]; then
+  if [[ ! -s "$WEB_TLS_CERT_FILE" || ! -s "$WEB_TLS_KEY_FILE" || -f "$(dirname "$WEB_TLS_CERT_FILE")/bootstrap-certificate" ]]; then
     log "Requesting HTTPS certificate for ${WEB_HOSTNAME}"
     if [[ -n "${TLS_CA_TOKEN:-}" ]]; then
       step ca certificate "$WEB_HOSTNAME" "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" --token "$TLS_CA_TOKEN" --force
@@ -522,6 +527,7 @@ configure_web_tls() {
   fi
   chmod 0600 "$WEB_TLS_KEY_FILE"
   chmod 0644 "$WEB_TLS_CERT_FILE"
+  rm -f "$(dirname "$WEB_TLS_CERT_FILE")/bootstrap-certificate"
 }
 
 start_acme_renewal_daemon() {
@@ -546,7 +552,17 @@ start_observability_services() {
   log 'Starting Samba audit collector'
   python3 /app/audit_collector.py &
 
-  if web_should_start; then
+  if [[ "${ADFS_SUPERVISED:-false}" == "true" ]]; then
+    configure_web_tls
+    if env_is_true "${WEB_TLS_AUTORENEW:-true}"; then
+      case "$ACTIVE_WEB_TLS_MODE" in
+        acme) start_acme_renewal_daemon ;;
+        ca) step ca renew --daemon --force "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" & ;;
+      esac
+    fi
+    log 'Starting document search and OCR worker'
+    python3 /app/document_index.py &
+  elif web_should_start; then
     ensure_web_jwt_secret
     configure_web_tls
     unset TLS_CA_PROVISIONER_PASSWORD TLS_CA_TOKEN
@@ -582,7 +598,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 17 * * * * root source /app/runtime.env && /usr/bin/python3 /app/trash.py --cleanup
 EOF
 
-  if [[ -n "${BACKUP_DESTINATION:-}" ]] && env_is_true "${BACKUP_AUTO_ENABLED:-true}"; then
+  if [[ "${ADFS_SUPERVISED:-false}" != "true" ]] && [[ -n "${BACKUP_DESTINATION:-}" ]] && env_is_true "${BACKUP_AUTO_ENABLED:-true}"; then
     cat >> /etc/cron.d/reconcile-shares <<EOF
 0 ${BACKUP_START_HOUR} * * * root source /app/runtime.env && BACKUP_TRIGGER=automatic /usr/bin/python3 /app/backup_to_destination.py
 EOF
@@ -591,6 +607,17 @@ EOF
   chmod 0644 /etc/cron.d/reconcile-shares
 }
 
+if [[ "${ADFS_SUPERVISED:-false}" == "true" ]]; then
+  source <(python3 /app/configuration.py export-shell)
+fi
+if [[ "${1:-}" == "--configure-tls" ]]; then
+  configure_web_tls
+  exit 0
+fi
+if [[ "${1:-}" == "--bootstrap-domain" ]]; then
+  export DOMAIN_USERS_SID="${DOMAIN_USERS_SID:-S-1-5-32-545}"
+  export DOMAIN_ADMINS_SID="${DOMAIN_ADMINS_SID:-S-1-5-32-544}"
+fi
 require_env REALM
 require_env WORKGROUP
 require_env DOMAIN
@@ -624,8 +651,15 @@ ensure_machine_keytab
 
 log 'Starting winbindd'
 winbindd -F --no-process-group &
+winbind_pid=$!
 
 wait_for_winbind
+touch /run/adfs-domain-ready
+if [[ "${1:-}" == "--bootstrap-domain" ]]; then
+  log 'Domain joined; waiting for web setup to select groups.'
+  wait "$winbind_pid"
+  exit "$?"
+fi
 
 register_ad_dns_record
 resolve_share_groups_from_sids
@@ -654,4 +688,5 @@ log 'Starting cron daemon'
 cron -f &
 
 log 'Starting smbd in foreground'
+touch /run/adfs-services-ready
 exec smbd -F --no-process-group

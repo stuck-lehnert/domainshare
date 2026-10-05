@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Dateiserver einrichten</title><link rel="stylesheet" href="/assets/styles.css"></head><body>
+<header class="portal-header"><strong>Dateiserver · Ersteinrichtung</strong></header>
+<main class="setup-main"><h1>Dateiserver einrichten</h1><p id="setup-status" role="status"></p><p id="setup-error" class="error" role="alert" hidden></p>
+<section id="setup-unlock" class="panel"><h2>Einrichtung entsperren</h2><p>Den einmaligen Einrichtungscode finden Sie im Containerprotokoll: <code>docker compose logs samba</code>.</p><form class="stack"><label>Einrichtungscode<input name="code" type="password" autocomplete="off" required autofocus></label><button type="submit">Weiter</button></form></section>
+<div id="setup-content" hidden></div></main>
+<script src="/assets/settings.js" defer></script><script src="/assets/setup.js" defer></script></body></html>

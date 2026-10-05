@@ -46,6 +46,7 @@ HTTP_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}),
     urllib.request.HTTPSHandler(context=TLS_CONTEXT),
 )
+TOKEN_CSRF = {}
 
 
 @dataclass
@@ -97,12 +98,19 @@ def http(
         headers["Content-Type"] = "application/json"
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if method == 'POST':
+        headers['Origin'] = BASE_URL
+        headers['X-CSRF-Token'] = 'login' if path == '/api/login' else TOKEN_CSRF.get(token, '')
     request = urllib.request.Request(
         f"{BASE_URL}{path}", data=body, headers=headers, method=method
     )
     try:
         with HTTP_OPENER.open(request, timeout=30) as response:
-            return Response(response.status, response.headers, response.read())
+            result = Response(response.status, response.headers, response.read())
+            if path == '/api/login' and result.status == 200:
+                session = result.json()
+                TOKEN_CSRF[session['token']] = session['csrfToken']
+            return result
     except urllib.error.HTTPError as exc:
         return Response(exc.code, exc.headers, exc.read())
 

@@ -24,11 +24,15 @@ else
 fi
 
 run_e2e=${DEV_RUN_E2E:-0}
+onboarding=0
+[[ $# -le 1 ]] || die 'use either --e2e or --onboarding'
 case "${1:-}" in
   --e2e) run_e2e=1 ;;
+  --onboarding) onboarding=1 ;;
   '') ;;
   *) die "unknown argument: $1" ;;
 esac
+[[ $onboarding != 1 || $run_e2e != 1 ]] || die '--onboarding cannot be combined with DEV_RUN_E2E=1'
 
 dev_realm=${DEV_REALM:-DEV.TEST}
 dev_workgroup=${DEV_WORKGROUP:-DEV}
@@ -46,6 +50,7 @@ dev_backup_auto_enabled=${DEV_BACKUP_AUTO_ENABLED:-true}
 dev_ca_password=${DEV_CA_PASSWORD:-PreviewCa123!}
 dev_ca_provisioner=${DEV_CA_PROVISIONER:-preview}
 dev_https_port=${DEV_HTTPS_PORT:-8443}
+dev_http_port=${DEV_HTTP_PORT:-8080}
 dev_activity_interval=${DEV_ACTIVITY_INTERVAL_SECONDS:-4}
 dev_backup_interval=${DEV_BACKUP_INTERVAL_SECONDS:-120}
 
@@ -90,6 +95,7 @@ volumes=(
 network_created=0
 watchdog_pid=
 log_pid=
+server_wait_pid=
 backup_driver_pid=
 ca_root_file=
 
@@ -132,6 +138,10 @@ cleanup() {
   if [[ -n ${log_pid:-} ]]; then
     kill "$log_pid" >/dev/null 2>&1 || true
     wait "$log_pid" 2>/dev/null || true
+  fi
+  if [[ -n ${server_wait_pid:-} ]]; then
+    kill "$server_wait_pid" >/dev/null 2>&1 || true
+    wait "$server_wait_pid" 2>/dev/null || true
   fi
   if [[ -n ${watchdog_pid:-} ]]; then
     kill "$watchdog_pid" >/dev/null 2>&1 || true
@@ -177,6 +187,22 @@ wait_for_exec() {
     elapsed=$((elapsed + 1))
   done
   return 1
+}
+
+follow_server() {
+  local file_status
+  "$engine" logs -f "$files_container" &
+  log_pid=$!
+  # Bash can handle termination immediately while waiting on a background job.
+  "$engine" wait "$files_container" >/dev/null 2>&1 &
+  server_wait_pid=$!
+  wait "$server_wait_pid" || die 'unable to wait for the file server'
+  server_wait_pid=
+  file_status=$("$engine" inspect -f '{{.State.ExitCode}}' "$files_container" 2>/dev/null || printf '1')
+  case "$file_status" in
+    ''|*[!0-9]*) exit 1 ;;
+    *) exit "$file_status" ;;
+  esac
 }
 
 create_network() {
@@ -281,73 +307,140 @@ if ! wait_for_exec "$dc_container" 150 test -f /run/preview-ready; then
 fi
 domain_sid=$("$engine" exec "$dc_container" cat /run/domain-sid)
 
-printf 'seeding preview files\n'
-"$engine" run --rm \
-  --network "$network_name" \
-  -e "DEV_SEED_MB=${DEV_SEED_MB:-8}" \
-  -v "$private_volume:/data/private" \
-  -v "$fslogix_volume:/data/fslogix" \
-  -v "$groups_volume:/data/groups" \
-  -v "$state_volume:/state" \
-  --entrypoint /usr/local/bin/preview-seed-files \
-  "$ad_image"
+if [[ $onboarding == 1 ]]; then
+  printf 'starting fresh file server for HTTP-to-HTTPS onboarding\n'
+  "$engine" run -d \
+    --name "$files_container" \
+    --hostname files \
+    --network "$network_name" \
+    --ip "$files_ip" \
+    --dns "$dc_ip" \
+    --dns-search "$dev_dns_domain" \
+    -p "127.0.0.1:${dev_http_port}:80" \
+    -p "127.0.0.1:${dev_https_port}:8443" \
+    -v "$private_volume:/data/private" \
+    -v "$fslogix_volume:/data/fslogix" \
+    -v "$groups_volume:/data/groups" \
+    -v "$state_volume:/state" \
+    -v "$samba_volume:/var/lib/samba" \
+    "$server_image" python3 -c '
+import json, os, sys
+sys.path.insert(0, "/app")
+import configuration
+# Only the external port mapping is supplied by the launcher. Domain, TLS,
+# credentials, groups and backups remain unconfigured until entered in the UI.
+port = int(sys.argv[1])
+if not 1 <= port <= 65535:
+    raise ValueError("Invalid development HTTPS port")
+store = configuration.Store()
+values = store.snapshot()["values"]
+values["WEB_HTTPS_PORT"] = str(port)
+with store.connect() as conn:
+    conn.execute("UPDATE configuration SET settings=? WHERE id=1", (json.dumps(values),))
+os.execv(sys.executable, [sys.executable, "/app/entrypoint.py"])
+' "$dev_https_port" >/dev/null
+else
+  printf 'seeding preview files\n'
+  "$engine" run --rm \
+    --network "$network_name" \
+    -e "DEV_SEED_MB=${DEV_SEED_MB:-8}" \
+    -v "$private_volume:/data/private" \
+    -v "$fslogix_volume:/data/fslogix" \
+    -v "$groups_volume:/data/groups" \
+    -v "$state_volume:/state" \
+    --entrypoint /usr/local/bin/preview-seed-files \
+    "$ad_image"
 
-printf 'starting actual file server and HTTPS web UI\n'
-"$engine" run -d \
-  --name "$files_container" \
-  --hostname files \
-  --network "$network_name" \
-  --ip "$files_ip" \
-  --dns "$dc_ip" \
-  --dns-search "$dev_dns_domain" \
-  -p "127.0.0.1:${dev_https_port}:8443" \
-  -e "REALM=${dev_realm}" \
-  -e "WORKGROUP=${dev_workgroup}" \
-  -e "DOMAIN=dc.${dev_dns_domain}" \
-  -e "LDAP_URI=ldap://dc.${dev_dns_domain}" \
-  -e "LDAP_BASE_DN=${dev_base_dn}" \
-  -e "JOIN_USER=Administrator" \
-  -e "JOIN_PASSWORD=${dev_dc_password}" \
-  -e "DOMAIN_USERS_SID=${domain_sid}-513" \
-  -e "DOMAIN_ADMINS_SID=${domain_sid}-512" \
-  -e "FSLOGIX_GROUP_SID=${domain_sid}-513" \
-  -e "SAMBA_HOSTNAME=files" \
-  -e "NETBIOS_NAME=FILES" \
-  -e "AD_DNS_NAME=files.${dev_dns_domain}" \
-  -e "WEB_ENABLED=true" \
-  -e "WEB_HOSTNAME=${dev_web_hostname}" \
-  -e "WEB_BIND_PORT=8443" \
-  -e "WEB_HTTPS_PORT=${dev_https_port}" \
-  -e "WEB_JWT_SECRET=preview-only-jwt-secret-with-at-least-32-bytes" \
-  -e "WEB_TLS_MODE=acme" \
-  -e "ACME_CA_SERVER=https://ca.${dev_dns_domain}:9000/acme/acme/directory" \
-  -e "ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem" \
-  -e "ACME_CA_CERTIFICATES_URL=https://ca.${dev_dns_domain}:9000/roots.pem" \
-  -e "ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=true" \
-  -e "ACME_HTTP_LISTEN=:80" \
-  -e "WEB_USAGE_SCAN_INTERVAL_SECONDS=60" \
-  -e "WEB_DIRECTORY_CACHE_SECONDS=30" \
-  -e "AUDIT_POLL_SECONDS=0.25" \
-  -e "BACKUP_DESTINATION=rsync://${dev_backup_user}:${dev_backup_password}@backup.${dev_dns_domain}/backups/fileserver" \
-  -e "BACKUP_ARCHIVE_PASSWORD=${dev_archive_password}" \
-  -e "BACKUP_AUTO_ENABLED=${dev_backup_auto_enabled}" \
-  -e "BACKUP_PROGRESS=never" \
-  -e "BACKUP_PROGRESS_INTERVAL_SECONDS=1" \
-  -e "BACKUP_RETENTION_DAILY=3" \
-  -e "BACKUP_RETENTION_WEEKLY=2" \
-  -e "BACKUP_RETENTION_MONTHLY=1" \
-  -e "BACKUP_RETENTION_YEARLY=1" \
-  -v "$private_volume:/data/private" \
-  -v "$fslogix_volume:/data/fslogix" \
-  -v "$groups_volume:/data/groups" \
-  -v "$state_volume:/state" \
-  -v "$samba_volume:/var/lib/samba" \
-  "$server_image" >/dev/null
+  printf 'starting actual file server and HTTPS web UI\n'
+  "$engine" run -d \
+    --name "$files_container" \
+    --hostname files \
+    --network "$network_name" \
+    --ip "$files_ip" \
+    --dns "$dc_ip" \
+    --dns-search "$dev_dns_domain" \
+    -p "127.0.0.1:${dev_https_port}:8443" \
+    -e "REALM=${dev_realm}" \
+    -e "WORKGROUP=${dev_workgroup}" \
+    -e "DOMAIN=dc.${dev_dns_domain}" \
+    -e "LDAP_URI=ldap://dc.${dev_dns_domain}" \
+    -e "LDAP_BASE_DN=${dev_base_dn}" \
+    -e "JOIN_USER=Administrator" \
+    -e "JOIN_PASSWORD=${dev_dc_password}" \
+    -e "DOMAIN_USERS_SID=${domain_sid}-513" \
+    -e "DOMAIN_ADMINS_SID=${domain_sid}-512" \
+    -e "FSLOGIX_GROUP_SID=${domain_sid}-513" \
+    -e "SAMBA_HOSTNAME=files" \
+    -e "NETBIOS_NAME=FILES" \
+    -e "AD_DNS_NAME=files.${dev_dns_domain}" \
+    -e "WEB_ENABLED=true" \
+    -e "WEB_HOSTNAME=${dev_web_hostname}" \
+    -e "WEB_BIND_PORT=8443" \
+    -e "WEB_HTTPS_PORT=${dev_https_port}" \
+    -e "WEB_LOGIN_ATTEMPTS_PER_5_MIN=100" \
+    -e "WEB_LOGIN_ACCOUNT_ATTEMPTS_PER_5_MIN=100" \
+    -e "WEB_JWT_SECRET=preview-only-jwt-secret-with-at-least-32-bytes" \
+    -e "WEB_TLS_MODE=acme" \
+    -e "ACME_CA_SERVER=https://ca.${dev_dns_domain}:9000/acme/acme/directory" \
+    -e "ACME_CA_CERTIFICATES=/state/tls/acme-ca-certificates.pem" \
+    -e "ACME_CA_CERTIFICATES_URL=https://ca.${dev_dns_domain}:9000/roots.pem" \
+    -e "ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD=true" \
+    -e "ACME_HTTP_LISTEN=:80" \
+    -e "WEB_USAGE_SCAN_INTERVAL_SECONDS=60" \
+    -e "WEB_DIRECTORY_CACHE_SECONDS=30" \
+    -e "AUDIT_POLL_SECONDS=0.25" \
+    -e "BACKUP_DESTINATION=rsync://${dev_backup_user}:${dev_backup_password}@backup.${dev_dns_domain}/backups/fileserver" \
+    -e "BACKUP_ARCHIVE_PASSWORD=${dev_archive_password}" \
+    -e "BACKUP_AUTO_ENABLED=${dev_backup_auto_enabled}" \
+    -e "BACKUP_PROGRESS=never" \
+    -e "BACKUP_PROGRESS_INTERVAL_SECONDS=1" \
+    -e "BACKUP_RETENTION_DAILY=3" \
+    -e "BACKUP_RETENTION_WEEKLY=2" \
+    -e "BACKUP_RETENTION_MONTHLY=1" \
+    -e "BACKUP_RETENTION_YEARLY=1" \
+    -v "$private_volume:/data/private" \
+    -v "$fslogix_volume:/data/fslogix" \
+    -v "$groups_volume:/data/groups" \
+    -v "$state_volume:/state" \
+    -v "$samba_volume:/var/lib/samba" \
+    "$server_image" >/dev/null
+fi
 
 if ! wait_for_exec "$files_container" 240 python3 -c \
   'import ssl,urllib.request; print(urllib.request.urlopen("https://127.0.0.1:8443/healthz", context=ssl._create_unverified_context(), timeout=3).status)'; then
   show_logs
   die 'file server web UI did not become healthy'
+fi
+
+if [[ $onboarding == 1 ]]; then
+  if ! wait_for_exec "$files_container" 30 python3 -c \
+    'import urllib.request; assert urllib.request.urlopen("http://127.0.0.1/api/https/status", timeout=3).status == 200'; then
+    show_logs
+    die 'HTTP HTTPS-setup UI did not become ready'
+  fi
+  printf '\nOnboarding preview ready (fresh configuration; no automatic domain join)\n'
+  printf '  Start here:        http://%s:%s/\n' "$dev_web_hostname" "$dev_http_port"
+  printf '  HTTPS afterwards:  https://%s:%s/\n' "$dev_web_hostname" "$dev_https_port"
+  printf '  HTTPS setup code:  %s\n' "$("$engine" exec "$files_container" cat /state/https-setup-code)"
+  printf '  Setup code:        %s\n' "$("$engine" exec "$files_container" cat /state/setup-code)"
+  printf '\nStep 1 — HTTP: configure ACME and upload the disposable CA root\n'
+  printf '  HTTPS hostname:    %s\n' "$dev_web_hostname"
+  printf '  ACME directory:    https://ca.%s:9000/acme/acme/directory\n' "$dev_dns_domain"
+  printf '  CA root to upload: %s\n' "$ca_root_file"
+  printf '\nStep 2 — HTTPS: join the disposable domain and select groups\n'
+  printf '  Realm / NetBIOS:   %s / %s\n' "$dev_realm" "$dev_workgroup"
+  printf '  Domain controller: dc.%s\n' "$dev_dns_domain"
+  printf '  Join account:      Administrator / %s\n' "$dev_dc_password"
+  printf '  Server / NetBIOS:  files / FILES\n'
+  printf '  Advanced LDAP URI: ldap://dc.%s (development DC only)\n' "$dev_dns_domain"
+  printf '  User / Admin group: Domain Users / Domain Admins\n'
+  printf '  Initial admin:     %s\\%s / %s\n' "$dev_workgroup" "$dev_admin_user" "$dev_admin_password"
+  printf '\nOptional backup destination — configure under /admin/settings after setup\n'
+  printf '  Destination:       rsync://%s:%s@backup.%s/backups/fileserver\n' "$dev_backup_user" "$dev_backup_password" "$dev_dns_domain"
+  printf '\nTrust the disposable CA root temporarily before continuing over HTTPS.\n'
+  printf 'Files, permissions and backups start empty; no SMB traffic or backup driver is started.\n'
+  printf 'Press Ctrl-C to remove this run, including its configuration and test data.\n\n'
+  follow_server
 fi
 
 if [[ $run_e2e == 1 ]]; then
@@ -437,10 +530,4 @@ printf '  CA root:  %s\n' "$ca_root_file"
 printf '\nThe CA is disposable, so import the displayed root only as temporary trust.\n'
 printf 'SMB activity and backups repeat in the background. Press Ctrl-C to remove everything.\n\n'
 
-"$engine" logs -f "$files_container" &
-log_pid=$!
-file_status=$("$engine" wait "$files_container" 2>/dev/null || printf '1')
-case "$file_status" in
-  ''|*[!0-9]*) exit 1 ;;
-  *) exit "$file_status" ;;
-esac
+follow_server
