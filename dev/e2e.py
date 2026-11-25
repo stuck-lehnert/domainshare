@@ -878,25 +878,51 @@ fi
         return change({"action": "set-permissions", "id": folder_id,
                        "permissions": [{"kind": "user", "principalId": user_sids["alice"], "level": level}]})
 
-    def smb(command, user="alice"):
-        result = engine_run("exec", CLIENT_CONTAINER, "smbclient", f"//files.{DNS_DOMAIN}/Data", "-m", "SMB3",
-                            "-U", f"{WORKGROUP}\\{user}%{ADMIN_PASSWORD if user == ADMIN_USER else USER_PASSWORD}", "-c", command, check_result=False)
+    def smb(command, user="alice", share="Data"):
+        password = ADMIN_PASSWORD if user == ADMIN_USER else USER_PASSWORD
+        result = engine_run(
+            "exec", CLIENT_CONTAINER, "smbclient", f"//files.{DNS_DOMAIN}/{share}",
+            "-m", "SMB3", "-U", f"{WORKGROUP}\\{user}%{password}", "-c", command,
+            check_result=False,
+        )
         return result.returncode, result.stdout + result.stderr
 
     # The SMB client sometimes exits zero on individual denied operations, so inspect status output.
-    def allowed(command, user="alice"):
-        code, output = smb(command, user)
-        check(code == 0 and "NT_STATUS_" not in output, f"operation unexpectedly failed: {command}: {output}")
+    def allowed(command, user="alice", share="Data"):
+        code, output = smb(command, user, share)
+        check(code == 0 and "NT_STATUS_" not in output, f"{user} on {share}: {command}: {output}")
 
     def denied(command):
         code, output = smb(command)
         check(code != 0 or "NT_STATUS_ACCESS_DENIED" in output, f"operation unexpectedly succeeded: {command}: {output}")
 
-    rules(0)
+    announce("administrators can open every SMB share without membership in the ordinary SMB users group")
+    admin_sid = engine_run(
+        "exec", FILES_CONTAINER, "wbinfo", "--name-to-sid", f"{WORKGROUP}\\{ADMIN_USER}"
+    ).stdout.split()[0]
+    admin_groups = engine_run("exec", FILES_CONTAINER, "wbinfo", "--user-sids", admin_sid).stdout.split()
+    smb_users_sid = engine_run(
+        "exec", FILES_CONTAINER, "wbinfo", "--name-to-sid", f"{WORKGROUP}\\Preview SMB Users"
+    ).stdout.split()[0]
+    check(
+        f"{DOMAIN_SID}-512" in admin_groups and smb_users_sid not in admin_groups,
+        "the SMB administrator test requires an admin who is not in the ordinary SMB users group",
+    )
+
+    for share in ("Private", "Data", "FSLogix"):
+        allowed("ls", ADMIN_USER, share)
+
+    # The new folder has no individual assignments; even an explicit level 0
+    # cannot remove the full access granted by the administrator group ACL.
+    allowed("cd Permissions; put /tmp/live-note.txt admin-probe.txt", ADMIN_USER)
+    change({"action": "set-permissions", "id": folder_id, "permissions": [
+        {"kind": "user", "principalId": admin_sid, "level": 0},
+        {"kind": "user", "principalId": user_sids["alice"], "level": 0},
+    ]})
+    allowed("cd Permissions; get admin-probe.txt /tmp/admin-readback.txt; rename admin-probe.txt existing.txt", ADMIN_USER)
     denied("cd Permissions; ls")
     _, listing = smb("ls")
     check("Permissions" not in listing, "level 0 folder is visible")
-    allowed("cd Permissions; put /tmp/live-note.txt existing.txt", ADMIN_USER)
     rules(1)
     allowed("cd Permissions; get existing.txt /tmp/permission-read.txt")
     denied("cd Permissions; put /tmp/live-note.txt blocked.txt")

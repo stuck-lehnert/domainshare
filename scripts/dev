@@ -306,6 +306,11 @@ if ! wait_for_exec "$dc_container" 150 test -f /run/preview-ready; then
   die 'dummy AD domain did not become ready'
 fi
 domain_sid=$("$engine" exec "$dc_container" cat /run/domain-sid)
+smb_users_sid="${domain_sid}-513"
+if [[ $run_e2e == 1 ]]; then
+  smb_users_sid=$("$engine" exec "$dc_container" samba-tool group show 'Preview SMB Users' | sed -n 's/^objectSid: //p')
+  [[ "$smb_users_sid" == "${domain_sid}"-[0-9]* ]] || die 'unable to resolve the preview SMB users group SID'
+fi
 
 if [[ $onboarding == 1 ]]; then
   printf 'starting fresh file server for HTTP-to-HTTPS onboarding\n'
@@ -367,9 +372,9 @@ else
     -e "LDAP_BASE_DN=${dev_base_dn}" \
     -e "JOIN_USER=Administrator" \
     -e "JOIN_PASSWORD=${dev_dc_password}" \
-    -e "DOMAIN_USERS_SID=${domain_sid}-513" \
+    -e "DOMAIN_USERS_SID=${smb_users_sid}" \
     -e "DOMAIN_ADMINS_SID=${domain_sid}-512" \
-    -e "FSLOGIX_GROUP_SID=${domain_sid}-513" \
+    -e "FSLOGIX_GROUP_SID=${smb_users_sid}" \
     -e "SAMBA_HOSTNAME=files" \
     -e "NETBIOS_NAME=FILES" \
     -e "AD_DNS_NAME=files.${dev_dns_domain}" \

@@ -534,6 +534,14 @@ class ManagedAccessTests(unittest.TestCase):
 
 
 class WindowsDescriptorTests(unittest.TestCase):
+    def test_admin_group_has_full_control_without_individual_grants(self):
+        for is_dir, top_level in ((True, True), (True, False), (False, False)):
+            with self.subTest(is_dir=is_dir, top_level=top_level):
+                sddl = access.descriptor({ALICE: 0}, ADMIN, is_dir=is_dir, top_level=top_level)
+                flags = 'OICI' if is_dir else ''
+                self.assertIn(f'(A;{flags};FA;;;{ADMIN})', sddl)
+                self.assertNotIn(ALICE, sddl)
+
     def test_modify_excludes_both_delete_rights_and_acl_ownership_changes(self):
         mask = access.MASKS[2]
         self.assertEqual(mask & (access.DELETE | access.DELETE_CHILD | 0x40000 | 0x80000), 0)

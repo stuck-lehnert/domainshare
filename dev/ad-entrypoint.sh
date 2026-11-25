@@ -137,7 +137,7 @@ userPrincipalName: ${user_upn}
 EOF
 done
 
-for group in Finance_Analysts Engineering_Leads FS_Finance FS_Engineering FS_Projects; do
+for group in Finance_Analysts Engineering_Leads FS_Finance FS_Engineering FS_Projects 'Preview SMB Users'; do
   ensure_group "$group"
 done
 
@@ -154,6 +154,8 @@ add_members FS_Engineering 'Engineering_Leads,dave'
 add_members FS_Projects 'FS_Finance,FS_Engineering,eve'
 add_members FS_Projects 'Domain Users'
 add_members 'Domain Admins' "$AD_WEB_ADMIN_USER"
+# Deliberately omit the web administrator: SMB tests exercise the admin group separately.
+add_members 'Preview SMB Users' 'alice,bob,carol,dave,eve,frank,report_svc,MSOL_sync'
 
 add_dns_record() {
   local name=$1

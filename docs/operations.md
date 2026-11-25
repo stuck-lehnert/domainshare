@@ -48,6 +48,8 @@ Compose publishes fixed ports 80 and 443, plus SMB 139 and 445. A deployment req
 
 ## SMB Shares
 
+Members of the configured administrator group (`DOMAIN_ADMINS_SID`) can connect to all three SMB shares without also belonging to the ordinary SMB user groups. Each share's file and folder ACLs still apply.
+
 ### Private
 
 - Share: `\\server\Private`
@@ -62,7 +64,7 @@ Compose publishes fixed ports 80 and 443, plus SMB 139 and 445. A deployment req
   - owner user: full control
   - Domain Admins: ACL full control
   - mode: `700`
-- `hide unreadable = yes` + ACLs enforce that users only see their own folder.
+- `hide unreadable = yes` and ACLs ensure non-admin users only see their own folder.
 
 ### Data
 
@@ -80,7 +82,7 @@ Compose publishes fixed ports 80 and 443, plus SMB 139 and 445. A deployment req
 
 - Share: `\\server\FSLogix`
 - Path: `/data/fslogix`
-- Access for authenticated users in configurable `FSLOGIX_GROUP_SID` (default: `DOMAIN_USERS_SID`, resolved through winbind).
+- Share access for the configured administrator group and for members of `FSLOGIX_GROUP_SID` (defaults to `DOMAIN_USERS_SID`, resolved through winbind).
 - Semantics intentionally differ from `Data`: only the share root is reconciled (`03770` + ACL defaults), while user-created profile container folders/files are not recursively normalized.
 - Samba masks are profile-container oriented (`create mask = 0600`, `directory mask = 0700`) so profile payload stays user-private by default.
 
@@ -95,7 +97,7 @@ The **Zugriffsverwaltung** page creates top-level Data folders, assigns a permis
 | 2 | Read, create, and edit; no delete |
 | 3 | Read, create, edit, and delete |
 
-No assignment means no access. Each user has an independent level per folder; level 0 revokes access. There are no access groups. Domain Admins retain full access. Only admins can rename or delete a top-level managed folder.
+For non-admin users, no assignment means no access and level 0 revokes access. Each user has an independent level per folder; there are no groups for per-folder assignments. The configured administrator group always has full access to active Data folders, regardless of individual assignments. Only admins can rename or delete a top-level managed folder.
 
 Level 2 blocks renaming and moving files or directories because SMB requires delete permission for those operations. Applications that save by deleting/replacing a file or renaming a temporary file require level 3. Level 2 still permits overwriting a file’s contents in place.
 
