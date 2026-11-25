@@ -42,6 +42,7 @@ def seed(phrase, passphrase=''):
 
 def archive_key(phrase):
     # A domain-separated archive password, followed by 7z's own AES-256 KDF.
+    # The v1 salt predates the rename and must stay fixed to unlock existing backups.
     return hashlib.pbkdf2_hmac('sha512', seed(phrase), b'adfs-backup-archive-v1', 1, dklen=32).hex()
 
 

@@ -793,7 +793,7 @@ async function renderDocuments() {
 }
 
 async function renderReport() {
-  content.innerHTML = pageHead("PDF-Bericht", "Vollständiger, druckbarer Stand der Dateiserver-Konfiguration und Belegung.") + `
+  content.innerHTML = pageHead("PDF-Bericht", "Vollständiger, druckbarer Stand der DomainShare-Konfiguration und Belegung.") + `
     <section class="panel">
       <h2>Enthaltene Informationen</h2>
       <ul>

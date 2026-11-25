@@ -143,7 +143,17 @@ class ConfigurationTests(unittest.TestCase):
         self.store.save({'REALM':'EXAMPLE.TEST','DOMAIN':'dc.example.test'},0,bootstrap=True)
         environment=self.store.environment()
         self.assertEqual(environment['LDAP_BASE_DN'],'DC=example,DC=test')
-        self.assertEqual(environment['AD_DNS_NAME'],'adsambafsrv.example.test')
+        self.assertEqual(environment['NETBIOS_NAME'], 'DOMAINSHARE')
+        self.assertEqual(environment['SAMBA_HOSTNAME'], 'domainshare')
+        self.assertEqual(environment['AD_DNS_NAME'], 'domainshare.example.test')
+
+    def test_existing_samba_names_are_kept_when_the_store_is_reopened(self):
+        self.store.import_legacy(LEGACY | {'NETBIOS_NAME': 'OFFICEFILES', 'SAMBA_HOSTNAME': 'officefiles'})
+
+        environment = configuration.Store(self.store.root).environment()
+        self.assertEqual(environment['NETBIOS_NAME'], 'OFFICEFILES')
+        self.assertEqual(environment['SAMBA_HOSTNAME'], 'officefiles')
+        self.assertEqual(environment['AD_DNS_NAME'], 'officefiles.example.test')
 
     def test_enabling_full_encryption_requires_a_confirmed_phrase(self):
         self.store.import_legacy(LEGACY)

@@ -2,8 +2,10 @@ services:
   samba:
     build:
       context: .
-    container_name: ad-samba-file-server
-    hostname: adsambafsrv
+    image: domainshare:latest
+    pull_policy: never
+    container_name: domainshare
+    hostname: domainshare
     restart: unless-stopped
     ports:
       - "445:445"

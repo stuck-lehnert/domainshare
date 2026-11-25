@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HTTPS administration UI for the AD-integrated file server."""
+"""HTTPS administration UI for DomainShare."""
 
 import base64
 import datetime as dt
@@ -72,8 +72,8 @@ RECONCILE_LOG_FILE = os.getenv("RECONCILE_LOG_FILE", "/var/log/reconcile.log")
 RECONCILE_LOCK_FILE = "/state/reconcile.lock"
 TLS_CERT_FILE = os.getenv("WEB_TLS_CERT_FILE", "/state/tls/web.crt")
 TLS_KEY_FILE = os.getenv("WEB_TLS_KEY_FILE", "/state/tls/web.key")
-JWT_COOKIE = "adfs_session"
-JWT_ISSUER = "ad-file-server-web"
+JWT_COOKIE = "domainshare_session"
+JWT_ISSUER = "domainshare-web"
 JWT_AUDIENCE = "ad-users"
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SID_RE = re.compile(r"S-\d+(?:-\d+)+", re.IGNORECASE)
@@ -869,7 +869,7 @@ CONFIG = None
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ADFileServerUI/1"
+    server_version = "DomainShare/1"
 
     def log_message(self, fmt: str, *args) -> None:
         log(f"{self.client_address[0]} {fmt % args}")
@@ -920,7 +920,7 @@ class Handler(BaseHTTPRequestHandler):
                 value['services'] = read_json(str(CONFIG.root / 'services-status.json'), {'state': 'waiting'})
                 self.send_json(value)
             elif not mutation and path == '/api/bootstrap/groups':
-                if not os.path.exists('/run/adfs-domain-ready'):
+                if not os.path.exists('/run/domainshare-domain-ready'):
                     raise ValueError('Domänenbeitritt ist noch nicht abgeschlossen')
                 self.send_json({'groups': self.domain_groups()})
             elif mutation and path == '/api/bootstrap/domain':
@@ -935,7 +935,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reload_configuration()
                 self.send_json(CONFIG.public(), HTTPStatus.ACCEPTED)
             elif mutation and path == '/api/bootstrap/finish':
-                if not os.path.exists('/run/adfs-domain-ready'):
+                if not os.path.exists('/run/domainshare-domain-ready'):
                     raise ValueError('Domänenbeitritt ist noch nicht abgeschlossen')
                 body = self.read_json_body()
                 changes = body.get('values', {})
@@ -1332,7 +1332,7 @@ class Handler(BaseHTTPRequestHandler):
             self.bootstrap(path)
             return
         if path == "/healthz":
-            if CONFIG is not None and CONFIG.snapshot()['phase'] == 'configured' and not os.path.exists('/run/adfs-services-ready'):
+            if CONFIG is not None and CONFIG.snapshot()['phase'] == 'configured' and not os.path.exists('/run/domainshare-services-ready'):
                 self.send_json({'status': 'starting', 'message': 'Dateidienste werden gestartet'}, HTTPStatus.SERVICE_UNAVAILABLE)
                 return
             self.send_json({"status": "ok"})

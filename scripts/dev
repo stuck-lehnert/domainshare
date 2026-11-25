@@ -54,12 +54,12 @@ dev_http_port=${DEV_HTTP_PORT:-8080}
 dev_activity_interval=${DEV_ACTIVITY_INTERVAL_SECONDS:-4}
 dev_backup_interval=${DEV_BACKUP_INTERVAL_SECONDS:-120}
 
-server_image=${DEV_SERVER_IMAGE:-ad-ds-simple-file-server-dev:latest}
-ad_image=${DEV_AD_IMAGE:-ad-ds-simple-file-server-ad-dev:latest}
-backup_image=${DEV_BACKUP_IMAGE:-ad-ds-simple-file-server-backup-dev:latest}
+server_image=${DEV_SERVER_IMAGE:-domainshare-dev:latest}
+ad_image=${DEV_AD_IMAGE:-domainshare-ad-dev:latest}
+backup_image=${DEV_BACKUP_IMAGE:-domainshare-backup-dev:latest}
 ca_image=${DEV_CA_IMAGE:-docker.io/smallstep/step-ca:latest}
 
-run_id="ad-file-server-dev-$$-$RANDOM"
+run_id="domainshare-dev-$$-$RANDOM"
 network_name="$run_id-net"
 dc_container="$run_id-dc"
 ca_container="$run_id-ca"
@@ -252,7 +252,7 @@ printf 'starting local CA: %s\n' "$ca_image"
   --network "$network_name" \
   --ip "$ca_ip" \
   --add-host "${dev_web_hostname}:${files_ip}" \
-  -e "DOCKER_STEPCA_INIT_NAME=AD file server preview CA" \
+  -e "DOCKER_STEPCA_INIT_NAME=DomainShare preview CA" \
   -e "DOCKER_STEPCA_INIT_DNS_NAMES=ca.${dev_dns_domain},localhost,127.0.0.1" \
   -e "DOCKER_STEPCA_INIT_PROVISIONER_NAME=${dev_ca_provisioner}" \
   -e "DOCKER_STEPCA_INIT_PASSWORD=${dev_ca_password}" \

@@ -282,7 +282,7 @@ def main() -> int:
     login_payload = login.json()
     token = str(login_payload.get("token", ""))
     claims = decode_jwt_payload(token)
-    check(claims.get("iss") == "ad-file-server-web", "JWT issuer is wrong")
+    check(claims.get("iss") == "domainshare-web", "JWT issuer is wrong")
     check(claims.get("aud") == "ad-users", "JWT audience is wrong")
     check(claims.get("role") == "domain-admin", "JWT role is wrong")
     check(claims.get("sub") == f"{WORKGROUP}\\{ADMIN_USER}", "JWT subject is wrong")

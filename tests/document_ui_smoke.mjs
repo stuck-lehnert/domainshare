@@ -8,7 +8,7 @@ import {fileURLToPath} from "node:url";
 const require = createRequire(import.meta.url);
 const {chromium} = require(process.env.PLAYWRIGHT_MODULE || "playwright");
 const root = fileURLToPath(new URL("../app/web/", import.meta.url));
-const out = process.env.SCREENSHOT_DIR || fs.mkdtempSync(path.join(os.tmpdir(), "adfs-portal-review-"));
+const out = process.env.SCREENSHOT_DIR || fs.mkdtempSync(path.join(os.tmpdir(), "domainshare-portal-review-"));
 fs.mkdirSync(out,{recursive:true});
 const sources=[{id:'data:finance',label:'Finanzen',kind:'data'},{id:'data:projects',label:'Projekte',kind:'data'},{id:'private:alice',label:'Private',kind:'private'}];
 const fixtures=[
@@ -40,7 +40,7 @@ const browser=await chromium.launch({headless:true,...(process.env.CHROMIUM_EXEC
 try {
  const page=await browser.newPage({viewport:{width:1500,height:1050}});
  page.on('pageerror',error=>errors.push(error.message));
- await page.route('http://adfs.test/**',async route=>{
+ await page.route('http://domainshare.test/**',async route=>{
   const url=new URL(route.request().url()); let body,type='application/json',status=200;
   if(url.pathname==='/api/session'){
    if(!loggedIn){status=401;body={error:'Anmeldung erforderlich'};}else body={user:'EXAMPLE\\alice',role,expiresAt:9999999999,csrfToken};
@@ -94,7 +94,7 @@ try {
  });
  const shot=async name=>{await page.waitForFunction(()=>Array.from(document.images).filter(img=>img.loading!=='lazy'||img.getBoundingClientRect().top<innerHeight).every(img=>img.complete));await page.screenshot({path:path.join(out,name+'.png'),fullPage:!await page.locator('#document-dialog').isVisible()});};
  const all=()=>page.waitForFunction(()=>document.querySelectorAll('.document-card').length===5);
- await page.goto('http://adfs.test/');await all();
+ await page.goto('http://domainshare.test/');await all();
  assert.equal(await page.locator('#admin-link').isHidden(),true);
  assert.equal(await page.locator('nav a[href^="/admin"]').count(),0);
  assert.equal(await page.locator('#source-filter').textContent().then(text=>text.includes('Mein Private-Ordner')),true);
@@ -261,7 +261,7 @@ try {
  await page.screenshot({path:path.join(out,'07-cursor-search.png'),fullPage:false});
  fixtures.splice(5);cursorMode=false;
  await page.locator('#reset-filters').click();await all();
- role='domain-admin';await page.goto('http://adfs.test/');await all();
+ role='domain-admin';await page.goto('http://domainshare.test/');await all();
  assert.equal(await page.locator('#admin-link').getAttribute('href'),'/admin/overview');
  assert.equal(await page.locator('#admin-link').isVisible(),true);
  assert.ok(pendingRequests.includes('FINANZ742')&&pendingRequests.includes('SCANLIVE742'));

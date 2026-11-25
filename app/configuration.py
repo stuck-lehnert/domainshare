@@ -41,8 +41,8 @@ FIELDS = {
     'DOMAIN_USERS_SID': field('groups', 'Benutzergruppe', kind='group', required=True),
     'DOMAIN_ADMINS_SID': field('groups', 'Administratorengruppe', kind='group', required=True),
     'FSLOGIX_GROUP_SID': field('groups', 'FSLogix-Gruppe', kind='group', required=True),
-    'NETBIOS_NAME': field('network', 'Servername (NetBIOS)', 'ADSAMBAFSRV', 'netbios'),
-    'SAMBA_HOSTNAME': field('network', 'Servername (DNS)', 'adsambafsrv', 'dns'),
+    'NETBIOS_NAME': field('network', 'Servername (NetBIOS)', 'DOMAINSHARE', 'netbios'),
+    'SAMBA_HOSTNAME': field('network', 'Servername (DNS)', 'domainshare', 'dns'),
     'AD_DNS_NAME': field('network', 'AD-DNS-Eintrag (optional)', kind='dns'),
     'AD_DNS_IP': field('network', 'IP-Adresse für AD-DNS-Eintrag (optional)', kind='ip'),
     'WEB_HOSTNAME': field('tls', 'HTTPS-Hostname', 'localhost', 'dns'),
@@ -368,7 +368,7 @@ class Store:
         if values.get('REALM') and not result.get('LDAP_BASE_DN'):
             result['LDAP_BASE_DN'] = ','.join('DC=' + part for part in values['REALM'].lower().split('.'))
         if values.get('REALM') and not result.get('AD_DNS_NAME'):
-            hostname = values.get('SAMBA_HOSTNAME', 'adsambafsrv').lower()
+            hostname = values.get('SAMBA_HOSTNAME', FIELDS['SAMBA_HOSTNAME']['default']).lower()
             result['AD_DNS_NAME'] = hostname if '.' in hostname else hostname + '.' + values['REALM'].lower()
         result.update(WEB_ENABLED='true', STATE_ROOT=str(self.root), STATE_DB_PATH=values.get('STATE_DB_PATH', str(self.root / 'shares.db')),
                       WEB_TLS_CERT_FILE=values.get('WEB_TLS_CERT_FILE', str(self.root / 'tls' / 'web.crt')),

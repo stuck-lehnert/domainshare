@@ -9,7 +9,7 @@ const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const root = fileURLToPath(new URL('../',import.meta.url));
 const fixture = spawn('python3',['-m','tests.configuration_browser_fixture'],{cwd:root,stdio:['ignore','pipe','pipe']});
 let logs='', browser; fixture.stderr.on('data',chunk=>{logs+=chunk;});
-const output = '/tmp/adfs-configuration-screenshots'; await mkdir(output,{recursive:true});
+const output = '/tmp/domainshare-configuration-screenshots'; await mkdir(output,{recursive:true});
 try {
  const info = await new Promise((resolve,reject)=>{
   const lines=createInterface({input:fixture.stdout}); const timeout=setTimeout(()=>reject(new Error('Fixture timeout: '+logs)),10000);

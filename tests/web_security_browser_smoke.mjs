@@ -34,7 +34,7 @@ try {
  });
  assert.equal(login.status,200);
  assert.ok(login.csrfToken);
- const cookie=(await context.cookies(target)).find(item=>item.name==='adfs_session');
+ const cookie=(await context.cookies(target)).find(item=>item.name==='domainshare_session');
  assert.equal(cookie.httpOnly,true);assert.equal(cookie.secure,true);assert.equal(cookie.sameSite,'Strict');
  const control=async action=>page.evaluate(async({action,csrf})=>{
   const response=await fetch('/admin/api/documents/control',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({action})});

@@ -79,6 +79,10 @@ const data = {
 };
 
 const source = report.buildReportSource(data);
+if (!source.includes('title: "DomainShare-Bericht", author: "DomainShare"')) {
+  throw new Error("report metadata is missing the DomainShare name");
+}
+
 if (source.includes("DARF NICHT") || source.includes("DARF EBENFALLS NICHT")) {
   throw new Error("log data leaked into Typst source");
 }

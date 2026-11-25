@@ -68,8 +68,8 @@ def main():
                 stop(certificate)
                 stop(ui)
                 service = ui = certificate = None
-                Path('/run/adfs-domain-ready').unlink(missing_ok=True)
-                Path('/run/adfs-services-ready').unlink(missing_ok=True)
+                Path('/run/domainshare-domain-ready').unlink(missing_ok=True)
+                Path('/run/domainshare-services-ready').unlink(missing_ok=True)
                 revision = snap['service_revision']
                 next_retry = 0
                 next_tls_retry = 0
@@ -90,7 +90,7 @@ def main():
                 tls_configuration.write_private(store.root / 'https-status.json', json.dumps({'state': 'ready' if succeeded else 'failed', 'message': 'HTTPS ist eingerichtet. Über HTTPS fortfahren.' if succeeded else 'ACME-Zertifikat konnte nicht angefordert werden. Hostname, CA und Erreichbarkeit von Port 80 prüfen.'}))
             if wants_acme and tls_marker.exists() and certificate is None and time.monotonic() >= next_tls_retry:
                 tls_configuration.write_private(store.root / 'https-status.json', json.dumps({'state': 'working', 'message': 'ACME-Zertifikat wird angefordert'}))
-                certificate = start([str(APP / 'init.sh'), '--configure-tls'], store, {'ADFS_SUPERVISED': 'true'})
+                certificate = start([str(APP / 'init.sh'), '--configure-tls'], store, {'DOMAINSHARE_SUPERVISED': 'true'})
                 next_tls_retry = time.monotonic() + 60
             desired = snap['phase'] in ('joining', 'groups', 'configured') and all(snap['values'].get(key) for key in ('REALM', 'WORKGROUP', 'DOMAIN'))
             if wants_acme and (certificate is not None or tls_marker.exists()):
@@ -98,15 +98,15 @@ def main():
             if desired and (service is None or service.poll() is not None) and time.monotonic() >= next_retry:
                 mode = [] if snap['phase'] == 'configured' else ['--bootstrap-domain']
                 write_status(store, state='starting', message='AD-Dienste werden gestartet')
-                service = start([str(APP / 'init.sh'), *mode], store, {'ADFS_SUPERVISED': 'true'})
+                service = start([str(APP / 'init.sh'), *mode], store, {'DOMAINSHARE_SUPERVISED': 'true'})
                 next_retry = time.monotonic() + 30
             if service is not None and service.poll() is not None:
                 code = service.returncode
                 stop(service)
                 service = None
-                Path('/run/adfs-services-ready').unlink(missing_ok=True)
+                Path('/run/domainshare-services-ready').unlink(missing_ok=True)
                 write_status(store, state='failed', message=f'AD-Dienste konnten nicht gestartet werden (Status {code}); Einstellungen prüfen')
-            elif service is not None and Path('/run/adfs-domain-ready').exists():
+            elif service is not None and Path('/run/domainshare-domain-ready').exists():
                 if snap['phase'] == 'joining':
                     store.phase('groups')
                 write_status(store, state='running', message='Domänenverbindung hergestellt')

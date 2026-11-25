@@ -11,7 +11,7 @@ from app import documents, state_db, web_security, web_ui
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix='adfs-security-browser-') as root:
+    with tempfile.TemporaryDirectory(prefix='domainshare-security-browser-') as root:
         path = str(Path(root) / 'state.db')
         tokens = web_ui.TokenManager('browser-fixture-secret-' * 3, 600, web_security.Sessions(path))
         web_ui.APP = SimpleNamespace(tokens=tokens)

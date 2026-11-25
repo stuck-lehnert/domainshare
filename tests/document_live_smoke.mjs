@@ -4,7 +4,7 @@ import {createRequire} from "node:module";
 import assert from "node:assert/strict";
 const require=createRequire(import.meta.url);
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||"playwright");
-const out=process.env.SCREENSHOT_DIR||'/tmp/adfs-documents-live-review';fs.mkdirSync(out,{recursive:true});
+const out=process.env.SCREENSHOT_DIR||'/tmp/domainshare-documents-live-review';fs.mkdirSync(out,{recursive:true});
 const host=process.env.PREVIEW_HTTPS_HOST;
 const origin=`https://${host}:${process.env.PREVIEW_HTTPS_PORT}`;
 const browser=await chromium.launch({headless:true,args:[`--host-resolver-rules=MAP ${host} 127.0.0.1`,"--ignore-certificate-errors"]});

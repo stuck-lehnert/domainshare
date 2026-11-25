@@ -171,14 +171,14 @@ export function buildReportSource(data) {
     .join(", ") || "—";
 
   const parts = [
-    '#set document(title: "Dateiserver-Bericht", author: "Dateiserver")',
+    '#set document(title: "DomainShare-Bericht", author: "DomainShare")',
     '#set page(paper: "a4", margin: (x: 15mm, top: 14mm, bottom: 17mm), footer: context align(center, text(size: 7pt, fill: luma(45%))[Seite #counter(page).display("1")]))',
     '#set text(font: "Libertinus Serif", size: 9pt, lang: "de")',
     "#set par(leading: 0.58em)",
     "#set heading(numbering: none)",
     '#let tree-row(depth, kind, name, sam, cycle) = block(width: 100%, above: 1.8pt, below: 1.8pt, breakable: false)[#grid(columns: (depth * 9pt + 8pt, 44pt, 1fr), column-gutter: 4pt, align: (left, left, left), [#text(size: 7.5pt, fill: luma(45%))[#if depth == 0 [•] else [>]]], [#text(size: 7.5pt, fill: luma(40%))[#kind]], [#name#if sam != "" and sam != name [#text(size: 7.5pt, fill: luma(40%))[ (#sam)]]#if cycle [#text(size: 7.5pt)[ (Zyklus)]]])]',
     "",
-    '#text(size: 22pt, weight: "semibold")[Dateiserver-Bericht]',
+    '#text(size: 22pt, weight: "semibold")[DomainShare-Bericht]',
     "#v(5pt)",
     keyValueTable([
       ["Server", system.hostname || "—"],
@@ -334,7 +334,7 @@ export async function createPdfReport(data, progress = () => {}) {
     throw new Error("Typst hat keine gültige PDF-Datei erzeugt.");
   }
 
-  const filename = "dateiserver-bericht-" + fileTimestamp(data.generatedAt) + ".pdf";
+  const filename = "domainshare-bericht-" + fileTimestamp(data.generatedAt) + ".pdf";
   const url = URL.createObjectURL(new Blob([pdf], {type: "application/pdf"}));
   const link = document.createElement("a");
   link.href = url;

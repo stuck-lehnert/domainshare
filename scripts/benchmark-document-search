@@ -31,7 +31,7 @@ if args.rows < 1000 or args.repeat < 1:
 if args.query_only and not args.database:
     parser.error('--query-only requires --database')
 
-with tempfile.TemporaryDirectory(prefix='adfs-search-benchmark-') as temporary:
+with tempfile.TemporaryDirectory(prefix='domainshare-search-benchmark-') as temporary:
     root = Path(temporary)
     filename = Path(args.database + '.fixture.pdf') if args.database else root / 'fixture.pdf'
     if not filename.exists() and not args.query_only:

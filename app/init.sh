@@ -46,13 +46,13 @@ require_vfs_modules() {
 }
 
 derive_netbios_name() {
-  local raw_name="${NETBIOS_NAME:-ADSAMBAFSRV}"
+  local raw_name="${NETBIOS_NAME:-DOMAINSHARE}"
   local upper_name="${raw_name^^}"
   local cleaned_name
   cleaned_name="$(printf '%s' "$upper_name" | tr -cd 'A-Z0-9')"
 
   if [[ -z "$cleaned_name" ]]; then
-    cleaned_name="SAMBAFS"
+    cleaned_name="DOMAINSHARE"
   fi
 
   if [[ ${#cleaned_name} -gt 15 ]]; then
@@ -397,7 +397,7 @@ url, output, insecure_value = sys.argv[1:]
 context = ssl.create_default_context()
 if insecure_value == "true":
     context = ssl._create_unverified_context()  # noqa: SLF001
-request = urllib.request.Request(url, headers={"User-Agent": "ad-file-server-ca-bootstrap/1"})
+request = urllib.request.Request(url, headers={"User-Agent": "DomainShare-CA-Bootstrap/1"})
 with urllib.request.urlopen(request, context=context, timeout=30) as response:
     if urllib.parse.urlsplit(response.geturl()).scheme != "https":
         raise RuntimeError("CA certificate download redirected away from HTTPS")
@@ -552,7 +552,7 @@ start_observability_services() {
   log 'Starting Samba audit collector'
   python3 /app/audit_collector.py &
 
-  if [[ "${ADFS_SUPERVISED:-false}" == "true" ]]; then
+  if [[ "${DOMAINSHARE_SUPERVISED:-false}" == "true" ]]; then
     configure_web_tls
     if env_is_true "${WEB_TLS_AUTORENEW:-true}"; then
       case "$ACTIVE_WEB_TLS_MODE" in
@@ -598,7 +598,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 17 * * * * root source /app/runtime.env && /usr/bin/python3 /app/trash.py --cleanup
 EOF
 
-  if [[ "${ADFS_SUPERVISED:-false}" != "true" ]] && [[ -n "${BACKUP_DESTINATION:-}" ]] && env_is_true "${BACKUP_AUTO_ENABLED:-true}"; then
+  if [[ "${DOMAINSHARE_SUPERVISED:-false}" != "true" ]] && [[ -n "${BACKUP_DESTINATION:-}" ]] && env_is_true "${BACKUP_AUTO_ENABLED:-true}"; then
     cat >> /etc/cron.d/reconcile-shares <<EOF
 0 ${BACKUP_START_HOUR} * * * root source /app/runtime.env && BACKUP_TRIGGER=automatic /usr/bin/python3 /app/backup_to_destination.py
 EOF
@@ -607,7 +607,7 @@ EOF
   chmod 0644 /etc/cron.d/reconcile-shares
 }
 
-if [[ "${ADFS_SUPERVISED:-false}" == "true" ]]; then
+if [[ "${DOMAINSHARE_SUPERVISED:-false}" == "true" ]]; then
   source <(python3 /app/configuration.py export-shell)
 fi
 if [[ "${1:-}" == "--configure-tls" ]]; then
@@ -654,7 +654,7 @@ winbindd -F --no-process-group &
 winbind_pid=$!
 
 wait_for_winbind
-touch /run/adfs-domain-ready
+touch /run/domainshare-domain-ready
 if [[ "${1:-}" == "--bootstrap-domain" ]]; then
   log 'Domain joined; waiting for web setup to select groups.'
   wait "$winbind_pid"
@@ -688,5 +688,5 @@ log 'Starting cron daemon'
 cron -f &
 
 log 'Starting smbd in foreground'
-touch /run/adfs-services-ready
+touch /run/domainshare-services-ready
 exec smbd -F --no-process-group

@@ -10,7 +10,7 @@ from app import configuration, state_db, web_security, web_ui
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix='adfs-configuration-browser-') as root:
+    with tempfile.TemporaryDirectory(prefix='domainshare-configuration-browser-') as root:
         store = configuration.Store(root)
         web_ui.CONFIG = store
         identity = {'sub':'EXAMPLE\\admin','sid':'S-1-5-21-1-2-3-1100','uid':1000,'role':'domain-admin'}
@@ -22,7 +22,7 @@ def main():
         web_ui.APP = SimpleNamespace(tokens=tokens, backup=lambda include_log=True: {'enabled':False,'manualEnabled':False,'state':'disabled','log':[]})
         web_ui.STATIC_ROOT = str(Path(__file__).resolve().parents[1] / 'app/web')
         original_exists = os.path.exists
-        os.path.exists = lambda path: True if str(path) in ('/run/adfs-domain-ready','/run/adfs-services-ready') else original_exists(path)
+        os.path.exists = lambda path: True if str(path) in ('/run/domainshare-domain-ready','/run/domainshare-services-ready') else original_exists(path)
 
         class Handler(web_ui.Handler):
             def domain_groups(self):

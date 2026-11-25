@@ -201,7 +201,7 @@ def watch_loop(stop):
 
 def run_job(row, source, phase, cancelled=None):
     timeout = setting('DOCUMENT_OCR_TIMEOUT_SECONDS', 600, 30, 3600) if phase == 'ocr' else 120
-    job_root = '/tmp/adfs-document-jobs'
+    job_root = '/tmp/domainshare-document-jobs'
     os.makedirs(job_root, mode=0o700, exist_ok=True)
     user = pwd.getpwnam('document-ocr')
     with tempfile.TemporaryDirectory(prefix='job-', dir=job_root) as workspace:
