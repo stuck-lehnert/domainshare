@@ -46,6 +46,7 @@ COPY app/account_policy.py /app/account_policy.py
 COPY app/audit_store.py /app/audit_store.py
 COPY app/audit_collector.py /app/audit_collector.py
 COPY app/trash.py /app/trash.py
+COPY app/agent_api.py /app/agent_api.py
 COPY app/web_ui.py /app/web_ui.py
 COPY app/web_security.py /app/web_security.py
 COPY app/configuration.py app/backup_keys.py app/tls_configuration.py app/entrypoint.py app/run_service.py app/healthcheck.py /app/
