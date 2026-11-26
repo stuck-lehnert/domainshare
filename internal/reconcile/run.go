@@ -73,6 +73,12 @@ func Run(ctx context.Context, options Options) error {
 				value.State, value.Phase, value.Percent = "completed", "completed", 100
 				value.Message = fmt.Sprintf("Reconciliation completed in %s", time.Since(started).Round(time.Millisecond))
 			}
+
+			// The status endpoint reads the log alongside the status. Write the
+			// terminal line first so it is already visible on completion.
+			if options.Logf != nil {
+				options.Logf("%s", value.Message)
+			}
 			options.publish(value)
 		}()
 
