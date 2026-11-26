@@ -2,11 +2,13 @@
 
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -22,12 +24,14 @@ STATE_DB_PATH = os.getenv(
     os.getenv("SHARE_DB_PATH", os.path.join(STATE_ROOT, "shares.db")),
 )
 LOCK_PATH = os.path.join(STATE_ROOT, "backup.lock")
+PENDING_SNAPSHOTS_DIRECTORY = "backup-pending"
 DEFAULT_BACKUP_LOG_FILE = "/var/log/backup.log"
 DEFAULT_BACKUP_STATUS_FILE = "/state/backup-status.json"
 DEFAULT_ARCHIVE_TEMP_DIR = "/tmp"
 GROUPS_SOURCE_PATH = "/data/groups"
 GROUP_ARCHIVE_CATEGORIES = ("data", "archive")
 TRASH_DIRECTORY = ".trash"
+OFFICE_LOCK_PATTERN = "~$*"
 TRASH_EXCLUDED_DESTINATIONS = frozenset(
     {"data/private", "data/groups", "data/fslogix"}
 )
@@ -38,6 +42,7 @@ MAX_PARALLEL_FILE_UPLOADS = 12
 MAX_CAPTURED_OUTPUT_LINES = 50
 MAX_CAPTURED_OUTPUT_RECORD_LENGTH = 1000
 SNAPSHOT_NAME_RE = re.compile(r"^\d{8}T\d{6}Z$")
+RSYNC_VANISHED_SOURCE = 24
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 RCLONE_FILE_PROGRESS_RE = re.compile(
     r"^\s*\*\s+(?P<file>.+?):\s+(?P<percent>\d+(?:\.\d+)?)%\s*(?P<detail>.*)$"
@@ -435,10 +440,8 @@ def measure_path_bytes(path: str, *, exclude_root_trash: bool = False) -> int:
             with os.scandir(current) as entries:
                 for entry in entries:
                     try:
-                        if (
-                            exclude_root_trash
-                            and is_root
-                            and entry.name == TRASH_DIRECTORY
+                        if entry.name.startswith("~$") or (
+                            exclude_root_trash and is_root and entry.name == TRASH_DIRECTORY
                         ):
                             continue
                         if entry.is_dir(follow_symlinks=False):
@@ -861,6 +864,7 @@ def run_streaming_command(
     *,
     progress: SyncProgressReporter,
     env: Optional[Dict[str, str]] = None,
+    accept_vanished_source: bool = False,
 ) -> subprocess.CompletedProcess:
     process = subprocess.Popen(
         command,
@@ -873,6 +877,7 @@ def run_streaming_command(
     splitter = OutputRecordSplitter()
     captured_records: List[str] = []
     returncode: Optional[int] = None
+    tolerated = False
 
     try:
         if process.stdout is not None:
@@ -893,11 +898,26 @@ def run_streaming_command(
             progress.observe(record)
 
         returncode = process.wait()
+        tolerated = accept_vanished_source and returncode == RSYNC_VANISHED_SOURCE
+    except BaseException:
+        # Stop the writer before run_backup tries to remove its partial upload.
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise
     finally:
-        progress.finish(success=returncode == 0)
+        if process.stdout is not None:
+            process.stdout.close()
+        progress.finish(success=returncode == 0 or tolerated)
 
     stdout = "\n".join(captured_records)
-    if returncode != 0:
+    if tolerated:
+        log("Skipping rsync source files that disappeared during the backup (exit 24)")
+    elif returncode != 0:
         output = stdout.strip() or f"exit code {returncode}"
         raise RuntimeError(f"Command failed ({command[0]}): {output}")
     return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr="")
@@ -965,6 +985,7 @@ def prepare_state_snapshot(
     document_relative = os.path.relpath(document_cache, state_root)
     excluded = {
         document_relative,
+        PENDING_SNAPSHOTS_DIRECTORY,
         database_relative,
         f"{database_relative}-wal",
         f"{database_relative}-shm",
@@ -1032,44 +1053,96 @@ def archive_password() -> str:
     return password
 
 
-def create_group_archive(source_path: str, archive_path: str, password: Optional[str]) -> None:
+def archive_has_only_missing_file_warnings(stderr: str) -> bool:
+    # 7z prints each warning as an error description followed by its filename.
+    # Exit 1 can also mean permission or read errors; do not accept those.
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    return bool(lines) and len(lines) % 2 == 0 and all(
+        re.fullmatch(r"WARNING: (?:errno=2\s*:\s*)?No such file or directory", lines[index])
+        for index in range(0, len(lines), 2)
+    )
+
+
+def create_group_archive(source_path: str, archive_path: str, password: Optional[str]) -> bool:
+    """Archive a live source. Return False if the source itself disappeared."""
     os.makedirs(os.path.dirname(archive_path), exist_ok=True)
     source_parent = os.path.dirname(source_path)
     source_name = os.path.basename(source_path)
-    result = run_command(
-        [
-            "7z",
-            "a",
-            "-t7z",
-            "-m0=lzma2",
-            "-mx=5",
-            "-mmt=on",
-            "-ms=off",
-            *(['-mhe=on', '-p'] if password else []),
-            '-snl',
-            '-xr!.trash',
-            "-y",
-            archive_path,
-            "--",
-            source_name,
-        ],
-        input_text=f"{password}\n" if password else None,
-        check=False,
-        env=os.environ.copy(),
-        cwd=source_parent,
-    )
-    if result.returncode != 0:
-        output = result.stderr.strip() or result.stdout.strip()
-        raise RuntimeError(f"Unable to archive group {source_name}: {output}")
+    try:
+        result = run_command(
+            [
+                "7z",
+                "a",
+                "-t7z",
+                "-m0=lzma2",
+                "-mx=5",
+                "-mmt=on",
+                "-ms=off",
+                *(['-mhe=on', '-p'] if password else []),
+                '-snl',
+                '-xr!.trash',
+                f'-xr!{OFFICE_LOCK_PATTERN}',
+                "-y",
+                archive_path,
+                "--",
+                source_name,
+            ],
+            input_text=f"{password}\n" if password else None,
+            check=False,
+            env={**os.environ, "LC_ALL": "C.UTF-8"},
+            cwd=source_parent,
+        )
+    except FileNotFoundError as exc:
+        if exc.filename != source_parent:
+            raise
+        log(f"Skipping vanished backup source {source_path}")
+        return False
+
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1 and archive_has_only_missing_file_warnings(result.stderr):
+        if os.path.isfile(archive_path):
+            log(f"Skipped files that disappeared while archiving {source_path}")
+            return True
+        try:
+            os.lstat(source_path)
+        except FileNotFoundError:
+            log(f"Skipping vanished backup source {source_path}")
+            return False
+
+    output = result.stderr.strip() or result.stdout.strip()
+    raise RuntimeError(f"Unable to archive {source_path}: {output}")
+
+
+def scan_live_backup_directory(path: str) -> List[os.DirEntry]:
+    try:
+        with os.scandir(path) as entries:
+            return sorted(
+                (entry for entry in entries if not entry.name.startswith("~$")),
+                key=lambda entry: entry.name.casefold(),
+            )
+    except FileNotFoundError:
+        log(f"Skipping vanished backup directory {path}")
+        return []
 
 
 def copy_backup_entry(entry: os.DirEntry, destination: str) -> None:
-    if entry.is_symlink():
-        os.symlink(os.readlink(entry.path), destination)
-    elif entry.is_dir(follow_symlinks=False):
-        shutil.copytree(entry.path, destination, symlinks=True)
-    else:
-        shutil.copy2(entry.path, destination, follow_symlinks=False)
+    source = entry.path
+    try:
+        mode = os.lstat(source).st_mode
+        if stat.S_ISLNK(mode):
+            os.symlink(os.readlink(source), destination)
+        elif stat.S_ISDIR(mode):
+            os.mkdir(destination)
+            for child in scan_live_backup_directory(source):
+                copy_backup_entry(child, os.path.join(destination, child.name))
+            shutil.copystat(source, destination, follow_symlinks=False)
+        else:
+            shutil.copy2(source, destination, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        if exc.filename != source:
+            raise
+        log(f"Skipping vanished backup source {source}")
 
 
 def prepare_group_archives(
@@ -1094,7 +1167,7 @@ def prepare_group_archives(
     archive_count = 0
     try:
         os.makedirs(staged_root, exist_ok=True)
-        entries = sorted(os.scandir(source_root), key=lambda entry: entry.name.casefold())
+        entries = scan_live_backup_directory(source_root)
         by_name = {entry.name: entry for entry in entries}
         for category in GROUP_ARCHIVE_CATEGORIES:
             source_category = by_name.pop(category, None)
@@ -1109,10 +1182,7 @@ def prepare_group_archives(
                 continue
 
             os.makedirs(target_category, exist_ok=True)
-            members = sorted(
-                os.scandir(source_category.path),
-                key=lambda entry: entry.name.casefold(),
-            )
+            members = scan_live_backup_directory(source_category.path)
             for entry in members:
                 if entry.name == TRASH_DIRECTORY:
                     log(f"Excluding retained trash from backup source {category}")
@@ -1128,12 +1198,8 @@ def prepare_group_archives(
                             message=f"Archiving group {relative_name}",
                             activeFiles=[],
                         )
-                    create_group_archive(
-                        entry.path,
-                        f"{target}.7z",
-                        archive_secret,
-                    )
-                    archive_count += 1
+                    if create_group_archive(entry.path, f"{target}.7z", archive_secret):
+                        archive_count += 1
                 else:
                     log(f"Preserving non-group entry {category}/{entry.name}")
                     copy_backup_entry(entry, target)
@@ -1171,17 +1237,19 @@ def prepare_encrypted_sources(sources, password, temporary_parent=None):
     """Encrypt every original/configuration source, including archive headers."""
     root = tempfile.mkdtemp(prefix='backup-encrypted-', dir=temporary_parent or None)
     staged = os.path.join(root, 'encrypted')
-    os.makedirs(staged)
     try:
+        os.makedirs(staged)
+        archives = []
         for source_path, destination_path in sources:
             name = destination_path.replace('/', '-') + '.7z'
             if BACKUP_STATUS is not None:
                 BACKUP_STATUS.write(state='running', currentSource=destination_path,
                                     message=f'Encrypting {destination_path}', activeFiles=[])
-            create_group_archive(source_path, os.path.join(staged, name), password)
+            if create_group_archive(source_path, os.path.join(staged, name), password):
+                archives.append(name)
         metadata = {'format': os.getenv('BACKUP_KEY_FORMAT', '7z-aes256'),
                     'keyId': os.getenv('BACKUP_KEY_ID', ''), 'encrypted': True,
-                    'archives': [destination.replace('/', '-') + '.7z' for _, destination in sources]}
+                    'archives': archives}
         with open(os.path.join(staged, 'backup-format.json'), 'w') as handle:
             json.dump(metadata, handle)
         return root, [(staged, 'encrypted')]
@@ -1292,6 +1360,45 @@ def choose_snapshot_name(existing_names: Set[str]) -> str:
         if candidate not in existing_names:
             return candidate
     raise RuntimeError("Unable to generate a unique snapshot name")
+
+
+def pending_snapshot_path(destination: Destination) -> str:
+    # A password change must not orphan cleanup, but a different destination or
+    # key namespace must never inherit a deletion from the old one.
+    target = [destination.scheme, destination.hostname, destination.port,
+              destination.username, destination.path.rstrip("/")]
+    key = hashlib.sha256(json.dumps(target).encode("utf-8")).hexdigest()
+    return os.path.join(STATE_ROOT, PENDING_SNAPSHOTS_DIRECTORY, key)
+
+
+def record_pending_snapshot(path: str, snapshot_name: str) -> None:
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    temporary_path = f"{path}.tmp"
+    with open(temporary_path, "w", encoding="ascii") as handle:
+        handle.write(f"{snapshot_name}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary_path, path)
+
+
+def cleanup_pending_snapshot(backend, path: str) -> None:
+    try:
+        with open(path, encoding="ascii") as handle:
+            snapshot_name = handle.read().strip()
+    except FileNotFoundError:
+        return
+
+    if parse_snapshot_name(snapshot_name) is None:
+        raise RuntimeError("Invalid pending backup snapshot name; refusing cleanup")
+
+    # A marker write can succeed remotely even if the client reports a failure.
+    # Never delete a completed snapshot, or one whose marker cannot be checked.
+    if snapshot_name in backend.list_snapshot_directories():
+        if not backend.snapshot_has_marker(snapshot_name):
+            log(f"Removing incomplete snapshot {snapshot_name}")
+            backend.delete_snapshot(snapshot_name)
+    os.unlink(path)
 
 
 def is_week_start(timestamp: dt.datetime) -> bool:
@@ -1481,9 +1588,22 @@ class RcloneBackend:
             "--config",
             self.config_path,
         ]
+        command.extend(["--exclude", OFFICE_LOCK_PATTERN])
         if destination_path in TRASH_EXCLUDED_DESTINATIONS:
             command.extend(["--exclude", f"/{TRASH_DIRECTORY}/**"])
-        run_streaming_command(command, progress=progress)
+        try:
+            run_streaming_command(command, progress=progress)
+        except RuntimeError as exc:
+            # Retry with a fresh source listing. Never turn a rclone error into
+            # success based on text: other files may have failed in the same pass.
+            vanished = any(
+                "failed to open source object" in line and "no such file or directory" in line
+                for line in str(exc).lower().splitlines()
+            )
+            if not vanished:
+                raise
+            log(f"A source file disappeared while syncing {destination_path}; retrying the source")
+            run_streaming_command(command, progress=progress)
 
     def write_marker(self, snapshot_name: str) -> None:
         marker_path = join_path(self._snapshot_root(snapshot_name), ".backup_complete")
@@ -1492,7 +1612,7 @@ class RcloneBackend:
             input_text=f"{dt.datetime.now(dt.timezone.utc).isoformat()}\n",
         )
 
-    def _snapshot_has_marker(self, snapshot_name: str) -> bool:
+    def snapshot_has_marker(self, snapshot_name: str) -> bool:
         result = self._run(
             [
                 "lsf",
@@ -1501,43 +1621,29 @@ class RcloneBackend:
                 "--include",
                 ".backup_complete",
             ],
-            check=False,
         )
-        if result.returncode != 0:
-            return False
         return any(
             line.strip() == ".backup_complete" for line in result.stdout.splitlines()
         )
 
-    def list_snapshots(self) -> List[str]:
+    def list_snapshot_directories(self) -> List[str]:
         result = self._run(
             ["lsf", f"backup:{self._snapshots_root()}", "--dirs-only", "--format", "p"],
             check=False,
         )
         if result.returncode != 0:
-            output = (result.stderr.strip() or result.stdout.strip()).lower()
-            if "not found" in output or "doesn't exist" in output:
+            if result.returncode == 3:  # rclone: directory not found
                 return []
             raise RuntimeError(result.stderr.strip() or result.stdout.strip())
 
-        names: List[str] = []
-        for line in result.stdout.splitlines():
-            candidate = line.strip().rstrip("/")
-            if not SNAPSHOT_NAME_RE.match(candidate):
-                continue
-            if self._snapshot_has_marker(candidate):
-                names.append(candidate)
-        return sorted(set(names))
+        names = {line.rstrip("/") for line in result.stdout.splitlines()}
+        return sorted(name for name in names if SNAPSHOT_NAME_RE.fullmatch(name))
+
+    def list_snapshots(self) -> List[str]:
+        return [name for name in self.list_snapshot_directories() if self.snapshot_has_marker(name)]
 
     def delete_snapshot(self, snapshot_name: str) -> None:
-        result = self._run(
-            ["purge", f"backup:{self._snapshot_root(snapshot_name)}"],
-            check=False,
-        )
-        if result.returncode != 0:
-            log(
-                f"Failed to delete snapshot {snapshot_name}: {result.stderr.strip() or result.stdout.strip()}"
-            )
+        self._run(["purge", f"backup:{self._snapshot_root(snapshot_name)}"])
 
 
 class RsyncBackend:
@@ -1555,6 +1661,7 @@ class RsyncBackend:
         user_prefix = f"{destination.username}@" if destination.username else ""
         self.remote_base = f"rsync://{user_prefix}{host}/{module_path.rstrip('/')}"
         self.command_env = os.environ.copy()
+        self.command_env["LC_ALL"] = "C"
         if destination.password:
             self.command_env["RSYNC_PASSWORD"] = destination.password
 
@@ -1600,11 +1707,13 @@ class RsyncBackend:
         ]
         if destination_path in TRASH_EXCLUDED_DESTINATIONS:
             command.append(f"--exclude=/{TRASH_DIRECTORY}/")
+        command.append(f"--exclude={OFFICE_LOCK_PATTERN}")
         command.extend([f"{source_path}/", f"{target}/"])
         run_streaming_command(
             command,
             env=self.command_env,
             progress=progress,
+            accept_vanished_source=True,
         )
 
     def write_marker(self, snapshot_name: str) -> None:
@@ -1623,16 +1732,25 @@ class RsyncBackend:
             if marker_file and os.path.exists(marker_file):
                 os.remove(marker_file)
 
-    def _snapshot_has_marker(self, snapshot_name: str) -> bool:
-        marker_remote = self._remote_path(f"snapshots/{snapshot_name}/.backup_complete")
+    def snapshot_has_marker(self, snapshot_name: str) -> bool:
+        snapshot_remote = self._remote_path(f"snapshots/{snapshot_name}")
         result = run_command(
-            ["rsync", "--list-only", marker_remote],
+            ["rsync", "--list-only", f"{snapshot_remote}/"],
             env=self.command_env,
-            check=False,
         )
-        return result.returncode == 0
+        return any(
+            name == ".backup_complete" and mode.startswith("-")
+            for mode, name in self._listed_entries(result.stdout)
+        )
 
-    def list_snapshots(self) -> List[str]:
+    @staticmethod
+    def _listed_entries(output: str):
+        for line in output.splitlines():
+            parts = line.split(maxsplit=4)
+            if len(parts) == 5:
+                yield parts[0], parts[4]
+
+    def list_snapshot_directories(self) -> List[str]:
         root = self._remote_path("snapshots")
         result = run_command(
             ["rsync", "--list-only", f"{root}/"],
@@ -1641,46 +1759,29 @@ class RsyncBackend:
         )
         if result.returncode != 0:
             output = result.stderr.strip() or result.stdout.strip()
-            lower = output.lower()
-            if (
-                "no such file" in lower
-                or "not found" in lower
-                or "chdir failed" in lower
+            if "No such file or directory (2)" in output and re.search(
+                r"\b(?:chdir|change_dir|link_stat)\b", output
             ):
                 return []
             raise RuntimeError(output)
 
-        names: List[str] = []
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line or line.startswith("receiving"):
-                continue
-            parts = line.split()
-            if not parts:
-                continue
-            candidate = parts[-1].rstrip("/")
-            if not SNAPSHOT_NAME_RE.match(candidate):
-                continue
-            if self._snapshot_has_marker(candidate):
-                names.append(candidate)
-        return sorted(set(names))
+        return sorted({
+            name for mode, name in self._listed_entries(result.stdout)
+            if mode.startswith("d") and SNAPSHOT_NAME_RE.fullmatch(name)
+        })
+
+    def list_snapshots(self) -> List[str]:
+        return [name for name in self.list_snapshot_directories() if self.snapshot_has_marker(name)]
 
     def delete_snapshot(self, snapshot_name: str) -> None:
-        snapshot_remote = self._remote_path(f"snapshots/{snapshot_name}")
-        empty_dir = tempfile.mkdtemp(prefix="backup-empty-")
-        try:
-            run_command(
-                ["rsync", "-a", "--delete", f"{empty_dir}/", f"{snapshot_remote}/"],
-                env=self.command_env,
-                check=False,
-            )
-
+        # The anchored include permits deleting only this directory. Everything
+        # else stays excluded (and therefore protected from rsync's --delete).
+        with tempfile.TemporaryDirectory(prefix="backup-empty-") as empty_dir:
             run_command(
                 [
                     "rsync",
                     "-a",
                     "--delete",
-                    "--prune-empty-dirs",
                     "--include",
                     f"/{snapshot_name}/***",
                     "--exclude",
@@ -1689,10 +1790,7 @@ class RsyncBackend:
                     f"{self._remote_path('snapshots')}/",
                 ],
                 env=self.command_env,
-                check=False,
             )
-        finally:
-            os.rmdir(empty_dir)
 
 
 def build_backend(destination: Destination):
@@ -1746,7 +1844,11 @@ def run_backup() -> int:
     state_snapshot_root = None
     group_archive_root = None
     encrypted_root = None
+    pending_path = pending_snapshot_path(destination)
     try:
+        backend = build_backend(destination)
+        cleanup_pending_snapshot(backend, pending_path)
+
         state_snapshot = None
         if os.path.isdir(STATE_ROOT):
             BACKUP_STATUS.write(message="Creating consistent state database snapshot")
@@ -1771,10 +1873,9 @@ def run_backup() -> int:
             encrypted_root, sources = prepare_encrypted_sources(sources, archive_password(),
                 os.getenv('BACKUP_ARCHIVE_TEMP_DIR', DEFAULT_ARCHIVE_TEMP_DIR))
 
-        backend = build_backend(destination)
         log(f"Starting backup to {redact_destination(destination.raw_url)}")
 
-        existing = set(backend.list_snapshots())
+        existing = set(backend.list_snapshot_directories())
         snapshot_name = choose_snapshot_name(existing)
         log(f"Creating snapshot {snapshot_name}")
         BACKUP_STATUS.write(snapshot=snapshot_name, message="Measuring backup payload")
@@ -1789,19 +1890,29 @@ def run_backup() -> int:
             message=f"Backup payload: {format_bytes(total_bytes)}",
         )
 
-        for source_path, destination_path in sources:
-            log(f"Syncing {destination_path}")
-            backend.sync_source(
-                snapshot_name,
-                source_path,
-                destination_path,
-                source_total_bytes=source_sizes[source_path],
-                overall_progress=overall_progress,
-                progress_interval_seconds=progress_interval_seconds,
-                interactive_progress=interactive_progress,
-            )
+        record_pending_snapshot(pending_path, snapshot_name)
+        try:
+            for source_path, destination_path in sources:
+                log(f"Syncing {destination_path}")
+                backend.sync_source(
+                    snapshot_name,
+                    source_path,
+                    destination_path,
+                    source_total_bytes=source_sizes[source_path],
+                    overall_progress=overall_progress,
+                    progress_interval_seconds=progress_interval_seconds,
+                    interactive_progress=interactive_progress,
+                )
 
-        backend.write_marker(snapshot_name)
+            backend.write_marker(snapshot_name)
+        except BaseException:
+            try:
+                cleanup_pending_snapshot(backend, pending_path)
+            except Exception as exc:
+                log(f"Could not clean up snapshot {snapshot_name}; will retry on the next backup: {exc}")
+            raise
+
+        os.unlink(pending_path)
 
         all_snapshot_names = backend.list_snapshots()
         snapshots = parse_snapshot_inventory(all_snapshot_names)
@@ -1823,14 +1934,14 @@ def run_backup() -> int:
         )
         return 0
     finally:
-        if backend is not None:
-            backend.close()
         if state_snapshot_root is not None:
             shutil.rmtree(state_snapshot_root, ignore_errors=True)
         if group_archive_root is not None:
             shutil.rmtree(group_archive_root, ignore_errors=True)
         if encrypted_root is not None:
             shutil.rmtree(encrypted_root, ignore_errors=True)
+        if backend is not None:
+            backend.close()
 
 
 def with_lock() -> int:
