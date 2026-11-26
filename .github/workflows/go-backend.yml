@@ -58,7 +58,10 @@ jobs:
           fi
 
           # Keep the failure visible in the Checks API as well as the job log.
-          failure=$(grep -Ei '(^\[e2e\]|error:|failed|fatal|assertion|traceback|exception|not permitted)' "$log" | tail -n 32 || true)
+          failure=$(
+            grep -E '(^\[e2e\]|^error:)' "$log" | tail -n 12 || true
+            awk '/^===== [^ ]+-files =====/{found=1; next} /^===== /{found=0} found' "$log" | tail -n 32
+          )
           failure=${failure:0:6000}
           failure=${failure//'%'/'%25'}
           failure=${failure//$'\r'/'%0D'}

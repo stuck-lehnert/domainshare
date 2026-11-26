@@ -181,6 +181,9 @@ show_logs() {
     if "$engine" inspect "$container" >/dev/null 2>&1; then
       printf '\n===== %s =====\n' "$container" >&2
       "$engine" logs --tail 160 "$container" >&2 || true
+      if [[ $container == "$files_container" ]]; then
+        "$engine" exec "$container" cat /state/services-status.json >&2 || true
+      fi
     fi
   done
 }

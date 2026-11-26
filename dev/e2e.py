@@ -173,6 +173,17 @@ def upgrade_activity(session):
     return http(query_path("/api/activity", {"user": "alice", "path": UPGRADE_PATH}), token=session)
 
 
+def is_upgrade_write(event):
+    # Samba's audit module can report either a share-relative or an absolute path.
+    path = event.get("path", "")
+    return (
+        event.get("share") == "Data"
+        and event.get("action") == "write"
+        and event.get("success") is True
+        and (path == UPGRADE_PATH or path.endswith("/" + UPGRADE_PATH))
+    )
+
+
 def finance_policy(session):
     response = http("/api/access", token=session)
     check(response.status == 200, "unable to read the Finance share policy")
@@ -195,9 +206,9 @@ def prepare_upgrade(path):
     document = eventually("Python catalog upgrade row", lambda: upgrade_document(alice_session),
                           lambda r: r.status == 200 and r.json()["total"] == 1, timeout=90).json()["items"][0]
     events = eventually("Python audit upgrade row", lambda: upgrade_activity(admin_session),
-                        lambda r: r.status == 200 and any(event["path"] == UPGRADE_PATH
-                                                         for event in r.json()["events"]), timeout=60).json()["events"]
-    event = next(item for item in events if item["path"] == UPGRADE_PATH)
+                        lambda r: r.status == 200 and any(map(is_upgrade_write, r.json()["events"])),
+                        timeout=60).json()["events"]
+    event = next(item for item in events if is_upgrade_write(item))
 
     agent = http("/admin/api/agent-tokens", method="POST", token=admin_session,
                  value={"label": "Python upgrade fixture", "usernames": ["alice"], "expiresInDays": 1})
@@ -212,6 +223,7 @@ def prepare_upgrade(path):
         "policy": policy,
         "document": document["id"],
         "event": event["id"],
+        "eventPath": event["path"],
     }
     Path(path).write_text(json.dumps(fixture), encoding="utf-8")
 
@@ -224,8 +236,13 @@ def verify_upgrade(path):
     check(finance_policy(fixture["admin"]) == fixture["policy"], "the Finance share policy changed during the upgrade")
 
     activity = upgrade_activity(fixture["admin"])
-    check(activity.status == 200 and any(event["id"] == fixture["event"] and event["path"] == UPGRADE_PATH
-                                         for event in activity.json()["events"]), "Python audit event was not preserved")
+    check(
+        activity.status == 200 and any(
+            event["id"] == fixture["event"] and event["path"] == fixture["eventPath"]
+            and is_upgrade_write(event) for event in activity.json()["events"]
+        ),
+        "Python audit event was not preserved",
+    )
     document = upgrade_document(fixture["alice"])
     check(document.status == 200 and [row["id"] for row in document.json()["items"]] == [fixture["document"]],
           "Python catalog document was not preserved")
