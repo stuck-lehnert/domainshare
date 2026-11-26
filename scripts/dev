@@ -520,6 +520,7 @@ fi
 
 run_e2e_checks() {
   PREVIEW_ENGINE="$engine" \
+    PREVIEW_BACKEND="$backend" \
     PREVIEW_FILES_CONTAINER="$files_container" \
     PREVIEW_CLIENT_CONTAINER="$client_container" \
     PREVIEW_BACKUP_CONTAINER="$backup_container" \

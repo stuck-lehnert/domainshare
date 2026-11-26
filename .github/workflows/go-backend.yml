@@ -49,4 +49,19 @@ jobs:
       DEV_BACKEND: ${{ matrix.backend }}
     steps:
       - uses: actions/checkout@v4
-      - run: ./scripts/test-e2e
+      - name: Run AD/Samba end-to-end tests
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/domainshare-e2e.log"
+          if ./scripts/test-e2e 2>&1 | tee "$log"; then
+            exit 0
+          fi
+
+          # Keep the failure visible in the Checks API as well as the job log.
+          failure=$(grep -Ei '(^\[e2e\]|error:|failed|fatal|assertion|traceback|exception|not permitted)' "$log" | tail -n 32 || true)
+          failure=${failure:0:6000}
+          failure=${failure//'%'/'%25'}
+          failure=${failure//$'\r'/'%0D'}
+          failure=${failure//$'\n'/'%0A'}
+          printf '::error title=AD/Samba end-to-end test failed::%s\n' "${failure:-See the job log for details.}"
+          exit 1

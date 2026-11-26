@@ -1111,8 +1111,12 @@ with access.mutation_lock():
         print(json.dumps({'sha256':hashlib.sha256(handle.read()).hexdigest(),'inode':os.stat(retained).st_ino}))
 """, folder_id, DOMAIN_SID).stdout)
     allowed('cd Permissions; get retained-system-grant.bin /tmp/old-system-grant.bin', 'MSOL_sync')
-    engine_run('exec', FILES_CONTAINER, 'bash', '-lc',
-               'source /app/runtime.env && exec python3 /app/reconcile_shares.py')
+    if os.environ.get("PREVIEW_BACKEND", "python") == "python":
+        engine_run('exec', FILES_CONTAINER, 'bash', '-lc',
+                   'source /app/runtime.env && exec python3 /app/reconcile_shares.py')
+    else:
+        engine_run('exec', FILES_CONTAINER, '/usr/local/bin/domainshare', 'reconcile')
+
     code, output = smb('cd Permissions; get retained-system-grant.bin /tmp/revoked-system-grant.bin', 'MSOL_sync')
     check(code != 0 or 'NT_STATUS_ACCESS_DENIED' in output, 'stored system-account grant still permits SMB reads')
     actual_service_file = json.loads(engine_run('exec', FILES_CONTAINER, 'python3', '-c', """
