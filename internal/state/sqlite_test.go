@@ -76,3 +76,51 @@ CREATE TABLE child (id INTEGER REFERENCES parent(id));`); err != nil {
 		t.Fatal("read-only connection wrote to the DB")
 	}
 }
+
+func TestOpenPrivatePreservesLegacyWAL(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "shares.db")
+	legacy, err := Open(ctx, path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+
+	if _, err := legacy.ExecContext(ctx, `CREATE TABLE legacy(value TEXT); INSERT INTO legacy VALUES('in the WAL');`); err != nil {
+		t.Fatal(err)
+	}
+	files := []string{path, path + "-wal", path + "-shm"}
+	for _, file := range files {
+		if err := os.Chmod(file, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	current, err := OpenPrivate(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer current.Close()
+
+	var value string
+	if err := current.QueryRowContext(ctx, `SELECT value FROM legacy`).Scan(&value); err != nil || value != "in the WAL" {
+		t.Fatalf("legacy transaction was not preserved: %q, %v", value, err)
+	}
+	for _, file := range files {
+		info, err := os.Stat(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("%s still has permissions %o", filepath.Base(file), info.Mode().Perm())
+		}
+	}
+
+	if err := os.Chmod(path+"-wal", 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if database, err := OpenPrivate(ctx, path); err == nil {
+		database.Close()
+		t.Fatal("accepted a publicly writable WAL")
+	}
+}

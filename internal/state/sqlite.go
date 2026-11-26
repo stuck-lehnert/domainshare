@@ -54,15 +54,25 @@ func OpenPrivate(ctx context.Context, path string) (*sql.DB, error) {
 	}
 
 	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
-		info, err := os.Lstat(absolute + suffix)
+		sidecar := absolute + suffix
+		info, err := os.Lstat(sidecar)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
-		if !privateDatabaseFile(info) || info.Mode().Perm()&0o077 != 0 {
-			return nil, errors.New("unsafe private database sidecar")
+		if !privateDatabaseFile(info) || info.Mode().Perm()&0o022 != 0 {
+			return nil, fmt.Errorf("unsafe private database sidecar: %s", filepath.Base(sidecar))
+		}
+
+		// The Python state store could create read-only-for-others sidecars.
+		// Keep their contents (especially uncheckpointed WAL transactions) and
+		// tighten permissions under the already validated parent directory.
+		if info.Mode().Perm() != 0o600 {
+			if err := os.Chmod(sidecar, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("restrict private database sidecar %s: %w", filepath.Base(sidecar), err)
+			}
 		}
 	}
 	return Open(ctx, absolute, false)

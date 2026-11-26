@@ -368,6 +368,20 @@ os.execvp(sys.argv[2], sys.argv[2:])
 ' "$dev_https_port" "${onboarding_command[@]}" >/dev/null
 else
   printf 'seeding preview files\n'
+  # Give the synthetic Private folders the same UIDs as the member server's
+  # RID mapping. Go must not transfer a pre-existing home to a new AD account.
+  private_owners=()
+  read -r private_uid_range < <(awk '$1 == "idmap" && $2 == "config" && $3 != "*" && $5 == "range" { print $7 }' "$repo_root/etc/samba/smb.conf")
+  private_uid_base=${private_uid_range%-*}
+  [[ $private_uid_base =~ ^[1-9][0-9]+$ ]] || die 'unable to determine the preview RID range'
+
+  for account in alice bob carol dave eve; do
+    account_sid=$("$engine" exec "$dc_container" samba-tool user show "$account" | sed -n 's/^objectSid: //p')
+    rid=${account_sid#"${domain_sid}"-}
+    [[ $rid =~ ^[0-9]+$ ]] || die "unable to resolve preview SID for $account"
+    private_owners+=("$account:$((private_uid_base + 10#$rid))")
+  done
+
   "$engine" run --rm \
     --network "$network_name" \
     -e "DEV_SEED_MB=${DEV_SEED_MB:-8}" \
@@ -376,7 +390,7 @@ else
     -v "$groups_volume:/data/groups" \
     -v "$state_volume:/state" \
     --entrypoint /usr/local/bin/preview-seed-files \
-    "$ad_image"
+    "$ad_image" "${private_owners[@]}"
 
   start_files_server() {
   "$engine" run -d \

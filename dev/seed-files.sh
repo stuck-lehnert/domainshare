@@ -97,6 +97,12 @@ with zipfile.ZipFile(root/'office-notes.docx','w') as office:
     office.writestr('word/document.xml','<document><body><p><t>Office document OFFICETEXT742</t></p></body></document>')
 PYDOCUMENTS
 
+# Ownership comes from the disposable AD users, not from guessed RIDs.
+for owner in "$@"; do
+  [[ $owner =~ ^(alice|bob|carol|dave|eve):([0-9]+)$ ]] || exit 1
+  chown -R -- "${BASH_REMATCH[2]}" "/data/private/${BASH_REMATCH[1]}"
+done
+
 # Seed the old state layout to exercise the one-time migration on startup.
 python3 - <<'PYSEED'
 import hashlib
