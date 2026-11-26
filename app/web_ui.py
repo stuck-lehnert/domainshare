@@ -3,6 +3,7 @@
 
 import base64
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -27,11 +28,11 @@ from typing import Dict, List, Optional, Tuple
 
 try:
     from app import reconcile_shares as directory
-    from app import trash, access_control, documents, web_security, configuration
+    from app import agent_api, trash, access_control, documents, web_security, configuration
     from app.account_policy import is_excluded_user
 except ImportError:  # Container execution uses /app as the import root.
     import reconcile_shares as directory
-    import trash, access_control, documents, web_security, configuration
+    import agent_api, trash, access_control, documents, web_security, configuration
     from account_policy import is_excluded_user
 
 try:
@@ -790,7 +791,8 @@ def tls_summary() -> Dict[str, object]:
 
 
 class App:
-    def __init__(self):
+    def __init__(self, agent_tokens=None):
+        self.agent_tokens = agent_tokens
         secret = os.environ.get("WEB_JWT_SECRET", "")
         self.tokens = TokenManager(secret, env_int("WEB_JWT_TTL_SECONDS", 28800, 300, 604800),
                                    web_security.Sessions(STATE_DB), current_identity)
@@ -873,6 +875,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args) -> None:
         log(f"{self.client_address[0]} {fmt % args}")
+
+    def log_request(self, code='-', size='-'):
+        if self.path.partition('?')[0].startswith('/api/agent/'):
+            self.log_message('"%s /api/agent/…" %s %s', self.command, str(code), str(size))
+            return
+        super().log_request(code, size)
 
     def reload_configuration(self):
         if CONFIG is not None:
@@ -1212,6 +1220,9 @@ class Handler(BaseHTTPRequestHandler):
         administrator = self.require_admin(user)
         if administrator is None:
             return
+        if parsed.path in {'/admin/api/agent-tokens', '/admin/api/agent-tokens/revoke'}:
+            self.manage_agent_tokens(parsed.path, administrator)
+            return
         parsed = parsed._replace(path=parsed.path[len("/admin"):])
         if parsed.path == '/api/settings' or parsed.path.startswith('/api/settings/'):
             self.settings_write(parsed.path, administrator)
@@ -1343,6 +1354,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.serve_static('/setup')
             return
+        if path == '/admin/api/agent-tokens':
+            administrator = self.require_admin()
+            if administrator is not None:
+                self.manage_agent_tokens(path, administrator, inventory=True)
+            return
+        if path.startswith('/api/agent/'):
+            self.agent_request(path, parsed.query)
+            return
         if path.startswith("/api/"):
             user = self.require_user()
             if user is None:
@@ -1435,6 +1454,142 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         self.serve_static(path)
+
+    def manage_agent_tokens(self, path, administrator, *, inventory=False):
+        store = APP.agent_tokens if APP else None
+        if store is None:
+            self.send_error_json(HTTPStatus.SERVICE_UNAVAILABLE, 'Tokenverwaltung nicht verfügbar')
+            return
+
+        try:
+            if inventory:
+                self.send_json({'tokens': store.inventory()})
+                return
+
+            body = self.read_json_body()
+            if path.endswith('/revoke'):
+                identifier = body.get('id')
+                if not store.revoke(identifier):
+                    self.send_error_json(HTTPStatus.NOT_FOUND, 'Token nicht gefunden')
+                    return
+                log(f'Agent token {identifier} revoked by {administrator["sub"]!r}')
+                self.send_json({'ok': True})
+                return
+
+            label = body.get('label')
+            if not isinstance(label, str) or not 1 <= len(label.strip()) <= 100:
+                raise ValueError('Eine Bezeichnung mit 1 bis 100 Zeichen ist erforderlich')
+
+            days = body.get('expiresInDays', 30)
+            if type(days) is not int or not 1 <= days <= 365:
+                raise ValueError('Die Laufzeit muss zwischen 1 und 365 Tagen liegen')
+
+            usernames = body.get('usernames')
+            if not isinstance(usernames, list) or not 1 <= len(usernames) <= 10:
+                raise ValueError('Ein bis zehn AD-Benutzernamen sind erforderlich')
+
+            accounts = {}
+            for username in usernames:
+                sam = agent_api.account_login(username)
+                sid = agent_api.resolve_account(sam)
+                if sid is None:
+                    raise ValueError(f'AD-Benutzer nicht verfügbar: {sam}')
+                accounts[sid] = sam
+
+            issued = store.issue(label.strip(), accounts, days, administrator['sub'])
+            log(f'Agent token {issued["id"]} issued by {administrator["sub"]!r}')
+            self.send_json(issued, HTTPStatus.CREATED)
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except (OSError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
+            log(f'Agent token management failed: {exc}')
+            self.send_error_json(HTTPStatus.SERVICE_UNAVAILABLE, 'Tokenverwaltung nicht verfügbar')
+
+    def agent_request(self, path, query):
+        prefix = '/api/agent/v1/'
+        if not path.startswith(prefix):
+            self.send_error_json(HTTPStatus.NOT_FOUND, 'Agenten-Endpunkt nicht gefunden')
+            return
+
+        operation = path[len(prefix) - 1:]
+        indexed_file = re.fullmatch(r'/documents/[a-f0-9]{32}(?:/(?:download|preview|content))?', operation)
+        if operation not in {'/search', '/list', '/file'} and not indexed_file:
+            self.send_error_json(HTTPStatus.NOT_FOUND, 'Agenten-Endpunkt nicht gefunden')
+            return
+
+        headers = self.headers.get_all('Authorization', [])
+        bearer = re.fullmatch(r'Bearer (\S+)', headers[0], re.ASCII | re.IGNORECASE) if len(headers) == 1 else None
+        store = APP.agent_tokens if APP else None
+        if not bearer or store is None:
+            self.send_error_json(HTTPStatus.UNAUTHORIZED, 'Agenten-Token erforderlich')
+            return
+
+        try:
+            token = store.authenticate(bearer[1])
+            if not token:
+                self.send_error_json(HTTPStatus.UNAUTHORIZED, 'Agenten-Token ungültig oder abgelaufen')
+                return
+
+            params = urllib.parse.parse_qs(query, keep_blank_values=True, max_num_fields=24, errors='strict')
+            if any(len(values) != 1 for values in params.values()):
+                raise ValueError('Anfrageparameter dürfen nur einmal vorkommen')
+
+            sam = agent_api.account_login(params.get('username', [''])[0])
+            token_id, accounts = token
+            sid = agent_api.resolve_account(sam)
+            identity = current_identity(sid) if sid in accounts else None
+            if identity is None:
+                self.send_error_json(HTTPStatus.FORBIDDEN, 'Benutzer ist für diesen Token nicht freigegeben')
+                return
+
+            log(f'Agent token {token_id} acting as {identity["sub"]!r}: {operation}')
+            if operation == '/search':
+                self.document_request('/api/documents', params, identity)
+            elif indexed_file:
+                self.document_request('/api' + operation, params, identity)
+            else:
+                self.agent_browse(operation, params, identity)
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except (OSError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
+            log(f'Agent request failed: {exc}')
+            self.send_error_json(HTTPStatus.SERVICE_UNAVAILABLE, 'Agenten-API nicht verfügbar')
+
+    def agent_browse(self, operation, params, identity):
+        source = params.get('source', [''])[0]
+        relative = params.get('path', [''])[0]
+        if len(source) > 300 or len(relative) > 4096:
+            raise ValueError('Dateipfad oder Ordnerkennung zu lang')
+
+        conn = documents.connect()
+        try:
+            documents.ensure_schema(conn)
+            if operation == '/file':
+                if not source or not relative:
+                    raise ValueError('source und path sind für Dateiabrufe erforderlich')
+                with documents.download_path(conn, identity, source, relative) as (handle, info):
+                    self.send_document_file(handle, info.st_size, 'application/octet-stream',
+                                            relative.rsplit('/', 1)[-1], range_support=True)
+            elif source:
+                after = params.get('after', [''])[0]
+                limit = int(params.get('limit', ['100'])[0])
+                if not 1 <= limit <= 200 or len(after) > 255:
+                    raise ValueError('Ungültiger Seitenzeiger oder Seitenumfang')
+                self.send_json(documents.browse_directory(conn, identity, source, relative, after, limit))
+            else:
+                if relative or 'after' in params:
+                    raise ValueError('source ist für Ordnerpfade erforderlich')
+                self.send_json({'sources': documents.browse_sources(conn, identity)})
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            self.send_error_json(HTTPStatus.NOT_FOUND, 'Datei oder Ordner nicht verfügbar')
+        except OSError as exc:
+            if exc.errno != errno.ELOOP:
+                raise
+            self.send_error_json(HTTPStatus.NOT_FOUND, 'Datei oder Ordner nicht verfügbar')
+        finally:
+            conn.close()
 
     def document_request(self, path, params, identity):
         conn = documents.connect()
@@ -1640,7 +1795,7 @@ def main() -> int:
     os.environ.update(CONFIG.environment())
     if not os.path.isfile(TLS_CERT_FILE) or not os.path.isfile(TLS_KEY_FILE):
         raise RuntimeError("TLS certificate or key is missing")
-    APP = App()
+    APP = App(agent_api.TokenStore(CONFIG.root))
     serve_https()
     return 0
 

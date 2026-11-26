@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -171,29 +172,19 @@ def valid_parts(path):
 
 
 @contextlib.contextmanager
-def open_file(root, path):
+def open_file(root, path, *, owner_uid=None):
     """Pin every path component; reject links, special files and nested mounts."""
     parts = valid_parts(path)
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    handle = None
-    try:
+    with open_directory(root, '/'.join(parts[:-1]), owner_uid=owner_uid) as fd:
         device = os.fstat(fd).st_dev
-        for part in parts[:-1]:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            os.close(fd)
-            fd = child
-            if os.fstat(fd).st_dev != device:
-                raise FileNotFoundError('Mount boundary')
         child = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-        handle = os.fdopen(child, 'rb')
-        info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_dev != device:
-            raise FileNotFoundError('Not a regular document')
-        yield handle, info
-    finally:
-        if handle is not None:
-            handle.close()
-        os.close(fd)
+        with os.fdopen(child, 'rb') as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_dev != device:
+                raise FileNotFoundError('Not a regular document')
+            if owner_uid is not None and not is_owner_readable(info, owner_uid, 0o400):
+                raise FileNotFoundError('Document not readable')
+            yield handle, info
 
 
 def source_inventory():
@@ -218,7 +209,7 @@ def source_inventory():
         conn.close()
 
 
-def allowed_sources(conn, identity):
+def allowed_sources(conn, identity, *, live=False):
     """Use current policy on every request, including previews and downloads."""
     if is_excluded_user(str(identity.get('sub', ''))):
         return {}
@@ -231,8 +222,19 @@ def allowed_sources(conn, identity):
         folders = {row['objectGUID']: row for row in policy.execute('SELECT * FROM shares WHERE isActive=1')}
         levels = {row['folderId']: row['level'] for row in policy.execute(
             "SELECT folderId,level FROM folder_permissions WHERE kind='user' AND principalId=?", (sid,))}
+        if live:
+            candidates = list(conn.execute(
+                "SELECT * FROM document_sources WHERE kind='private' AND owner_sid=?", (sid,)
+            ))
+            for folder_id, folder in folders.items():
+                if identity.get('role') == 'domain-admin' or levels.get(folder_id, 0) >= 1:
+                    candidates.append({'id': 'data:' + folder_id, 'kind': 'data',
+                                       'label': folder['shareName'], 'root': access_control.safe_folder_path(folder)})
+        else:
+            candidates = conn.execute('SELECT * FROM document_sources')
+
         result = {}
-        for source in conn.execute('SELECT * FROM document_sources'):
+        for source in candidates:
             if source['kind'] == 'data':
                 folder_id = source['id'][5:]
                 folder = folders.get(folder_id)
@@ -329,17 +331,27 @@ def walk_source(conn, source, watch=None, should_stop=None):
     return completed
 
 
+def is_owner_readable(info, uid, required):
+    return info.st_uid == uid and info.st_mode & required == required
+
+
 @contextlib.contextmanager
-def open_directory(root, relative):
+def open_directory(root, relative, *, owner_uid=None):
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        device = os.fstat(fd).st_dev
+        info = os.fstat(fd)
+        device = info.st_dev
+        if owner_uid is not None and not is_owner_readable(info, owner_uid, 0o500):
+            raise FileNotFoundError('Directory not readable')
         for part in valid_parts(relative) if relative else []:
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = child
-            if os.fstat(fd).st_dev != device:
+            info = os.fstat(fd)
+            if info.st_dev != device:
                 raise FileNotFoundError('Mount boundary')
+            if owner_uid is not None and not is_owner_readable(info, owner_uid, 0o500):
+                raise FileNotFoundError('Directory not readable')
         yield fd
     finally:
         os.close(fd)
@@ -348,21 +360,76 @@ def open_directory(root, relative):
 def private_readable(source, relative, uid):
     if source['kind'] != 'private':
         return True
+    if uid is None:
+        return False
     try:
-        with open_directory(source['root'], '') as fd:
-            info = os.fstat(fd)
-            if info.st_uid != uid or info.st_mode & 0o500 != 0o500:
-                return False
-        parts = valid_parts(relative)
-        for index in range(1, len(parts)):
-            with open_directory(source['root'], '/'.join(parts[:index])) as fd:
-                info = os.fstat(fd)
-                if info.st_uid != uid or info.st_mode & 0o500 != 0o500:
-                    return False
-        with open_file(source['root'], relative) as (_, info):
-            return info.st_uid == uid and bool(info.st_mode & 0o400)
+        with open_file(source['root'], relative, owner_uid=uid):
+            return True
     except OSError:
         return False
+
+
+def browse_sources(conn, identity):
+    sources = []
+    for item in allowed_sources(conn, identity, live=True).values():
+        try:
+            uid = identity['uid'] if item['kind'] == 'private' else None
+            with open_directory(item['root'], '', owner_uid=uid):
+                sources.append({'id': item['id'], 'label': item['label'], 'kind': item['kind']})
+        except OSError:
+            continue
+    return sorted(sources, key=lambda item: (item['kind'], item['label'].casefold(), item['id']))
+
+
+def browse_directory(conn, identity, source_id, relative, after, limit):
+    source = allowed_sources(conn, identity, live=True).get(source_id)
+    if source is None:
+        raise FileNotFoundError('Directory not available')
+
+    if relative and any(is_excluded_filename(part) for part in valid_parts(relative)):
+        raise FileNotFoundError('Directory not available')
+
+    uid = identity['uid'] if source['kind'] == 'private' else None
+    with open_directory(source['root'], relative, owner_uid=uid) as fd:
+        device = os.fstat(fd).st_dev
+
+        def visible_entries(entries):
+            for entry in entries:
+                if entry.name <= after or entry.name == '.trash' or is_excluded_filename(entry.name):
+                    continue
+                # Ignore filesystem names which cannot be represented as UTF-8 API paths.
+                if any(0xD800 <= ord(char) <= 0xDFFF for char in entry.name):
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                directory_entry = stat.S_ISDIR(info.st_mode)
+                if info.st_dev != device or not (directory_entry or stat.S_ISREG(info.st_mode)):
+                    continue
+                required = 0o500 if directory_entry else 0o400
+                if uid is not None and not is_owner_readable(info, uid, required):
+                    continue
+                yield {'name': entry.name, 'path': f'{relative}/{entry.name}' if relative else entry.name,
+                       'type': 'directory' if directory_entry else 'file',
+                       'size': None if directory_entry else info.st_size, 'modified': info.st_mtime}
+
+        with os.scandir(fd) as entries:
+            page = heapq.nsmallest(limit + 1, visible_entries(entries), key=lambda item: item['name'])
+
+    return {'sourceId': source_id, 'path': relative, 'items': page[:limit],
+            'nextAfter': page[limit - 1]['name'] if len(page) > limit else None}
+
+
+@contextlib.contextmanager
+def download_path(conn, identity, source_id, relative):
+    source = allowed_sources(conn, identity, live=True).get(source_id)
+    if source is None or any(is_excluded_filename(part) for part in valid_parts(relative)):
+        raise FileNotFoundError('File not available')
+
+    uid = identity['uid'] if source['kind'] == 'private' else None
+    with open_file(source['root'], relative, owner_uid=uid) as opened:
+        yield opened
 
 
 def current_document(conn, document_id, identity):
@@ -590,7 +657,8 @@ def detail(conn, identity, document_id):
 @contextlib.contextmanager
 def download(conn, identity, document_id):
     row, source = current_document(conn, document_id, identity)
-    with open_file(source['root'], row['path']) as (handle, info):
+    uid = identity['uid'] if source['kind'] == 'private' else None
+    with open_file(source['root'], row['path'], owner_uid=uid) as (handle, info):
         if fingerprint(info) != row['fingerprint']:
             raise FileNotFoundError('Document changed')
         yield handle, row

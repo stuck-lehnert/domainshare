@@ -108,6 +108,7 @@ function empty(message) { return `<div class="empty">${esc(message)}</div>`; }
 function badge(text, kind = "") { return `<span class="badge ${kind}">${esc(text)}</span>`; }
 
 function routeFor(path) {
+  if (path === '/admin/agent-tokens') return 'agent-tokens';
   if (path.startsWith('/admin/settings') || path.startsWith('/settings')) return 'settings';
   path = path.replace(/^\/admin(?=\/|$)/, "") || "/overview";
   if (path.startsWith("/storage/data")) return "storage-data";
@@ -156,11 +157,112 @@ async function navigate(path, replace = false) {
     if (route === 'settings') {
       content.innerHTML = pageHead('Einstellungen', 'Serverkonfiguration dauerhaft speichern.') + '<div id="configuration-settings"></div>';
       await ConfigurationUI.mount(document.querySelector('#configuration-settings'), {api, notice, onDirty: dirty => { state.accessDirty = dirty; }});
+    } else if (route === 'agent-tokens') {
+      await renderAgentTokens();
     }
     content.focus();
   } catch (error) {
     content.innerHTML = pageHead("Seite konnte nicht geladen werden", error.message) + `<section class="panel">${empty("Dienststatus prüfen und erneut versuchen.")}</section>`;
   }
+}
+
+async function renderAgentTokens() {
+  content.innerHTML = pageHead('Agenten-Tokens', 'Lesezugriff für Agenten im Namen ausdrücklich freigegebener AD-Benutzer.') + `
+    <section class="panel">
+      <h2>Token erstellen</h2>
+      <p>Jede Anfrage braucht einen Benutzernamen. Der Agent erhält dessen aktuelle Dateirechte. Gib Administratorkonten nur frei, wenn der Agent auf alle Data-Ordner zugreifen soll.</p>
+      <form id="agent-token-form" class="stack">
+        <label>Bezeichnung<input name="label" maxlength="100" required></label>
+        <label>AD-Benutzernamen (ein Name pro Zeile, bis zu zehn)<textarea name="usernames" rows="3" maxlength="2560" required></textarea></label>
+        <label>Gültig für (Tage)<input name="days" type="number" min="1" max="365" value="30" required></label>
+        <div class="toolbar"><button type="submit">Token erstellen</button></div>
+      </form>
+      <div id="agent-token-issued" hidden>
+        <p role="status">Der Token wird nur jetzt angezeigt. Kopiere ihn in einen sicheren Speicher.</p>
+        <label>Bearer-Token<input type="text" readonly aria-label="Neuer Bearer-Token" autocomplete="off" spellcheck="false"></label>
+        <button type="button" data-hide-token>Token ausblenden</button>
+      </div>
+      <p class="error" role="alert" id="agent-token-error" hidden></p>
+    </section>
+    <section class="panel">
+      <h2>Ausgestellte Tokens</h2>
+      <div id="agent-token-list" aria-live="polite"></div>
+    </section>`;
+
+  const form = content.querySelector('#agent-token-form');
+  const issued = content.querySelector('#agent-token-issued');
+  const output = issued.querySelector('input');
+  const list = content.querySelector('#agent-token-list');
+  const error = content.querySelector('#agent-token-error');
+
+  function showError(message) {
+    error.textContent = message;
+    error.hidden = !message;
+  }
+
+  async function refresh() {
+    const {tokens} = await api('/api/agent-tokens');
+    if (!tokens.length) {
+      list.textContent = 'Keine Agenten-Tokens vorhanden.';
+      return;
+    }
+
+    list.innerHTML = `<div class="table-wrap"><table>
+      <thead><tr><th>Bezeichnung</th><th>Benutzer</th><th>Gültig bis</th><th>Erstellt von</th><th>Aktion</th></tr></thead>
+      <tbody>${tokens.map(token => `<tr>
+        <td>${esc(token.label)}</td>
+        <td>${esc(token.usernames.join(', '))}</td>
+        <td>${esc(utcTime(token.expiresAt * 1000))}${token.expiresAt * 1000 <= Date.now() ? ' (abgelaufen)' : ''}</td>
+        <td>${esc(token.createdBy)}</td>
+        <td><button type="button" data-revoke="${esc(token.id)}">Widerrufen</button></td>
+      </tr>`).join('')}</tbody></table></div>`;
+  }
+
+  issued.querySelector('[data-hide-token]').addEventListener('click', () => {
+    output.value = '';
+    issued.hidden = true;
+  });
+
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    showError('');
+    const button = form.querySelector('button[type="submit"]');
+    button.disabled = true;
+
+    try {
+      const result = await api('/api/agent-tokens', {method: 'POST', body: JSON.stringify({
+        label: form.elements.label.value,
+        usernames: form.elements.usernames.value.split(/\r?\n/).map(name => name.trim()).filter(Boolean),
+        expiresInDays: Number(form.elements.days.value),
+      })});
+      output.value = result.token;
+      issued.hidden = false;
+      output.select();
+      form.reset();
+      await refresh();
+    } catch (err) {
+      showError(err.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  list.addEventListener('click', async event => {
+    const button = event.target.closest('button[data-revoke]');
+    if (!button || !window.confirm('Diesen Agenten-Token sofort widerrufen?')) return;
+
+    showError('');
+    button.disabled = true;
+    try {
+      await api('/api/agent-tokens/revoke', {method: 'POST', body: JSON.stringify({id: button.dataset.revoke})});
+      await refresh();
+    } catch (err) {
+      showError(err.message);
+      button.disabled = false;
+    }
+  });
+
+  await refresh();
 }
 
 function eventRows(events) {

@@ -419,11 +419,14 @@ class StateSnapshotTests(unittest.TestCase):
             pending = state / backup.PENDING_SNAPSHOTS_DIRECTORY
             pending.mkdir()
             (pending / "journal").write_text("20260101T000000Z\n")
+            for suffix in ('', '-wal', '-shm', '-journal'):
+                (state / ('agent-tokens.db' + suffix)).write_bytes(b'agent token state')
             with mock.patch.dict(os.environ, {"DOCUMENT_STATE_ROOT": str(cache)}):
                 snapshot_root, staged = backup.prepare_state_snapshot(str(state), str(database))
             try:
                 self.assertFalse((Path(staged) / "documents").exists())
                 self.assertFalse((Path(staged) / pending.name).exists())
+                self.assertEqual(list(Path(staged).glob('agent-tokens.db*')), [])
                 self.assertEqual((cache / "search.db").read_bytes(), b"derived index")
                 self.assertEqual(original.read_bytes(), b"original PDF bytes")
                 self.assertEqual((Path(staged) / "data-xattrs.tdb").read_bytes(), b"access records")

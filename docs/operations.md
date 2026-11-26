@@ -139,6 +139,7 @@ The console is intentionally operational and plain:
 - **Trash**: list seven-day recycle entries across all shares, download a retained file, or restore it without overwriting an existing path.
 - **Share reconciliation**: manually force reconciliation and follow its phase, progress bar, current group, and live output.
 - **Backups**: manually start a backup and follow live progress, active transfer rows, snapshot name, trigger, and recent output.
+- **Agenten-Tokens**: issue and revoke read-only tokens for explicitly allowed AD users. See the [Agent API](agent-api.md).
 - **PDF report**: storage totals and every storage row, individual folder/user assignments, current backup state, system checks, and TLS certificate data.
 - **System**: domain trust, Samba configuration, TLS certificate, scanner, and activity database health.
 

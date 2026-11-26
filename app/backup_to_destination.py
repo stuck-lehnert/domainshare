@@ -986,6 +986,7 @@ def prepare_state_snapshot(
     excluded = {
         document_relative,
         PENDING_SNAPSHOTS_DIRECTORY,
+        'agent-tokens.db', 'agent-tokens.db-wal', 'agent-tokens.db-shm', 'agent-tokens.db-journal',
         database_relative,
         f"{database_relative}-wal",
         f"{database_relative}-shm",

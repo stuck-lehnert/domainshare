@@ -31,6 +31,7 @@ Run `./scripts/dev` with Docker or Podman. It starts a disposable AD domain and 
 - [Operations](docs/operations.md) — configuration, upgrades, backups, and troubleshooting.
 - [Architecture](docs/architecture.md) — Samba integration, document search, and activity storage.
 - [Development](docs/development.md) — local preview, test commands, and browser checks.
+- [Agent API](docs/agent-api.md) — token setup, delegated search, directory listings, and downloads.
 
 ## License
 
