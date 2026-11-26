@@ -1,0 +1,497 @@
+[
+  {
+    "stream": "main",
+    "params": {
+      "limit": "2"
+    },
+    "response": {
+      "events": [
+        {
+          "id": 5,
+          "timestamp": "2026-07-31T12:36:30.123+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "bob@example.com",
+          "clientIp": "192.0.2.6",
+          "client": "PC02",
+          "share": "Private",
+          "operation": "move",
+          "action": "move",
+          "result": "ok",
+          "success": true,
+          "path": "a file.txt|another file.txt",
+          "source": "samba.log"
+        },
+        {
+          "id": 3,
+          "timestamp": "2026-07-31T12:34:56+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "DEV\\MSOL_Test",
+          "clientIp": "192.0.2.5",
+          "client": "PC01",
+          "share": "Private",
+          "operation": "delete",
+          "action": "delete",
+          "result": "OK",
+          "success": true,
+          "path": "old/%_literal.txt",
+          "source": "samba.log"
+        }
+      ],
+      "hasMore": true,
+      "nextCursor": "1785501296:3",
+      "matched": 4,
+      "matchedExact": true,
+      "facets": {
+        "users": [
+          "bob@example.com",
+          "DEV\\Alice"
+        ],
+        "shares": [
+          "Data",
+          "Private"
+        ],
+        "operations": [
+          "delete",
+          "move",
+          "read",
+          "write"
+        ],
+        "actions": [
+          "delete",
+          "move",
+          "read",
+          "write"
+        ]
+      },
+      "indexing": {
+        "ready": true,
+        "processedEvents": 0,
+        "totalEvents": 0,
+        "percent": 100.0
+      },
+      "stream": "main"
+    }
+  },
+  {
+    "stream": "main",
+    "params": {
+      "limit": "2",
+      "cursor": "1785501296:3"
+    },
+    "response": {
+      "events": [
+        {
+          "id": 2,
+          "timestamp": "2026-07-31T12:34:56+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "DEV\\Alice",
+          "clientIp": "192.0.2.5",
+          "client": "PC01",
+          "share": "Data",
+          "operation": "write",
+          "action": "write",
+          "result": "Permission denied",
+          "success": false,
+          "path": "Finance/Report.txt",
+          "source": "samba.log"
+        },
+        {
+          "id": 1,
+          "timestamp": "2026-07-31T12:34:56+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "DEV\\Alice",
+          "clientIp": "192.0.2.5",
+          "client": "PC01",
+          "share": "Data",
+          "operation": "read",
+          "action": "read",
+          "result": "OK",
+          "success": true,
+          "path": "Finance/Report.txt",
+          "source": "samba.log"
+        }
+      ],
+      "hasMore": false,
+      "nextCursor": null,
+      "matched": 4,
+      "matchedExact": true,
+      "facets": {
+        "users": [
+          "bob@example.com",
+          "DEV\\Alice"
+        ],
+        "shares": [
+          "Data",
+          "Private"
+        ],
+        "operations": [
+          "delete",
+          "move",
+          "read",
+          "write"
+        ],
+        "actions": [
+          "delete",
+          "move",
+          "read",
+          "write"
+        ]
+      },
+      "indexing": {
+        "ready": true,
+        "processedEvents": 0,
+        "totalEvents": 0,
+        "percent": 100.0
+      },
+      "stream": "main"
+    }
+  },
+  {
+    "stream": "main",
+    "params": {
+      "user": " dev\\ALICE ",
+      "share": "DATA",
+      "operation": "WRITE",
+      "result": "fail"
+    },
+    "response": {
+      "events": [
+        {
+          "id": 2,
+          "timestamp": "2026-07-31T12:34:56+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "DEV\\Alice",
+          "clientIp": "192.0.2.5",
+          "client": "PC01",
+          "share": "Data",
+          "operation": "write",
+          "action": "write",
+          "result": "Permission denied",
+          "success": false,
+          "path": "Finance/Report.txt",
+          "source": "samba.log"
+        }
+      ],
+      "hasMore": false,
+      "nextCursor": null,
+      "matched": 1,
+      "matchedExact": true,
+      "facets": {
+        "users": [
+          "bob@example.com",
+          "DEV\\Alice"
+        ],
+        "shares": [
+          "Data",
+          "Private"
+        ],
+        "operations": [
+          "delete",
+          "move",
+          "read",
+          "write"
+        ],
+        "actions": [
+          "delete",
+          "move",
+          "read",
+          "write"
+        ]
+      },
+      "indexing": {
+        "ready": true,
+        "processedEvents": 0,
+        "totalEvents": 0,
+        "percent": 100.0
+      },
+      "stream": "main"
+    }
+  },
+  {
+    "stream": "main",
+    "params": {
+      "path": "%_"
+    },
+    "response": {
+      "events": [
+        {
+          "id": 3,
+          "timestamp": "2026-07-31T12:34:56+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "DEV\\MSOL_Test",
+          "clientIp": "192.0.2.5",
+          "client": "PC01",
+          "share": "Private",
+          "operation": "delete",
+          "action": "delete",
+          "result": "OK",
+          "success": true,
+          "path": "old/%_literal.txt",
+          "source": "samba.log"
+        }
+      ],
+      "hasMore": false,
+      "nextCursor": null,
+      "matched": 1,
+      "matchedExact": true,
+      "facets": {
+        "users": [
+          "bob@example.com",
+          "DEV\\Alice"
+        ],
+        "shares": [
+          "Data",
+          "Private"
+        ],
+        "operations": [
+          "delete",
+          "move",
+          "read",
+          "write"
+        ],
+        "actions": [
+          "delete",
+          "move",
+          "read",
+          "write"
+        ]
+      },
+      "indexing": {
+        "ready": true,
+        "processedEvents": 0,
+        "totalEvents": 0,
+        "percent": 100.0
+      },
+      "stream": "main"
+    }
+  },
+  {
+    "stream": "main",
+    "params": {
+      "path": "report",
+      "limit": "1"
+    },
+    "response": {
+      "events": [
+        {
+          "id": 2,
+          "timestamp": "2026-07-31T12:34:56+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "DEV\\Alice",
+          "clientIp": "192.0.2.5",
+          "client": "PC01",
+          "share": "Data",
+          "operation": "write",
+          "action": "write",
+          "result": "Permission denied",
+          "success": false,
+          "path": "Finance/Report.txt",
+          "source": "samba.log"
+        }
+      ],
+      "hasMore": true,
+      "nextCursor": "1785501296:2",
+      "matched": null,
+      "matchedExact": false,
+      "facets": {
+        "users": [
+          "bob@example.com",
+          "DEV\\Alice"
+        ],
+        "shares": [
+          "Data",
+          "Private"
+        ],
+        "operations": [
+          "delete",
+          "move",
+          "read",
+          "write"
+        ],
+        "actions": [
+          "delete",
+          "move",
+          "read",
+          "write"
+        ]
+      },
+      "indexing": {
+        "ready": true,
+        "processedEvents": 0,
+        "totalEvents": 0,
+        "percent": 100.0
+      },
+      "stream": "main"
+    }
+  },
+  {
+    "stream": "main",
+    "params": {
+      "count": "false",
+      "facets": "off"
+    },
+    "response": {
+      "events": [
+        {
+          "id": 5,
+          "timestamp": "2026-07-31T12:36:30.123+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "bob@example.com",
+          "clientIp": "192.0.2.6",
+          "client": "PC02",
+          "share": "Private",
+          "operation": "move",
+          "action": "move",
+          "result": "ok",
+          "success": true,
+          "path": "a file.txt|another file.txt",
+          "source": "samba.log"
+        },
+        {
+          "id": 3,
+          "timestamp": "2026-07-31T12:34:56+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "DEV\\MSOL_Test",
+          "clientIp": "192.0.2.5",
+          "client": "PC01",
+          "share": "Private",
+          "operation": "delete",
+          "action": "delete",
+          "result": "OK",
+          "success": true,
+          "path": "old/%_literal.txt",
+          "source": "samba.log"
+        },
+        {
+          "id": 2,
+          "timestamp": "2026-07-31T12:34:56+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "DEV\\Alice",
+          "clientIp": "192.0.2.5",
+          "client": "PC01",
+          "share": "Data",
+          "operation": "write",
+          "action": "write",
+          "result": "Permission denied",
+          "success": false,
+          "path": "Finance/Report.txt",
+          "source": "samba.log"
+        },
+        {
+          "id": 1,
+          "timestamp": "2026-07-31T12:34:56+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "DEV\\Alice",
+          "clientIp": "192.0.2.5",
+          "client": "PC01",
+          "share": "Data",
+          "operation": "read",
+          "action": "read",
+          "result": "OK",
+          "success": true,
+          "path": "Finance/Report.txt",
+          "source": "samba.log"
+        }
+      ],
+      "hasMore": false,
+      "nextCursor": null,
+      "matched": null,
+      "matchedExact": false,
+      "facets": {
+        "users": [],
+        "shares": [],
+        "operations": [],
+        "actions": []
+      },
+      "indexing": {
+        "ready": true,
+        "processedEvents": 0,
+        "totalEvents": 0,
+        "percent": 100.0
+      },
+      "stream": "main"
+    }
+  },
+  {
+    "stream": "fslogix",
+    "params": {},
+    "response": {
+      "events": [
+        {
+          "id": 4,
+          "timestamp": "2026-07-31T12:35:00+00:00",
+          "ingestedAt": "2026-07-31T12:36:30.123+00:00",
+          "user": "bob@example.com",
+          "clientIp": "192.0.2.6",
+          "client": "PC02",
+          "share": "fSlOgIx",
+          "operation": "write",
+          "action": "write",
+          "result": "OK",
+          "success": true,
+          "path": "profile.vhdx",
+          "source": "samba.log"
+        }
+      ],
+      "hasMore": false,
+      "nextCursor": null,
+      "matched": 1,
+      "matchedExact": true,
+      "facets": {
+        "users": [
+          "bob@example.com"
+        ],
+        "shares": [
+          "fSlOgIx"
+        ],
+        "operations": [
+          "write"
+        ],
+        "actions": [
+          "write"
+        ]
+      },
+      "indexing": {
+        "ready": true,
+        "processedEvents": 0,
+        "totalEvents": 0,
+        "percent": 100.0
+      },
+      "stream": "fslogix"
+    }
+  },
+  {
+    "stream": "fslogix",
+    "params": {
+      "action": "unsupported"
+    },
+    "response": {
+      "events": [],
+      "hasMore": false,
+      "nextCursor": null,
+      "matched": 0,
+      "matchedExact": true,
+      "facets": {
+        "users": [
+          "bob@example.com"
+        ],
+        "shares": [
+          "fSlOgIx"
+        ],
+        "operations": [
+          "write"
+        ],
+        "actions": [
+          "write"
+        ]
+      },
+      "indexing": {
+        "ready": true,
+        "processedEvents": 0,
+        "totalEvents": 0,
+        "percent": 100.0
+      },
+      "stream": "fslogix"
+    }
+  }
+]

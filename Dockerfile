@@ -1,5 +1,18 @@
 FROM docker.io/smallstep/step-cli:0.31.0 AS step-cli
 
+FROM docker.io/library/golang:1.25-bookworm AS go-build
+WORKDIR /src
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local
+COPY go.mod go.sum ./
+COPY cmd ./cmd
+COPY internal ./internal
+RUN mkdir /out \
+    && go build -trimpath -o /out/ ./cmd/... \
+    && cc -std=gnu11 -O2 -Wall -Wextra -Werror \
+        "-DSAMBA_PRIVATE_DIR=\"/usr/lib/$(gcc -print-multiarch)/samba\"" \
+        internal/sambaacl/helper/main.c -o /out/domainshare-sambaacl -ldl \
+    && go clean -cache -modcache
+
 FROM docker.io/library/debian:12-slim
 
 LABEL org.opencontainers.image.title="DomainShare"
@@ -15,6 +28,7 @@ RUN apt-get update \
         ldap-utils \
         libnss-winbind \
         libpam-winbind \
+        libtiff-tools \
         python3 \
         python3-samba \
         python3-pil \
@@ -36,6 +50,10 @@ RUN useradd --system --no-create-home --shell /usr/sbin/nologin document-ocr
 
 RUN mkdir -p /app /data/private /data/fslogix /data/groups/data /data/groups/archive /state
 COPY --from=step-cli /usr/local/bin/step /usr/local/bin/step
+COPY --from=go-build /out/domainshare /usr/local/bin/domainshare
+COPY --from=go-build /out/domainshare-backup /usr/local/bin/domainshare-backup
+COPY --from=go-build /out/domainshare-trash /usr/local/bin/domainshare-trash
+COPY --from=go-build /out/domainshare-sambaacl /usr/local/libexec/domainshare-sambaacl
 
 COPY app/reconcile_shares.py /app/reconcile_shares.py
 COPY app/backup_to_destination.py /app/backup_to_destination.py

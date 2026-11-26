@@ -1,0 +1,644 @@
+{
+  "fields": [
+    {
+      "key": "REALM",
+      "section": "domain",
+      "label": "Kerberos-Domäne",
+      "default": "",
+      "kind": "dns",
+      "minimum": null,
+      "maximum": null,
+      "required": true
+    },
+    {
+      "key": "WORKGROUP",
+      "section": "domain",
+      "label": "NetBIOS-Domäne",
+      "default": "",
+      "kind": "netbios",
+      "minimum": null,
+      "maximum": null,
+      "required": true
+    },
+    {
+      "key": "DOMAIN",
+      "section": "domain",
+      "label": "Domänencontroller / AD-DNS-Name",
+      "default": "",
+      "kind": "dns",
+      "minimum": null,
+      "maximum": null,
+      "required": true
+    },
+    {
+      "key": "JOIN_USER",
+      "section": "domain",
+      "label": "Konto für Domänenbeitritt und LDAP",
+      "default": "",
+      "kind": "text",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "JOIN_PASSWORD",
+      "section": "domain",
+      "label": "Passwort für Domänenbeitritt und LDAP",
+      "default": "",
+      "kind": "secret",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "LDAP_URI",
+      "section": "domain",
+      "label": "LDAP-Adresse (optional)",
+      "default": "",
+      "kind": "ldap",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "LDAP_BASE_DN",
+      "section": "domain",
+      "label": "LDAP-Basis-DN (optional)",
+      "default": "",
+      "kind": "text",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "DOMAIN_USERS_SID",
+      "section": "groups",
+      "label": "Benutzergruppe",
+      "default": "",
+      "kind": "group",
+      "minimum": null,
+      "maximum": null,
+      "required": true
+    },
+    {
+      "key": "DOMAIN_ADMINS_SID",
+      "section": "groups",
+      "label": "Administratorengruppe",
+      "default": "",
+      "kind": "group",
+      "minimum": null,
+      "maximum": null,
+      "required": true
+    },
+    {
+      "key": "FSLOGIX_GROUP_SID",
+      "section": "groups",
+      "label": "FSLogix-Gruppe",
+      "default": "",
+      "kind": "group",
+      "minimum": null,
+      "maximum": null,
+      "required": true
+    },
+    {
+      "key": "NETBIOS_NAME",
+      "section": "network",
+      "label": "Servername (NetBIOS)",
+      "default": "DOMAINSHARE",
+      "kind": "netbios",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "SAMBA_HOSTNAME",
+      "section": "network",
+      "label": "Servername (DNS)",
+      "default": "domainshare",
+      "kind": "dns",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "AD_DNS_NAME",
+      "section": "network",
+      "label": "AD-DNS-Eintrag (optional)",
+      "default": "",
+      "kind": "dns",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "AD_DNS_IP",
+      "section": "network",
+      "label": "IP-Adresse für AD-DNS-Eintrag (optional)",
+      "default": "",
+      "kind": "ip",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "WEB_HOSTNAME",
+      "section": "tls",
+      "label": "HTTPS-Hostname",
+      "default": "localhost",
+      "kind": "dns",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "WEB_TLS_MODE",
+      "section": "tls",
+      "label": "HTTPS-Zertifikat",
+      "default": "self-signed",
+      "kind": "choice",
+      "minimum": null,
+      "maximum": null,
+      "choices": [
+        "self-signed",
+        "acme",
+        "ca",
+        "files"
+      ]
+    },
+    {
+      "key": "WEB_TLS_AUTORENEW",
+      "section": "tls",
+      "label": "Zertifikate automatisch erneuern",
+      "default": true,
+      "kind": "bool",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "ACME_CA_SERVER",
+      "section": "tls",
+      "label": "ACME-Verzeichnisadresse",
+      "default": "",
+      "kind": "https",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "ACME_CA_CERTIFICATES_PEM",
+      "section": "tls",
+      "label": "CA-Vertrauenszertifikat (PEM)",
+      "default": "",
+      "kind": "pem",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "ACME_CA_CERTIFICATES_URL",
+      "section": "tls",
+      "label": "Adresse für CA-Vertrauenszertifikat (optional)",
+      "default": "",
+      "kind": "https",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "ACME_CA_CERTIFICATES_INSECURE_DOWNLOAD",
+      "section": "tls",
+      "label": "CA-Download ohne Zertifikatsprüfung",
+      "default": false,
+      "kind": "bool",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "ACME_RENEW_CHECK_SECONDS",
+      "section": "tls",
+      "label": "Erneuerung prüfen (Sekunden)",
+      "default": 900,
+      "kind": "int",
+      "minimum": 60,
+      "maximum": 86400
+    },
+    {
+      "key": "TLS_CA_URL",
+      "section": "tls",
+      "label": "CA-Adresse",
+      "default": "",
+      "kind": "https",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "TLS_CA_ROOT_PEM",
+      "section": "tls",
+      "label": "CA-Wurzelzertifikat (PEM)",
+      "default": "",
+      "kind": "pem",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "TLS_CA_FINGERPRINT",
+      "section": "tls",
+      "label": "CA-Fingerabdruck",
+      "default": "",
+      "kind": "text",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "TLS_CA_PROVISIONER",
+      "section": "tls",
+      "label": "CA-Provisioner",
+      "default": "",
+      "kind": "text",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "TLS_CA_TOKEN",
+      "section": "tls",
+      "label": "CA-Einrichtungstoken",
+      "default": "",
+      "kind": "secret",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "TLS_CA_PASSWORD",
+      "section": "tls",
+      "label": "CA-Provisioner-Passwort",
+      "default": "",
+      "kind": "secret",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "WEB_TLS_CERT_PEM",
+      "section": "tls",
+      "label": "HTTPS-Zertifikat (PEM)",
+      "default": "",
+      "kind": "pem",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "WEB_TLS_KEY_PEM",
+      "section": "tls",
+      "label": "Privater HTTPS-Schlüssel (PEM)",
+      "default": "",
+      "kind": "secretpem",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "WEB_TRUSTED_ORIGINS",
+      "section": "web",
+      "label": "Weitere HTTPS-Origins (kommagetrennt)",
+      "default": "",
+      "kind": "origins",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "WEB_JWT_TTL_SECONDS",
+      "section": "web",
+      "label": "Sitzungsdauer (Sekunden)",
+      "default": 28800,
+      "kind": "int",
+      "minimum": 300,
+      "maximum": 604800
+    },
+    {
+      "key": "WEB_AUTH_RECHECK_SECONDS",
+      "section": "web",
+      "label": "AD-Rechte erneut prüfen (Sekunden)",
+      "default": 60,
+      "kind": "int",
+      "minimum": 5,
+      "maximum": 300
+    },
+    {
+      "key": "WEB_LOGIN_ATTEMPTS_PER_5_MIN",
+      "section": "web",
+      "label": "Anmeldeversuche pro IP / 5 Minuten",
+      "default": 10,
+      "kind": "int",
+      "minimum": 3,
+      "maximum": 100
+    },
+    {
+      "key": "WEB_LOGIN_ACCOUNT_ATTEMPTS_PER_5_MIN",
+      "section": "web",
+      "label": "Anmeldeversuche pro Konto / 5 Minuten",
+      "default": 10,
+      "kind": "int",
+      "minimum": 3,
+      "maximum": 100
+    },
+    {
+      "key": "WEB_TLS_HANDSHAKE_TIMEOUT_SECONDS",
+      "section": "web",
+      "label": "TLS-Handshake-Zeitlimit (Sekunden)",
+      "default": 5,
+      "kind": "int",
+      "minimum": 1,
+      "maximum": 30
+    },
+    {
+      "key": "WEB_REQUEST_TIMEOUT_SECONDS",
+      "section": "web",
+      "label": "Anfrage-Zeitlimit (Sekunden)",
+      "default": 30,
+      "kind": "int",
+      "minimum": 1,
+      "maximum": 300
+    },
+    {
+      "key": "WEB_MAX_CONNECTIONS",
+      "section": "web",
+      "label": "Gleichzeitige Web-Verbindungen",
+      "default": 64,
+      "kind": "int",
+      "minimum": 4,
+      "maximum": 512
+    },
+    {
+      "key": "WEB_USAGE_SCAN_INTERVAL_SECONDS",
+      "section": "web",
+      "label": "Belegung erfassen (Sekunden)",
+      "default": 900,
+      "kind": "int",
+      "minimum": 10,
+      "maximum": 86400
+    },
+    {
+      "key": "WEB_DIRECTORY_CACHE_SECONDS",
+      "section": "web",
+      "label": "AD-Verzeichniszwischenspeicher (Sekunden)",
+      "default": 300,
+      "kind": "int",
+      "minimum": 5,
+      "maximum": 3600
+    },
+    {
+      "key": "PRIVATE_SKIP_USERS",
+      "section": "files",
+      "label": "Private Ordner: ausgeschlossene Benutzer (kommagetrennt)",
+      "default": "",
+      "kind": "text",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "PRIVATE_SKIP_PREFIXES",
+      "section": "files",
+      "label": "Private Ordner: ausgeschlossene Präfixe (kommagetrennt)",
+      "default": "",
+      "kind": "text",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "TRASH_RETENTION_DAYS",
+      "section": "files",
+      "label": "Papierkorb aufbewahren (Tage)",
+      "default": 7,
+      "kind": "int",
+      "minimum": 1,
+      "maximum": 365
+    },
+    {
+      "key": "AUDIT_SKIP_USER_SUFFIXES",
+      "section": "files",
+      "label": "Protokoll: ausgeschlossene Kontosuffixe",
+      "default": "_svc,_ServiceAcc",
+      "kind": "text",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "AUDIT_QUERY_MAX_DAYS",
+      "section": "files",
+      "label": "Protokoll: größter Suchzeitraum (Tage)",
+      "default": 31,
+      "kind": "int",
+      "minimum": 1,
+      "maximum": 366
+    },
+    {
+      "key": "DOCUMENT_SCAN_SECONDS",
+      "section": "documents",
+      "label": "Dateien erneut erfassen (Sekunden)",
+      "default": 30,
+      "kind": "int",
+      "minimum": 5,
+      "maximum": 3600
+    },
+    {
+      "key": "DOCUMENT_OCR_LANGUAGE",
+      "section": "documents",
+      "label": "OCR-Sprachen",
+      "default": "deu+eng",
+      "kind": "languages",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "DOCUMENT_OCR_TIMEOUT_SECONDS",
+      "section": "documents",
+      "label": "OCR-Auftrag-Zeitlimit (Sekunden)",
+      "default": 600,
+      "kind": "int",
+      "minimum": 30,
+      "maximum": 3600
+    },
+    {
+      "key": "DOCUMENT_OCR_DPI",
+      "section": "documents",
+      "label": "OCR-Auflösung (DPI)",
+      "default": 300,
+      "kind": "int",
+      "minimum": 150,
+      "maximum": 400
+    },
+    {
+      "key": "DOCUMENT_OCR_MAX_DIMENSION",
+      "section": "documents",
+      "label": "OCR: größte Bildkante (Pixel)",
+      "default": 3500,
+      "kind": "int",
+      "minimum": 1500,
+      "maximum": 5000
+    },
+    {
+      "key": "DOCUMENT_OCR_PAGE_TIMEOUT_SECONDS",
+      "section": "documents",
+      "label": "OCR-Seiten-Zeitlimit (Sekunden)",
+      "default": 30,
+      "kind": "int",
+      "minimum": 5,
+      "maximum": 120
+    },
+    {
+      "key": "DOCUMENT_MAX_FILE_MB",
+      "section": "documents",
+      "label": "Größte Datei für Texterfassung (MiB)",
+      "default": 512,
+      "kind": "int",
+      "minimum": 1,
+      "maximum": 4096
+    },
+    {
+      "key": "DOCUMENT_MAX_PDF_PAGES",
+      "section": "documents",
+      "label": "Größte PDF-Seitenzahl",
+      "default": 500,
+      "kind": "int",
+      "minimum": 1,
+      "maximum": 5000
+    },
+    {
+      "key": "BACKUP_DESTINATION",
+      "section": "backup",
+      "label": "Sicherungsziel",
+      "default": "",
+      "kind": "secreturl",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "BACKUP_AUTO_ENABLED",
+      "section": "backup",
+      "label": "Automatische Sicherungen",
+      "default": false,
+      "kind": "bool",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "BACKUP_START_HOUR",
+      "section": "backup",
+      "label": "Tägliche Startzeit (Stunde, UTC)",
+      "default": 2,
+      "kind": "int",
+      "minimum": 0,
+      "maximum": 23
+    },
+    {
+      "key": "BACKUP_RETENTION_DAILY",
+      "section": "backup",
+      "label": "Tägliche Sicherungen aufbewahren",
+      "default": 3,
+      "kind": "int",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    {
+      "key": "BACKUP_RETENTION_WEEKLY",
+      "section": "backup",
+      "label": "Wöchentliche Sicherungen aufbewahren",
+      "default": 2,
+      "kind": "int",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    {
+      "key": "BACKUP_RETENTION_MONTHLY",
+      "section": "backup",
+      "label": "Monatliche Sicherungen aufbewahren",
+      "default": 2,
+      "kind": "int",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    {
+      "key": "BACKUP_RETENTION_YEARLY",
+      "section": "backup",
+      "label": "Jährliche Sicherungen aufbewahren",
+      "default": 1,
+      "kind": "int",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    {
+      "key": "BACKUP_ENCRYPTION_ENABLED",
+      "section": "backup",
+      "label": "Alle Sicherungsdaten verschlüsseln",
+      "default": true,
+      "kind": "bool",
+      "minimum": null,
+      "maximum": null
+    },
+    {
+      "key": "BACKUP_PROGRESS_INTERVAL_SECONDS",
+      "section": "backup",
+      "label": "Fortschritt erfassen (Sekunden)",
+      "default": 10,
+      "kind": "int",
+      "minimum": 1,
+      "maximum": 300
+    }
+  ],
+  "privateFields": [
+    "ACME_CA_CERTIFICATES",
+    "ACME_HTTP_LISTEN",
+    "AUDIT_ARCHIVE_DIR",
+    "AUDIT_POLL_SECONDS",
+    "AUDIT_SOURCE_GLOB",
+    "BACKUP_ARCHIVE_PASSWORD",
+    "BACKUP_ARCHIVE_TEMP_DIR",
+    "BACKUP_KEY_FORMAT",
+    "BACKUP_KEY_ID",
+    "BACKUP_LOG_FILE",
+    "BACKUP_NAMESPACE",
+    "BACKUP_PROGRESS",
+    "BACKUP_STATUS_FILE",
+    "DOCUMENT_STATE_ROOT",
+    "FSLOGIX_ROOT",
+    "GROUP_ARCHIVE_ROOT",
+    "GROUP_ROOT",
+    "PRIVATE_ROOT",
+    "RECONCILE_LOG_FILE",
+    "RECONCILE_STATUS_FILE",
+    "SHARE_DB_PATH",
+    "STATE_DB_PATH",
+    "STATE_ROOT",
+    "TLS_CA_PROVISIONER_PASSWORD",
+    "TLS_CA_PROVISIONER_PASSWORD_FILE",
+    "TLS_CA_REBOOTSTRAP",
+    "TLS_CA_ROOT",
+    "TLS_CA_STATE_DIR",
+    "WEB_BIND_ADDRESS",
+    "WEB_BIND_PORT",
+    "WEB_HTTPS_PORT",
+    "WEB_JWT_SECRET",
+    "WEB_TLS_CERT_FILE",
+    "WEB_TLS_KEY_FILE"
+  ],
+  "sections": [
+    {
+      "id": "domain",
+      "label": "Active Directory"
+    },
+    {
+      "id": "groups",
+      "label": "Gruppen für Anmeldung und Systemzugriff"
+    },
+    {
+      "id": "network",
+      "label": "Server und DNS"
+    },
+    {
+      "id": "tls",
+      "label": "HTTPS und Zertifikate"
+    },
+    {
+      "id": "web",
+      "label": "Web-Zugriff"
+    },
+    {
+      "id": "files",
+      "label": "Dateien und Protokolle"
+    },
+    {
+      "id": "documents",
+      "label": "Dokumentindex und OCR"
+    },
+    {
+      "id": "backup",
+      "label": "Sicherungen"
+    }
+  ]
+}

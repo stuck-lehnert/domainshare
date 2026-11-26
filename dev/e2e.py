@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, Optional
 
 
@@ -89,7 +90,8 @@ def http(
     value: Optional[Dict[str, object]] = None,
     token: str = "",
 ) -> Response:
-    if path.startswith("/api/") and not path.startswith("/api/documents") and path.split("?",1)[0] not in {"/api/login", "/api/logout", "/api/session"}:
+    if (path.startswith("/api/") and not path.startswith(("/api/documents", "/api/agent/"))
+            and path.split("?", 1)[0] not in {"/api/login", "/api/logout", "/api/session"}):
         path = "/admin" + path
     body = None
     headers = {"Accept": "application/json"}
@@ -156,6 +158,88 @@ def flatten_members(nodes):
 
 def query_path(path: str, params: Dict[str, str]) -> str:
     return f"{path}?{urllib.parse.urlencode(params)}"
+
+
+UPGRADE_NAME = "python-upgrade-fixture.txt"
+UPGRADE_PATH = f"Finance/Reports/{UPGRADE_NAME}"
+UPGRADE_CONTENT = b"Written through SMB before switching to Go.\n"
+
+
+def upgrade_document(session):
+    return http(query_path("/api/documents", {"q": UPGRADE_NAME, "scope": "name"}), token=session)
+
+
+def upgrade_activity(session):
+    return http(query_path("/api/activity", {"user": "alice", "path": UPGRADE_PATH}), token=session)
+
+
+def finance_policy(session):
+    response = http("/api/access", token=session)
+    check(response.status == 200, "unable to read the Finance share policy")
+    return next(folder for folder in response.json()["folders"] if folder["name"] == "Finance")
+
+
+def prepare_upgrade(path):
+    announce("creating a live SMB file, audit event, catalog row, sessions and agent token with Python")
+    admin = http("/api/login", method="POST", value={"username": ADMIN_USER, "password": ADMIN_PASSWORD})
+    alice = http("/api/login", method="POST", value={"username": "alice", "password": USER_PASSWORD})
+    check(admin.status == alice.status == 200, "unable to start Python upgrade sessions")
+    admin_session = admin.json()["token"]
+    alice_session = alice.json()["token"]
+
+    engine_run("exec", CLIENT_CONTAINER, "sh", "-ec", 'printf "%s" "$1" > /tmp/python-upgrade.txt',
+               "sh", UPGRADE_CONTENT.decode())
+    engine_run("exec", CLIENT_CONTAINER, "smbclient", f"//files.{DNS_DOMAIN}/Data", "-m", "SMB3",
+               "-U", f"{WORKGROUP}\\alice%{USER_PASSWORD}",
+               "-c", f"cd Finance; cd Reports; put /tmp/python-upgrade.txt {UPGRADE_NAME}")
+    document = eventually("Python catalog upgrade row", lambda: upgrade_document(alice_session),
+                          lambda r: r.status == 200 and r.json()["total"] == 1, timeout=90).json()["items"][0]
+    events = eventually("Python audit upgrade row", lambda: upgrade_activity(admin_session),
+                        lambda r: r.status == 200 and any(event["path"] == UPGRADE_PATH
+                                                         for event in r.json()["events"]), timeout=60).json()["events"]
+    event = next(item for item in events if item["path"] == UPGRADE_PATH)
+
+    agent = http("/admin/api/agent-tokens", method="POST", token=admin_session,
+                 value={"label": "Python upgrade fixture", "usernames": ["alice"], "expiresInDays": 1})
+    check(agent.status == 201, "unable to create Python agent token")
+    policy = finance_policy(admin_session)
+    check(policy["active"] and policy["permissions"], "the Finance share has no policy to migrate")
+
+    fixture = {
+        "admin": admin_session,
+        "alice": alice_session,
+        "agent": agent.json()["token"],
+        "policy": policy,
+        "document": document["id"],
+        "event": event["id"],
+    }
+    Path(path).write_text(json.dumps(fixture), encoding="utf-8")
+
+
+def verify_upgrade(path):
+    announce("verifying Python sessions, share policy, audit, index and agent file access after the Go switch")
+    fixture = json.loads(Path(path).read_text(encoding="utf-8"))
+    session = http("/api/session", token=fixture["alice"])
+    check(session.status == 200 and session.json()["user"] == f"{WORKGROUP}\\alice", "Python session was not preserved")
+    check(finance_policy(fixture["admin"]) == fixture["policy"], "the Finance share policy changed during the upgrade")
+
+    activity = upgrade_activity(fixture["admin"])
+    check(activity.status == 200 and any(event["id"] == fixture["event"] and event["path"] == UPGRADE_PATH
+                                         for event in activity.json()["events"]), "Python audit event was not preserved")
+    document = upgrade_document(fixture["alice"])
+    check(document.status == 200 and [row["id"] for row in document.json()["items"]] == [fixture["document"]],
+          "Python catalog document was not preserved")
+
+    file_params = {
+        "username": "alice",
+        "source": "data:" + fixture["policy"]["id"],
+        "path": f"Reports/{UPGRADE_NAME}",
+    }
+    download = http(query_path("/api/agent/v1/file", file_params), token=fixture["agent"])
+    check(download.status == 200 and download.body == UPGRADE_CONTENT, "Python agent token could not read the migrated file")
+    file_params["username"] = "bob"
+    check(http(query_path("/api/agent/v1/file", file_params), token=fixture["agent"]).status == 403,
+          "upgrade widened the old agent token scope")
 
 
 def main() -> int:
@@ -294,6 +378,35 @@ def main() -> int:
     check(http("/api/session", token=f"{token}corrupt").status == 401, "corrupt JWT was accepted")
     readonly = http("/api/groups", method="POST", value={}, token=token)
     check(readonly.status == 404, "a mutation-like API method was accepted")
+
+    announce("agent token management, live delegated identity, and revocation")
+    agent_admin = "/admin/api/agent-tokens"
+    agent_list = "/api/agent/v1/list"
+    agent_request = {"label": "disposable E2E token", "usernames": ["alice"], "expiresInDays": 1}
+    check(http(agent_admin, method="POST", value=agent_request, token=user_token).status == 403,
+          "ordinary user created an agent token")
+    issued = http(agent_admin, method="POST", value=agent_request, token=token)
+    check(issued.status == 201, "administrator could not issue an agent token for a live AD account")
+    agent = issued.json()
+    bearer = agent["token"]
+    try:
+        inventory = http(agent_admin, token=token)
+        check(inventory.status == 200 and bearer.encode() not in inventory.body,
+              "agent token inventory exposes the bearer token")
+        check(http(agent_list, token=bearer).status == 400, "agent request did not require username")
+        check(http(agent_list + "?username=alice&username=alice", token=bearer).status == 400,
+              "agent request accepted duplicate usernames")
+        check(http(agent_list + "?username=bob", token=bearer).status == 403,
+              "agent token allowed an account outside its scope")
+        check(http("/api/session", token=bearer).status == 401, "agent token allowed browser session access")
+        scoped = http(query_path(agent_list, {"username": f"{WORKGROUP}\\alice"}), token=bearer)
+        check(scoped.status == 200, "agent token could not list roots as its allowed live AD account")
+        check(http(agent_list + "?username=alice", token=token).status == 401,
+              "admin browser session was treated as an agent token")
+    finally:
+        revoked = http(agent_admin + "/revoke", method="POST", value={"id": agent["id"]}, token=token)
+        check(revoked.status == 200, "agent token revocation failed")
+    check(http(agent_list + "?username=alice", token=bearer).status == 401, "revoked agent token still works")
 
     announce("AD trust, nested group tree, folders, and domain membership")
     engine_run("exec", FILES_CONTAINER, "wbinfo", "-t")
@@ -1078,7 +1191,15 @@ with open(path,'rb') as handle:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        if len(sys.argv) == 1:
+            sys.exit(main())
+        if len(sys.argv) != 3 or sys.argv[1] not in {"--prepare-upgrade", "--verify-upgrade"}:
+            fail("usage: e2e.py [--prepare-upgrade FIXTURE | --verify-upgrade FIXTURE]")
+
+        if sys.argv[1] == "--prepare-upgrade":
+            prepare_upgrade(sys.argv[2])
+        else:
+            verify_upgrade(sys.argv[2])
     except Exception as exc:  # pylint: disable=broad-except
         print(f"[e2e] FAIL: {exc}", file=sys.stderr, flush=True)
         sys.exit(1)

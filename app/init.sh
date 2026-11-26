@@ -387,7 +387,9 @@ ensure_acme_ca_certificates() {
 
     mkdir -p "$(dirname "$target")"
     rm -f "$download_tmp"
-    if ! python3 - "$download_url" "$download_tmp" "$insecure" <<'PY'
+    if [[ "${DOMAINSHARE_NATIVE:-false}" == "true" ]]; then
+      "$DOMAINSHARE_BINARY" ca-download --state-root "$STATE_ROOT" || return 1
+    elif ! python3 - "$download_url" "$download_tmp" "$insecure" <<'PY'
 import ssl
 import sys
 import urllib.parse
@@ -549,6 +551,17 @@ start_acme_renewal_daemon() {
 }
 
 start_observability_services() {
+  if [[ "${DOMAINSHARE_NATIVE:-false}" == "true" ]]; then
+    configure_web_tls
+    if env_is_true "${WEB_TLS_AUTORENEW:-true}"; then
+      case "$ACTIVE_WEB_TLS_MODE" in
+        acme) start_acme_renewal_daemon ;;
+        ca) step ca renew --daemon --force "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" & ;;
+      esac
+    fi
+    return
+  fi
+
   log 'Starting Samba audit collector'
   python3 /app/audit_collector.py &
 
@@ -607,7 +620,14 @@ EOF
   chmod 0644 /etc/cron.d/reconcile-shares
 }
 
-if [[ "${DOMAINSHARE_SUPERVISED:-false}" == "true" ]]; then
+run_root="${DOMAINSHARE_RUN_ROOT:-/run}"
+if [[ "${DOMAINSHARE_NATIVE:-false}" == "true" ]]; then
+  : "${DOMAINSHARE_BINARY:?Start native mode with domainshare supervise --native}"
+  : "${STATE_ROOT:?The supervisor must supply STATE_ROOT}"
+  state_exports="$("$DOMAINSHARE_BINARY" export-shell --state-root "$STATE_ROOT")"
+  source /dev/stdin <<<"$state_exports"
+  unset state_exports
+elif [[ "${DOMAINSHARE_SUPERVISED:-false}" == "true" ]]; then
   source <(python3 /app/configuration.py export-shell)
 fi
 if [[ "${1:-}" == "--configure-tls" ]]; then
@@ -654,7 +674,7 @@ winbindd -F --no-process-group &
 winbind_pid=$!
 
 wait_for_winbind
-touch /run/domainshare-domain-ready
+touch "$run_root/domainshare-domain-ready"
 if [[ "${1:-}" == "--bootstrap-domain" ]]; then
   log 'Domain joined; waiting for web setup to select groups.'
   wait "$winbind_pid"
@@ -664,13 +684,21 @@ fi
 register_ad_dns_record
 resolve_share_groups_from_sids
 render_smb_conf
-write_runtime_env_file
+if [[ "${DOMAINSHARE_NATIVE:-false}" == "true" ]]; then
+  log 'Running startup reconciliation'
+  RECONCILE_TRIGGER=startup "$DOMAINSHARE_BINARY" reconcile --state-root "$STATE_ROOT"
 
-log 'Running startup reconciliation'
-RECONCILE_TRIGGER=startup python3 /app/reconcile_shares.py
+  log 'Preparing seven-day trash repositories'
+  "$DOMAINSHARE_BINARY" trash-cleanup --state-root "$STATE_ROOT"
+else
+  write_runtime_env_file
 
-log 'Preparing seven-day trash repositories'
-python3 /app/trash.py --cleanup
+  log 'Running startup reconciliation'
+  RECONCILE_TRIGGER=startup python3 /app/reconcile_shares.py
+
+  log 'Preparing seven-day trash repositories'
+  python3 /app/trash.py --cleanup
+fi
 
 start_observability_services
 
@@ -682,11 +710,30 @@ else
   log 'BACKUP_DESTINATION is unset; backups disabled'
 fi
 
+if [[ "${DOMAINSHARE_NATIVE:-false}" == "true" ]]; then
+  log 'Starting smbd'
+  smbd -F --no-process-group &
+  smbd_pid=$!
+
+  for (( attempt=0; attempt<30; attempt++ )); do
+    kill -0 "$smbd_pid" "$winbind_pid" || exit 1
+    if timeout 2 smbcontrol smbd ping >/dev/null 2>&1; then
+      touch "$run_root/domainshare-services-ready"
+      wait -n "$winbind_pid" "$smbd_pid"
+      exit "$?"
+    fi
+    sleep 1
+  done
+
+  log 'smbd did not become ready'
+  exit 1
+fi
+
 install_cron_job
 
 log 'Starting cron daemon'
 cron -f &
 
 log 'Starting smbd in foreground'
-touch /run/domainshare-services-ready
+touch "$run_root/domainshare-services-ready"
 exec smbd -F --no-process-group

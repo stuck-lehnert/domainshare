@@ -27,6 +27,37 @@ Run a disposable preview or verify changes against the test domain.
 - `dev/` (disposable AD DC, backup target, SMB client, seed data, and E2E assertions)
 - `scripts/dev`
 - `scripts/test-e2e`
+- `cmd/domainshare/`, `internal/` (Go backend candidate and SQLite compatibility tests)
+
+## Go Backend Candidate
+
+Use Go 1.25 or newer to run `go test ./...` and `go vet ./...`. Some tests use
+Python as a compatibility reference, plus real tools such as 7-Zip, rsync,
+Poppler, Tesseract, and `setfacl` when available.
+
+The image builds both backends. The production command is still Python until
+the Go candidate passes the fresh-domain and existing-volume checks. Test the
+candidate with disposable data on a host with working Docker or Podman:
+
+```bash
+DEV_BACKEND=go ./scripts/test-e2e
+DEV_BACKEND=upgrade ./scripts/test-e2e
+```
+
+The first run joins a new test domain with Go. The second starts the Python
+backend, then recreates the file server with `domainshare supervise --native`
+while retaining the test Samba membership, configuration, TLS and data volumes.
+Before switching, it uploads a file over SMB, waits for Python to index and
+audit it, and creates browser sessions and a scoped agent token. After the
+switch, Go must serve that data and preserve the access restrictions. Both
+runs then use the same end-to-end suite. Do not run the preview against a live
+domain or production volumes.
+
+In native mode the image also exposes `domainshare backup`,
+`domainshare reconcile`, `domainshare trash-cleanup` and `domainshare healthcheck`.
+Restore a local encrypted archive into a new directory with
+`domainshare-backup restore ARCHIVE NEW_DIRECTORY` (use `--legacy` for an
+archive encrypted with the old archive password rather than a recovery phrase).
 
 ## Local Preview
 
@@ -116,6 +147,7 @@ The E2E suite verifies:
 - shared SQLite schema, integrity, indexes, legacy-log removal, and main-read and FSLogix-event deduplication across interleaved events and collector polls;
 - real Samba recycle handling plus authenticated trash listing, streamed download, and restore;
 - real rsync transfer progress, completed backup status, log output, remote snapshot marker, and per-group encrypted non-solid 7z archives;
+- offline Go restore from a completed backup, comparing the recovered file byte for byte in a container with no network or live-data mounts;
 - anonymous action rejection plus authenticated manual backup and reconciliation actions, terminal progress, and live reconciliation output;
 - overview and system-health aggregation;
 - the log-free PDF report snapshot plus local Typst wrapper, WebAssembly, font MIME types, and immutable caching.

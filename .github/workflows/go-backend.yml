@@ -1,0 +1,52 @@
+name: Go backend candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['ci/domainshare-go']
+  pull_request:
+    paths:
+      - '.github/workflows/go-backend.yml'
+      - 'app/**'
+      - 'cmd/**'
+      - 'dev/**'
+      - 'etc/samba/**'
+      - 'internal/**'
+      - 'scripts/dev'
+      - 'scripts/test-e2e'
+      - 'Dockerfile'
+      - 'go.mod'
+      - 'go.sum'
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acl libtiff-tools p7zip-full poppler-utils rclone rsync tesseract-ocr-eng
+      - run: go test ./...
+      - run: go vet ./...
+      - run: CGO_ENABLED=0 go build ./cmd/...
+
+  samba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [go, upgrade]
+    env:
+      DEV_BACKEND: ${{ matrix.backend }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/test-e2e

@@ -1,0 +1,9 @@
+[2026/07/31 12:34:56.123456,  1] smbd_audit: 2026/07/31 12:34:56|DEV\Alice|192.0.2.5|PC01|Data|pread|OK|Finance/Report.txt
+  2026/07/31 12:34:56|DEV\Alice|192.0.2.5|PC01|Data|pread_send|ok|Finance/Report.txt
+  2026/07/31 12:34:56|DEV\Alice|192.0.2.5|PC01|Data|pwrite|Permission denied|Finance/Report.txt
+  2026/07/31 12:34:56|DEV\MSOL_Test|192.0.2.5|PC01|Private|unlinkat|OK|old/%_literal.txt
+  2026/07/31 12:34:56|DEV\backup_SVC|192.0.2.5|PC01|Private|pwrite|OK|never-ingest.txt
+  2026/07/31 12:35:00|bob@example.com|192.0.2.6|PC02|fSlOgIx|pwrite|OK|profile.vhdx
+  2026/07/31 12:35:00|bob@example.com|192.0.2.6|PC02|fSlOgIx|pwrite_recv|OK|profile.vhdx
+smbd_audit: x|bob@example.com|192.0.2.6|PC02|Private|renameat|ok|a file.txt|another file.txt
+smbd_audit: x|bob@example.com|192.0.2.6|PC02|Private|open|ok|ignore-open.txt
