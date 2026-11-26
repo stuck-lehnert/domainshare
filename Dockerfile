@@ -1,4 +1,4 @@
-FROM docker.io/smallstep/step-cli:0.30.2 AS step-cli
+FROM docker.io/smallstep/step-cli:0.31.0 AS step-cli
 
 FROM docker.io/library/debian:12-slim
 
