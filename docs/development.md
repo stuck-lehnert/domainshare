@@ -35,25 +35,24 @@ Use Go 1.25 or newer to run `go test ./...` and `go vet ./...`. Some tests use
 Python as a compatibility reference, plus real tools such as 7-Zip, rsync,
 Poppler, Tesseract, and `setfacl` when available.
 
-The image builds both backends. The production command is still Python until
-the Go candidate passes the fresh-domain and existing-volume checks. Test the
-candidate with disposable data on a host with working Docker or Podman:
+The default image runs the Go backend. Test it with disposable data on a host
+with Docker or Podman:
 
 ```bash
-DEV_BACKEND=go ./scripts/test-e2e
+./scripts/test-e2e
 DEV_BACKEND=upgrade ./scripts/test-e2e
 ```
 
-The first run joins a new test domain with Go. The second starts the Python
-backend, then recreates the file server with `domainshare supervise --native`
-while retaining the test Samba membership, configuration, TLS and data volumes.
+The first run joins a new test domain with Go. The second starts the legacy
+`python-compat` image, then recreates the file server with the default Go image
+while retaining the Samba membership, configuration, TLS and data volumes.
 Before switching, it uploads a file over SMB, waits for Python to index and
 audit it, and creates browser sessions and a scoped agent token. After the
 switch, Go must serve that data and preserve the access restrictions. Both
 runs then use the same end-to-end suite. Do not run the preview against a live
 domain or production volumes.
 
-In native mode the image also exposes `domainshare backup`,
+The image also exposes `domainshare backup`,
 `domainshare reconcile`, `domainshare trash-cleanup` and `domainshare healthcheck`.
 Restore a local encrypted archive into a new directory with
 `domainshare-backup restore ARCHIVE NEW_DIRECTORY` (use `--legacy` for an

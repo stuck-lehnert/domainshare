@@ -1,4 +1,4 @@
-name: Go backend candidate
+name: Go backend
 
 on:
   workflow_dispatch:
@@ -15,8 +15,10 @@ on:
       - 'scripts/dev'
       - 'scripts/test-e2e'
       - 'Dockerfile'
+      - 'docker-compose.yml'
       - 'go.mod'
       - 'go.sum'
+      - 'setup'
 
 permissions:
   contents: read
@@ -49,6 +51,7 @@ jobs:
       DEV_BACKEND: ${{ matrix.backend }}
     steps:
       - uses: actions/checkout@v4
+      - run: docker compose config --quiet
       - name: Run AD/Samba end-to-end tests
         shell: bash
         run: |

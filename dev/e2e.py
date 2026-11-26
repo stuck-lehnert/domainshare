@@ -1105,7 +1105,7 @@ fi
     # Reproduce a policy and ACL from a version that allowed MSOL accounts.
     previous_service_file = json.loads(engine_run("exec", FILES_CONTAINER, "python3", "-c", """
 import hashlib, json, os, sys
-sys.path.insert(0, '/app')
+sys.path[:0] = ['/tmp/domainshare-legacy-fixture', '/app']
 import access_control as access
 import reconcile_shares as directory
 folder_id=sys.argv[1]
@@ -1138,7 +1138,7 @@ with access.mutation_lock():
     check(code != 0 or 'NT_STATUS_ACCESS_DENIED' in output, 'stored system-account grant still permits SMB reads')
     actual_service_file = json.loads(engine_run('exec', FILES_CONTAINER, 'python3', '-c', """
 import hashlib, json, os, sys
-sys.path.insert(0,'/app')
+sys.path[:0] = ['/tmp/domainshare-legacy-fixture', '/app']
 import reconcile_shares as directory
 conn=directory.open_db()
 assert not conn.execute('SELECT 1 FROM folder_permissions WHERE folderId=?',(sys.argv[1],)).fetchone()
@@ -1161,7 +1161,7 @@ with open(path,'rb') as handle:
     # but the folder and stored path still use /data/groups/<GUID>.
     previous = json.loads(engine_run("exec", FILES_CONTAINER, "python3", "-c", """
 import hashlib, json, os, sys
-sys.path.insert(0,'/app')
+sys.path[:0] = ['/tmp/domainshare-legacy-fixture', '/app']
 import access_control as access
 import reconcile_shares as directory
 folder_id=sys.argv[1]

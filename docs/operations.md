@@ -42,6 +42,8 @@ Administrators manage server settings at `/admin/settings` and backup destinatio
 
 For an existing installation, run `./setup` or `./redeploy`: the previous container’s resolved configuration is imported once when available; otherwise, its `.env` is imported without executing it. The original domain join, storage paths, access database, volumes, backup password, destinations and backup history are preserved. A configured installation ignores later `.env` edits. An unconfigured installation can also import its old file from the HTTPS setup screen. Keep the same Compose project name and volume names during the upgrade. Never use `docker compose down -v` on retained data.
 
+Before upgrading from the Python backend, retain the previous image and Compose file, and take a consistent snapshot of the state, Samba and data volumes while DomainShare is stopped. If a rollback is needed, stop the Go container before starting the previous version. Restore the pre-upgrade snapshot if needed, accounting for files changed since then. Do not run both versions against the same writable volumes.
+
 The DomainShare rename changes the container and image names, not the Compose service (`samba`) or its volumes. If you move or rename an existing checkout, set `COMPOSE_PROJECT_NAME` to the previous Compose project name before running `./setup` or `./redeploy`, so Compose finds the existing volumes. Saved Samba DNS and NetBIOS names stay in place. Web users need to sign in again after the rename.
 
 Compose publishes fixed ports 80 and 443, plus SMB 139 and 445. A deployment requiring different host ports can use a Compose override; it does not configure application credentials or backup destinations. TLS, AD settings and backup configuration are managed in the browser.
@@ -180,7 +182,7 @@ Backups can run while users are working. Office lock files (`~$*`) are excluded,
 
 Retention defaults are 3 daily, 2 weekly, 2 monthly and 1 yearly snapshots. Each tier selects its newest eligible snapshots; the union is kept. Snapshot names are UTC timestamps. If an upload fails, DomainShare removes the incomplete snapshot without touching previously completed ones. If the destination is unavailable or the worker is interrupted, DomainShare retries cleanup before the next backup to the same destination and key generation. An interrupted job is detected from the backup lock rather than shown as running indefinitely.
 
-To recover a generated-key archive offline, use `python3 app/restore_backup.py ARCHIVE.7z NEW_RECOVERY_DIRECTORY` with Python and 7z installed. The tool prompts for the phrase without echoing it, derives the key and extracts only into a new directory. Inspect the files before copying anything into live volumes. It refuses to overwrite an existing recovery directory. Legacy archives still use their original archive password.
+To recover an archive offline, run `domainshare-backup restore ARCHIVE.7z NEW_RECOVERY_DIRECTORY` on a machine with `7z` installed. The binary is in the DomainShare image and can also be built with `go build ./cmd/domainshare-backup`. Use `domainshare-backup restore --legacy ARCHIVE.7z NEW_RECOVERY_DIRECTORY` for an archive encrypted with its original password instead of a recovery phrase. The tool prompts without echoing the credential and refuses to overwrite an existing directory. Inspect the recovered files before copying them into live volumes.
 
 The versioned key format is `adfs-backup-archive-v1`: standard BIP39 English phrase/checksum and seed derivation (empty BIP39 passphrase), then PBKDF2-HMAC-SHA512 with that seed as the password, ASCII salt `adfs-backup-archive-v1`, one iteration, 32-byte output, lowercase hexadecimal. This becomes the archive password used by 7z's own AES-256 key derivation. The key identifier is the first 24 hexadecimal characters of SHA-256 of that ASCII password. The wordlist and license are bundled, so offline recovery does not depend on a network service.
 
@@ -189,15 +191,16 @@ The versioned key format is `adfs-backup-archive-v1`: standard BIP39 English phr
 ```bash
 docker compose logs -f samba
 docker compose logs -f samba | grep -E '\\[web\\]|\\[audit\\]'
-docker compose exec samba python3 /app/reconcile_shares.py
-docker compose exec samba python3 /app/run_service.py backup_to_destination.py
+docker compose exec samba domainshare healthcheck
+docker compose exec samba domainshare reconcile
+docker compose exec samba domainshare backup
 docker compose exec samba sqlite3 /state/shares.db 'PRAGMA quick_check;'
 docker compose exec samba sqlite3 /state/shares.db 'SELECT action, count(*) FROM audit_events GROUP BY action;'
 docker compose exec samba testparm -s
 docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
 docker compose exec samba sh -lc 'tail -n 200 /var/log/backup.log'
-docker compose exec samba python3 -m json.tool /state/backup-status.json
-docker compose exec samba python3 -m json.tool /state/reconcile-status.json
+docker compose exec samba cat /state/backup-status.json
+docker compose exec samba cat /state/reconcile-status.json
 ```
 
 ## Troubleshooting
@@ -250,7 +253,7 @@ docker compose exec samba python3 -m json.tool /state/reconcile-status.json
 - Check the reconciliation status and logs if the one-time import or an ACL update fails:
 
   ```bash
-  docker compose exec samba python3 /app/reconcile_shares.py
+  docker compose exec samba domainshare reconcile
   docker compose exec samba tail -n 100 /var/log/reconcile.log
   ```
 
@@ -262,10 +265,10 @@ docker compose exec samba python3 -m json.tool /state/reconcile-status.json
 - Force a recursive repair for all active Data group folders with:
 
   ```bash
-  docker compose exec samba sh -lc 'REPAIR_DATA_ACLS=1 python3 /app/reconcile_shares.py'
+  docker compose exec -e REPAIR_DATA_ACLS=1 samba domainshare reconcile
   ```
 
-- After a successful repair, later cron runs return to root-only Data ACL refreshes unless group ACLs change again.
+- After a successful repair, scheduled reconciliations return to root-only Data ACL refreshes unless group ACLs change again.
 
 ### Startup fails with `Unsafe managed folder path: /data/groups/<GUID>`
 
@@ -301,7 +304,7 @@ Startup repairs stored legacy paths without reimporting AD membership. It logs `
 - Re-run reconciliation to rebuild private directories and ACLs:
 
   ```bash
-  docker compose exec samba python3 /app/reconcile_shares.py
+  docker compose exec samba domainshare reconcile
   ```
 
 - Check identity resolution for a user:

@@ -12,9 +12,9 @@ previous_container="$(docker compose ps --all -q samba)"
 if [[ -n "$previous_container" ]]; then
   # Resolved values preserve Compose interpolation and literal password bytes.
   docker inspect "$previous_container" --format '{{json .Config.Env}}' |
-    docker compose run --rm --no-deps -T samba python3 /app/configuration.py import-runtime
+    docker compose run --rm --no-deps -T samba domainshare import-runtime
 elif [[ -f .env ]]; then
-  docker compose run --rm --no-deps -T samba python3 /app/configuration.py import-legacy < .env
+  docker compose run --rm --no-deps -T samba domainshare import-legacy < .env
 fi
 docker compose up -d
 printf '\nOpen http://<server>/ to configure HTTPS, then continue over HTTPS.\n'

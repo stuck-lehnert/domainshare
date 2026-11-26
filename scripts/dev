@@ -24,7 +24,7 @@ else
 fi
 
 run_e2e=${DEV_RUN_E2E:-0}
-backend=${DEV_BACKEND:-python}
+backend=${DEV_BACKEND:-go}
 onboarding=0
 [[ $# -le 1 ]] || die 'use either --e2e or --onboarding'
 case "${1:-}" in
@@ -63,6 +63,7 @@ dev_activity_interval=${DEV_ACTIVITY_INTERVAL_SECONDS:-4}
 dev_backup_interval=${DEV_BACKUP_INTERVAL_SECONDS:-120}
 
 server_image=${DEV_SERVER_IMAGE:-domainshare-dev:latest}
+python_image=${DEV_PYTHON_IMAGE:-domainshare-python-dev:latest}
 ad_image=${DEV_AD_IMAGE:-domainshare-ad-dev:latest}
 backup_image=${DEV_BACKUP_IMAGE:-domainshare-backup-dev:latest}
 ca_image=${DEV_CA_IMAGE:-docker.io/smallstep/step-ca:latest}
@@ -245,6 +246,10 @@ printf 'engine: %s\n' "$engine"
 if [[ ${DEV_SKIP_BUILD:-0} != 1 ]]; then
   printf 'building file server image: %s\n' "$server_image"
   "$engine" build -t "$server_image" -f "$repo_root/Dockerfile" "$repo_root"
+  if [[ $backend != go ]]; then
+    printf 'building the Python compatibility image: %s\n' "$python_image"
+    "$engine" build --target python-compat -t "$python_image" -f "$repo_root/Dockerfile" "$repo_root"
+  fi
   printf 'building AD/client image: %s\n' "$ad_image"
   "$engine" build -t "$ad_image" -f "$repo_root/dev/ad-dc.Dockerfile" "$repo_root"
   printf 'building backup image: %s\n' "$backup_image"
@@ -331,8 +336,10 @@ fi
 
 if [[ $onboarding == 1 ]]; then
   printf 'starting fresh file server for HTTP-to-HTTPS onboarding (%s)\n' "$backend"
+  onboarding_image=$python_image
   onboarding_command=("${python_command[@]}")
   if [[ $backend == go ]]; then
+    onboarding_image=$server_image
     onboarding_command=("${go_command[@]}")
   fi
 
@@ -350,20 +357,28 @@ if [[ $onboarding == 1 ]]; then
     -v "$groups_volume:/data/groups" \
     -v "$state_volume:/state" \
     -v "$samba_volume:/var/lib/samba" \
-    "$server_image" python3 -c '
-import json, os, sys
-sys.path.insert(0, "/app")
-import configuration
+    "$onboarding_image" python3 -c '
+import os
+import sqlite3
+import subprocess
+import sys
+
 # Only the external port mapping is supplied by the launcher. Domain, TLS,
 # credentials, groups and backups remain unconfigured until entered in the UI.
 port = int(sys.argv[1])
 if not 1 <= port <= 65535:
     raise ValueError("Invalid development HTTPS port")
-store = configuration.Store()
-values = store.snapshot()["values"]
-values["WEB_HTTPS_PORT"] = str(port)
-with store.connect() as conn:
-    conn.execute("UPDATE configuration SET settings=? WHERE id=1", (json.dumps(values),))
+
+if sys.argv[2] == "python3":
+    sys.path.insert(0, "/app")
+    import configuration
+    configuration.Store()
+else:
+    subprocess.run(["domainshare", "export-shell"], stdout=subprocess.DEVNULL, check=True)
+
+with sqlite3.connect("/state/configuration.db") as conn:
+    conn.execute("UPDATE configuration SET settings=json_set(settings, ?, ?) WHERE id=1", ("$.WEB_HTTPS_PORT", str(port)))
+
 os.execvp(sys.argv[2], sys.argv[2:])
 ' "$dev_https_port" "${onboarding_command[@]}" >/dev/null
 else
@@ -393,6 +408,8 @@ else
     "$ad_image" "${private_owners[@]}"
 
   start_files_server() {
+  local image=$1
+  shift
   "$engine" run -d \
     --name "$files_container" \
     --hostname files \
@@ -444,14 +461,14 @@ else
     -v "$groups_volume:/data/groups" \
     -v "$state_volume:/state" \
     -v "$samba_volume:/var/lib/samba" \
-    "$server_image" "$@" >/dev/null
+    "$image" "$@" >/dev/null
   }
 
   printf 'starting actual file server and HTTPS web UI (%s)\n' "$backend"
   if [[ $backend == go ]]; then
-    start_files_server "${go_command[@]}"
+    start_files_server "$server_image"
   else
-    start_files_server "${python_command[@]}"
+    start_files_server "$python_image"
   fi
 fi
 
@@ -564,7 +581,7 @@ if [[ $backend == upgrade ]]; then
   printf 'switching the disposable Python server to Go on the same AD account and volumes\n'
   "$engine" stop --time 30 "$files_container" >/dev/null
   "$engine" rm "$files_container" >/dev/null
-  start_files_server "${go_command[@]}"
+  start_files_server "$server_image"
   if ! wait_for_exec "$files_container" 240 /usr/local/bin/domainshare healthcheck; then
     show_logs
     die 'Go backend did not become healthy with the existing Python volumes'
@@ -626,6 +643,19 @@ check_backup_restore() {
 }
 
 if [[ $run_e2e == 1 ]]; then
+  if [[ $backend != python ]]; then
+    "$engine" exec "$files_container" test ! -e /app/entrypoint.py
+    "$engine" exec "$files_container" test ! -e /app/runtime.env
+
+    # Only the tests use these modules to synthesize on-disk state from old
+    # versions. The default image and its startup contain no Python backend.
+    fixture_path=/tmp/domainshare-legacy-fixture
+    "$engine" exec "$files_container" mkdir -m 700 "$fixture_path"
+    for module in access_control account_policy reconcile_shares state_db; do
+      "$engine" cp "$repo_root/app/$module.py" "$files_container:$fixture_path/$module.py"
+    done
+  fi
+
   printf 'running end-to-end assertions\n'
   if ! run_e2e_checks || ! check_backup_restore; then
     show_logs

@@ -19,7 +19,7 @@ services:
       - state_data:/state
       - samba_lib_data:/var/lib/samba
     healthcheck:
-      test: ["CMD", "python3", "/app/healthcheck.py"]
+      test: ["CMD", "domainshare", "healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 5

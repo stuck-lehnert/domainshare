@@ -13,7 +13,7 @@ RUN mkdir /out \
         internal/sambaacl/helper/main.c -o /out/domainshare-sambaacl -ldl \
     && go clean -cache -modcache
 
-FROM docker.io/library/debian:12-slim
+FROM docker.io/library/debian:12-slim AS runtime
 
 LABEL org.opencontainers.image.title="DomainShare"
 
@@ -22,7 +22,6 @@ ENV DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         acl \
-        cron \
         gettext-base \
         krb5-user \
         ldap-utils \
@@ -31,7 +30,6 @@ RUN apt-get update \
         libtiff-tools \
         python3 \
         python3-samba \
-        python3-pil \
         ocrmypdf \
         poppler-utils \
         tesseract-ocr-deu \
@@ -54,6 +52,18 @@ COPY --from=go-build /out/domainshare /usr/local/bin/domainshare
 COPY --from=go-build /out/domainshare-backup /usr/local/bin/domainshare-backup
 COPY --from=go-build /out/domainshare-trash /usr/local/bin/domainshare-trash
 COPY --from=go-build /out/domainshare-sambaacl /usr/local/libexec/domainshare-sambaacl
+COPY app/web /app/web
+COPY --chmod=755 app/init.sh /app/init.sh
+COPY etc/samba/smb.conf /app/smb.conf.template
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# Retain the previous backend only for migration tests and explicit rollback.
+FROM runtime AS python-compat
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cron python3-pil \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY app/reconcile_shares.py /app/reconcile_shares.py
 COPY app/backup_to_destination.py /app/backup_to_destination.py
@@ -76,13 +86,7 @@ COPY app/documents.py /app/documents.py
 COPY app/document_search.py /app/document_search.py
 COPY app/document_index.py /app/document_index.py
 COPY app/extract_document.py /app/extract_document.py
-COPY app/web /app/web
-COPY app/init.sh /app/init.sh
-COPY etc/samba/smb.conf /app/smb.conf.template
-
-RUN chmod +x /app/init.sh /app/reconcile_shares.py /app/backup_to_destination.py \
-        /app/audit_collector.py /app/web_ui.py \
-    && true
-
-ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python3", "/app/entrypoint.py"]
+
+FROM runtime AS domainshare
+CMD ["/usr/local/bin/domainshare", "supervise", "--native"]
