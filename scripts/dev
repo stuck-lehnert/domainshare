@@ -37,7 +37,12 @@ esac
 case "$backend" in
   python|go) ;;
   upgrade) [[ $run_e2e == 1 ]] || die 'DEV_BACKEND=upgrade requires --e2e' ;;
-  *) die 'DEV_BACKEND must be python, go, or upgrade' ;;
+  split)
+    [[ $run_e2e == 1 ]] || die 'DEV_BACKEND=split requires --e2e'
+    docker compose version >/dev/null || die 'DEV_BACKEND=split requires Docker Compose'
+    engine=docker
+    ;;
+  *) die 'DEV_BACKEND must be python, go, upgrade, or split' ;;
 esac
 go_command=(/usr/local/bin/domainshare supervise --native)
 python_command=(python3 /app/entrypoint.py)
@@ -74,6 +79,7 @@ dc_container="$run_id-dc"
 ca_container="$run_id-ca"
 backup_container="$run_id-backup"
 files_container="$run_id-files"
+management_container="$run_id-management"
 client_container="$run_id-client"
 restore_container="$run_id-restore"
 
@@ -110,6 +116,15 @@ server_wait_pid=
 backup_driver_pid=
 ca_root_file=
 upgrade_fixture=
+preview_compose=
+split_volumes=()
+
+if [[ $backend == split ]]; then
+  containers=("$management_container" "${containers[@]}")
+  for volume in samba_conf samba_run samba_cache samba_logs samba_readiness; do
+    split_volumes+=("${run_id}_$volume")
+  done
+fi
 
 stop_resources() {
   local container
@@ -123,7 +138,7 @@ stop_resources() {
   if [[ $network_created == 1 ]]; then
     "$engine" network rm "$network_name" >/dev/null 2>&1 || true
   fi
-  for volume in "${volumes[@]}"; do
+  for volume in "${volumes[@]}" "${split_volumes[@]}"; do
     "$engine" volume rm "$volume" >/dev/null 2>&1 || true
   done
 }
@@ -167,6 +182,9 @@ cleanup() {
   if [[ -n $upgrade_fixture ]]; then
     rm -f -- "$upgrade_fixture"
   fi
+  if [[ -n $preview_compose ]]; then
+    rm -f -- "$preview_compose"
+  fi
   exit "$status"
 }
 
@@ -178,7 +196,7 @@ trap 'exit 131' QUIT
 
 show_logs() {
   local container
-  for container in "$dc_container" "$ca_container" "$backup_container" "$files_container" "$client_container"; do
+  for container in "$dc_container" "$ca_container" "$backup_container" "$run_id-files" "$management_container" "$client_container"; do
     if "$engine" inspect "$container" >/dev/null 2>&1; then
       printf '\n===== %s =====\n' "$container" >&2
       "$engine" logs --tail 160 "$container" >&2 || true
@@ -410,7 +428,14 @@ else
   start_files_server() {
   local image=$1
   shift
+  local labels=()
+  if [[ $backend == split ]]; then
+    labels=(--label "com.docker.compose.project=$run_id" --label com.docker.compose.service=samba
+      --label com.docker.compose.container-number=1 --label com.docker.compose.oneoff=False
+      --label com.docker.compose.config-hash=legacy)
+  fi
   "$engine" run -d \
+    "${labels[@]}" \
     --name "$files_container" \
     --hostname files \
     --network "$network_name" \
@@ -571,7 +596,7 @@ run_e2e_checks() {
     python3 "$repo_root/dev/e2e.py" "$@"
 }
 
-if [[ $backend == upgrade ]]; then
+if [[ $backend == upgrade || $backend == split ]]; then
   upgrade_fixture=$(mktemp)
   if ! run_e2e_checks --prepare-upgrade "$upgrade_fixture"; then
     show_logs
@@ -579,9 +604,23 @@ if [[ $backend == upgrade ]]; then
   fi
 
   printf 'switching the disposable Python server to Go on the same AD account and volumes\n'
-  "$engine" stop --time 30 "$files_container" >/dev/null
-  "$engine" rm "$files_container" >/dev/null
-  start_files_server "$server_image"
+  if [[ $backend == split ]]; then
+    preview_compose=$(mktemp --suffix=.json)
+    COMPOSE_PROJECT_NAME="$run_id" docker compose -f "$repo_root/docker-compose.yml" config --format json |
+      python3 "$repo_root/dev/split-compose.py" "$network_name" "$files_ip" "${subnet_prefix}31" \
+        "$dc_ip" "$dev_dns_domain" "$dev_https_port" "$files_container" "$management_container" "$server_image" \
+        "$private_volume" "$fslogix_volume" "$groups_volume" "$state_volume" "$samba_volume" > "$preview_compose"
+    export COMPOSE_FILE="$preview_compose" COMPOSE_PROJECT_NAME="$run_id" PREVIEW_SAMBA_CONTAINER="$files_container"
+    if ! "$repo_root/setup" --skip-build; then
+      show_logs
+      die 'Compose split migration failed'
+    fi
+    files_container=$management_container
+  else
+    "$engine" stop --time 30 "$files_container" >/dev/null
+    "$engine" rm "$files_container" >/dev/null
+    start_files_server "$server_image"
+  fi
   if ! wait_for_exec "$files_container" 240 /usr/local/bin/domainshare healthcheck; then
     show_logs
     die 'Go backend did not become healthy with the existing Python volumes'
@@ -592,6 +631,11 @@ if [[ $backend == upgrade ]]; then
   if ! run_e2e_checks --verify-upgrade "$upgrade_fixture"; then
     show_logs
     die 'Go could not read live state created by Python'
+  fi
+
+  if [[ $backend == split ]] && ! run_e2e_checks --verify-redeploy; then
+    show_logs
+    die 'management redeploy interrupted SMB'
   fi
 fi
 

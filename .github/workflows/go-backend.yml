@@ -46,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [go, upgrade]
+        backend: [go, upgrade, split]
     env:
       DEV_BACKEND: ${{ matrix.backend }}
     steps:
@@ -63,7 +63,7 @@ jobs:
           # Keep the failure visible in the Checks API as well as the job log.
           failure=$(
             grep -E '(^\[e2e\]|^error:)' "$log" | tail -n 12 || true
-            awk '/^===== [^ ]+-files =====/{found=1; next} /^===== /{found=0} found' "$log" | tail -n 32
+            awk '/^===== [^ ]+-(files|management) =====/{print; found=1; next} /^===== /{found=0} found' "$log" | tail -n 32
           )
           failure=${failure:0:6000}
           failure=${failure//'%'/'%25'}

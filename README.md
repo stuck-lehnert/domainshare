@@ -17,7 +17,7 @@ You need Docker with Compose, a reachable AD domain and an account allowed to jo
 git clone https://github.com/stuck-lehnert/domainshare.git
 cd domainshare
 ./setup
-docker compose logs samba
+docker compose logs management
 ```
 
 Open `http://<server>/` and enter the HTTPS setup code from the logs. Once your certificate is ready, follow the HTTPS link and use the separate setup code to join the domain and select access groups.

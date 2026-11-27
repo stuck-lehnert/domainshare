@@ -2,22 +2,50 @@ services:
   samba:
     build:
       context: .
-    image: domainshare:latest
+    image: domainshare-samba:latest
     pull_policy: never
     container_name: domainshare
     hostname: domainshare
     restart: unless-stopped
+    labels:
+      org.domainshare.role: samba
+    command: ["domainshare", "supervise", "--native", "--role", "samba", "--run-root", "/run/domainshare-samba"]
+    environment: &domainshare-environment
+      KRB5_CONFIG: /etc/samba/krb5.conf
     ports:
       - "445:445"
       - "139:139"
-      - "80:80"
-      - "443:8443"
-    volumes:
+    volumes: &domainshare-volumes
       - private_data:/data/private
       - fslogix_data:/data/fslogix
       - group_data:/data/groups
       - state_data:/state
       - samba_lib_data:/var/lib/samba
+      - samba_conf:/etc/samba
+      - samba_run:/run/samba
+      - samba_cache:/var/cache/samba
+      - samba_logs:/var/log/samba
+      - samba_readiness:/run/domainshare-samba
+
+  management:
+    build:
+      context: .
+    image: domainshare:latest
+    pull_policy: never
+    hostname: domainshare-management
+    restart: unless-stopped
+    # Samba's local messaging and process checks require its PID namespace.
+    # Recreating management does not recreate the namespace owner.
+    pid: service:samba
+    depends_on:
+      samba:
+        condition: service_started
+    command: ["domainshare", "supervise", "--native", "--role", "management", "--run-root", "/run/domainshare-samba"]
+    environment: *domainshare-environment
+    ports:
+      - "80:80"
+      - "443:8443"
+    volumes: *domainshare-volumes
     healthcheck:
       test: ["CMD", "domainshare", "healthcheck"]
       interval: 30s
@@ -31,3 +59,8 @@ volumes:
   group_data:
   state_data:
   samba_lib_data:
+  samba_conf:
+  samba_run:
+  samba_cache:
+  samba_logs:
+  samba_readiness:

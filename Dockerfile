@@ -44,7 +44,8 @@ RUN apt-get update \
         winbind \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --system --no-create-home --shell /usr/sbin/nologin document-ocr
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin document-ocr \
+    && sed -ri '/^passwd:/ { /winbind/! s/$/ winbind/ }; /^group:/ { /winbind/! s/$/ winbind/ }' /etc/nsswitch.conf
 
 RUN mkdir -p /app /data/private /data/fslogix /data/groups/data /data/groups/archive /state
 COPY --from=step-cli /usr/local/bin/step /usr/local/bin/step
@@ -56,7 +57,7 @@ COPY app/web /app/web
 COPY --chmod=755 app/init.sh /app/init.sh
 COPY etc/samba/smb.conf /app/smb.conf.template
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 
 # Retain the previous backend only for migration tests and explicit rollback.
 FROM runtime AS python-compat

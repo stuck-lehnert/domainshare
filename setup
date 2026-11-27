@@ -1,21 +1,52 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-case "${1:-}" in
-  '') docker compose build ;;
-  --skip-build) ;;
-  *) printf 'Usage: ./setup [--skip-build]\n' >&2; exit 1 ;;
-esac
-# Import once into the existing state volume. Never source/evaluate legacy .env.
-# The import container does not join AD, reconcile permissions, or touch files.
+build=1
+restart_samba=0
+for option in "$@"; do
+  case "$option" in
+    --skip-build) build=0 ;;
+    --restart-samba) restart_samba=1 ;;
+    *) printf 'Usage: ./setup [--skip-build] [--restart-samba]\n' >&2; exit 1 ;;
+  esac
+done
+
 previous_container="$(docker compose ps --all -q samba)"
+migrate=0
 if [[ -n "$previous_container" ]]; then
-  # Resolved values preserve Compose interpolation and literal password bytes.
+  role="$(docker inspect "$previous_container" --format '{{index .Config.Labels "org.domainshare.role"}}')"
+  if [[ "$role" != samba ]]; then
+    migrate=1
+  fi
+fi
+
+if [[ "$build" == 1 ]]; then
+  if [[ -z "$previous_container" || "$migrate" == 1 || "$restart_samba" == 1 ]]; then
+    docker compose build samba management
+  else
+    docker compose build management
+  fi
+fi
+
+# Import before replacing the old container. Run the import in a one-shot
+# container with no published ports or dependency on a running smbd.
+if [[ "$migrate" == 1 ]]; then
   docker inspect "$previous_container" --format '{{json .Config.Env}}' |
     docker compose run --rm --no-deps -T samba domainshare import-runtime
-elif [[ -f .env ]]; then
+elif [[ -z "$previous_container" && -f .env ]]; then
   docker compose run --rm --no-deps -T samba domainshare import-legacy < .env
 fi
-docker compose up -d
+
+if [[ "$migrate" == 1 || "$restart_samba" == 1 ]]; then
+  printf 'Replacing Samba; active SMB sessions will disconnect.\n'
+  # Release the old PID namespace before replacing its owner.
+  docker compose stop management
+  docker compose up -d --no-deps --force-recreate samba
+  docker compose up -d --no-deps --force-recreate management
+else
+  docker compose up -d --no-deps --no-recreate samba
+  docker compose up -d --no-deps management
+fi
+
 printf '\nOpen http://<server>/ to configure HTTPS, then continue over HTTPS.\n'
-printf 'First-launch setup codes: docker compose logs samba\n'
+printf 'First-launch setup codes: docker compose logs management\n'

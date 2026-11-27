@@ -41,6 +41,7 @@ with Docker or Podman:
 ```bash
 ./scripts/test-e2e
 DEV_BACKEND=upgrade ./scripts/test-e2e
+DEV_BACKEND=split ./scripts/test-e2e  # requires Docker Compose
 ```
 
 The first run joins a new test domain with Go. The second starts the legacy
@@ -51,6 +52,11 @@ audit it, and creates browser sessions and a scoped agent token. After the
 switch, Go must serve that data and preserve the access restrictions. Both
 runs then use the same end-to-end suite. Do not run the preview against a live
 domain or production volumes.
+
+The split check upgrades the old combined server using `setup` and the real
+Compose service definitions on the preview network. It replaces management
+while an SMB3 file handle is still open on FSLogix, then reads through the
+same handle and checks that Samba was not restarted.
 
 The image also exposes `domainshare backup`,
 `domainshare reconcile`, `domainshare trash-cleanup` and `domainshare healthcheck`.

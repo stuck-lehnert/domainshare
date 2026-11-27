@@ -21,6 +21,7 @@ func runService(ctx context.Context, command string, args []string) error {
 	root := flags.String("state-root", config.DefaultRoot, "persistent configuration directory")
 	var address, assets, app, runtime *string
 	var native *bool
+	var role *string
 	var slot *string
 	switch command {
 	case "http-setup":
@@ -34,6 +35,7 @@ func runService(ctx context.Context, command string, args []string) error {
 		app = flags.String("app-root", "/app", "application directory")
 		runtime = flags.String("run-root", "/run", "runtime marker directory")
 		native = flags.Bool("native", false, "use the Go backend and workers")
+		role = flags.String("role", "combined", "container role: combined, management, or samba")
 	case "backup":
 		slot = flags.String("slot", "", "run at most once for this scheduled UTC hour (YYYY-MM-DDTHH)")
 	}
@@ -83,7 +85,7 @@ func runService(ctx context.Context, command string, args []string) error {
 		if err != nil {
 			return err
 		}
-		return supervisor.Run(ctx, store, supervisor.Options{Binary: self, AppRoot: *app, RunRoot: *runtime, Native: *native})
+		return supervisor.Run(ctx, store, supervisor.Options{Binary: self, AppRoot: *app, RunRoot: *runtime, Native: *native, Role: *role})
 	default:
 		return fmt.Errorf("unknown service %q", command)
 	}

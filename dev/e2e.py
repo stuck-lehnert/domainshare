@@ -4,6 +4,7 @@
 import base64
 import json
 import os
+import select
 import socket
 import ssl
 import subprocess
@@ -259,6 +260,71 @@ def verify_upgrade(path):
           "upgrade widened the old agent token scope")
 
 
+def verify_management_redeploy():
+    announce("management replacement retains an open SMB3 file handle on FSLogix")
+    samba = os.environ["PREVIEW_SAMBA_CONTAINER"]
+    compose_file = Path(os.environ["COMPOSE_FILE"])
+
+    def container_instance(name):
+        return engine_run("inspect", "--format", "{{.Id}} {{.State.StartedAt}}", name).stdout.strip()
+
+    samba_before = container_instance(samba)
+    management_before = container_instance(FILES_CONTAINER)
+    probe = """
+import sys
+from samba.credentials import Credentials, DONT_USE_KERBEROS
+from samba.samba3 import libsmb_samba_internal as smb, param
+
+host, domain, password = sys.argv[1:]
+lp = param.get_context()
+lp.load('/etc/samba/smb.conf')
+credentials = Credentials()
+credentials.set_domain(domain)
+credentials.set_username('alice')
+credentials.set_password(password)
+credentials.set_workstation('DS-DEPLOY-TEST')
+credentials.set_kerberos_state(DONT_USE_KERBEROS)
+
+connection = smb.Conn(host, 'FSLogix', lp, credentials)
+handle = connection.create('management-redeploy-probe.bin', CreateDisposition=3, DesiredAccess=3)
+payload = b'open SMB file handle'
+connection.write(handle, payload, 0)
+assert connection.read(handle, 0, len(payload)) == payload
+print('OPEN', flush=True)
+
+assert sys.stdin.readline() == 'continue\\n'
+assert connection.read(handle, 0, len(payload)) == payload
+connection.close(handle)
+print('STILL_OPEN', flush=True)
+"""
+
+    with subprocess.Popen(
+        [ENGINE, "exec", "-i", CLIENT_CONTAINER, "timeout", "120", "python3", "-c", probe,
+         f"files.{DNS_DOMAIN}", WORKGROUP, USER_PASSWORD],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    ) as client:
+        try:
+            ready, _, _ = select.select([client.stdout], [], [], 20)
+            check(ready and client.stdout.readline().strip() == "OPEN", "SMB3 handle did not open")
+
+            # Simulate a change to the management image/configuration, with the
+            # normal deploy path used by redeploy (no Samba restart flag).
+            spec = json.loads(compose_file.read_text(encoding="utf-8"))
+            spec["services"]["management"]["environment"]["PREVIEW_BUILD_REVISION"] = "next"
+            compose_file.write_text(json.dumps(spec), encoding="utf-8")
+            subprocess.run(["./setup", "--skip-build"], check=True, timeout=75)
+
+            check(container_instance(samba) == samba_before, "management deploy restarted Samba")
+            check(container_instance(FILES_CONTAINER) != management_before, "the management container was not replaced")
+            output, _ = client.communicate(input="continue\n", timeout=15)
+            check(client.returncode == 0 and output.strip() == "STILL_OPEN", "the original SMB handle stopped working")
+        finally:
+            if client.poll() is None:
+                client.kill()
+
+    eventually("management HTTPS after redeploy", lambda: http("/healthz"), lambda response: response.status == 200)
+
+
 def main() -> int:
     announce("TLS chain, hostname, public health, and browser security headers")
     health = http("/healthz")
@@ -399,7 +465,10 @@ def main() -> int:
     announce("agent token management, live delegated identity, and revocation")
     agent_admin = "/admin/api/agent-tokens"
     agent_list = "/api/agent/v1/list"
-    agent_request = {"label": "disposable E2E token", "usernames": ["alice"], "expiresInDays": 1}
+    agent_logins = ["alice"]
+    if os.environ.get("PREVIEW_BACKEND", "go") != "python":
+        agent_logins += [f"david.davis@{DNS_DOMAIN}", f"frank.foster@people.{DNS_DOMAIN}"]
+    agent_request = {"label": "disposable E2E token", "usernames": agent_logins, "expiresInDays": 1}
     check(http(agent_admin, method="POST", value=agent_request, token=user_token).status == 403,
           "ordinary user created an agent token")
     issued = http(agent_admin, method="POST", value=agent_request, token=token)
@@ -418,6 +487,18 @@ def main() -> int:
         check(http("/api/session", token=bearer).status == 401, "agent token allowed browser session access")
         scoped = http(query_path(agent_list, {"username": f"{WORKGROUP}\\alice"}), token=bearer)
         check(scoped.status == 200, "agent token could not list roots as its allowed live AD account")
+        if len(agent_logins) > 1:
+            for alias, account in (
+                (f"alice@{DNS_DOMAIN.upper()}", "alice"),
+                (f"david.davis@{DNS_DOMAIN}", "dave"),
+                (f"FRANK.FOSTER@people.{DNS_DOMAIN}", "frank"),
+            ):
+                actual = http(query_path(agent_list, {"username": alias}), token=bearer)
+                expected = http(query_path(agent_list, {"username": account}), token=bearer)
+                check(actual.status == expected.status == 200 and actual.json() == expected.json(),
+                      f"agent sign-in alias changed the delegated identity: {alias}")
+            wrong_suffix = http(query_path(agent_list, {"username": "alice@unconfigured.invalid"}), token=bearer)
+            check(wrong_suffix.status == 403, "agent ignored an unregistered UPN suffix")
         check(http(agent_list + "?username=alice", token=token).status == 401,
               "admin browser session was treated as an agent token")
     finally:
@@ -1181,7 +1262,10 @@ with access.mutation_lock():
     print(json.dumps(previous))
 """, repair_id).stdout)
     check(http(control_path, method="POST", value={"action":"pause"}, token=token).status == 200, "cannot persist worker pause before restart")
-    engine_run("restart", FILES_CONTAINER)
+    if os.environ.get("PREVIEW_SAMBA_CONTAINER"):
+        subprocess.run(["./setup", "--skip-build", "--restart-samba"], check=True, timeout=90)
+    else:
+        engine_run("restart", FILES_CONTAINER)
     eventually("file server startup after legacy path repair", lambda: http("/healthz"), lambda response: response.status == 200, timeout=120)
     restarted_worker = eventually("paused document worker after restart", lambda: http(status_path, token=token),
                                  lambda r: r.status == 200 and r.json()["online"], timeout=30).json()
@@ -1214,8 +1298,11 @@ if __name__ == "__main__":
     try:
         if len(sys.argv) == 1:
             sys.exit(main())
+        if sys.argv[1:] == ["--verify-redeploy"]:
+            verify_management_redeploy()
+            sys.exit(0)
         if len(sys.argv) != 3 or sys.argv[1] not in {"--prepare-upgrade", "--verify-upgrade"}:
-            fail("usage: e2e.py [--prepare-upgrade FIXTURE | --verify-upgrade FIXTURE]")
+            fail("usage: e2e.py [--prepare-upgrade FIXTURE | --verify-upgrade FIXTURE | --verify-redeploy]")
 
         if sys.argv[1] == "--prepare-upgrade":
             prepare_upgrade(sys.argv[2])

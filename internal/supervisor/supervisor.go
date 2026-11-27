@@ -22,6 +22,7 @@ type Options struct {
 	RunRoot string
 	Binary  string
 	Native  bool
+	Role    string
 }
 
 type runner struct {
@@ -48,6 +49,18 @@ func Run(ctx context.Context, store *config.Store, options Options) error {
 	}
 	if options.Binary == "" {
 		return errors.New("missing supervisor executable")
+	}
+	switch options.Role {
+	case "", "combined":
+	case "management", "samba":
+		if !options.Native {
+			return errors.New("split container roles require --native")
+		}
+	default:
+		return fmt.Errorf("unknown container role %q", options.Role)
+	}
+	if options.Role == "samba" {
+		return serveSamba(ctx, store, options)
 	}
 
 	snapshot, err := store.Snapshot(ctx)
@@ -148,11 +161,14 @@ func (run *runner) tick(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	if err := run.domainTick(ctx, snapshot, environment, now, tlsReady); err != nil {
-		return err
+	if run.options.Role != "management" {
+		if err := run.domainTick(ctx, snapshot, environment, now, tlsReady); err != nil {
+			return err
+		}
 	}
 	if run.options.Native {
 		if !run.servicesReady(snapshot) {
+			run.stopWorkers()
 			return nil
 		}
 		if err := run.nativeWorkers(environment, now.UTC()); err != nil {
@@ -223,10 +239,7 @@ func (run *runner) domainTick(ctx context.Context, snapshot config.Snapshot, env
 		if err := run.removeReadiness(); err != nil {
 			return err
 		}
-		for _, child := range []*process{run.audit, run.index, run.reconcile, run.trash} {
-			child.stop()
-		}
-		run.audit, run.index, run.reconcile, run.trash = nil, nil, nil, nil
+		run.stopWorkers()
 		run.nextDomain = now.Add(30 * time.Second)
 		message := fmt.Sprintf("AD-Dienste konnten nicht gestartet werden (Status %d); Einstellungen prüfen", code)
 		return run.serviceStatus("failed", message)
@@ -315,10 +328,14 @@ func (run *runner) launchInit(environment map[string]string, args ...string) (*p
 	return run.launch(environment, map[string]string{
 		"DOMAINSHARE_SUPERVISED": "true", "DOMAINSHARE_NATIVE": fmt.Sprint(run.options.Native),
 		"DOMAINSHARE_RUN_ROOT": run.options.RunRoot, "DOMAINSHARE_BINARY": run.options.Binary,
+		"DOMAINSHARE_SAMBA_ONLY": fmt.Sprint(run.options.Role == "samba"),
 	}, command...)
 }
 
 func (run *runner) removeReadiness() error {
+	if run.options.Role == "management" {
+		return nil
+	}
 	return errors.Join(run.removeMarker("domainshare-services-ready"), run.removeMarker("domainshare-domain-ready"))
 }
 

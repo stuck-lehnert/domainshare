@@ -156,7 +156,7 @@ resolve_share_groups_from_sids() {
 }
 
 render_krb5_conf() {
-  cat > /etc/krb5.conf <<EOF
+  cat > "${KRB5_CONFIG:-/etc/krb5.conf}" <<EOF
 [libdefaults]
  default_realm = ${REALM}
  dns_lookup_realm = false
@@ -624,9 +624,11 @@ run_root="${DOMAINSHARE_RUN_ROOT:-/run}"
 if [[ "${DOMAINSHARE_NATIVE:-false}" == "true" ]]; then
   : "${DOMAINSHARE_BINARY:?Start native mode with domainshare supervise --native}"
   : "${STATE_ROOT:?The supervisor must supply STATE_ROOT}"
-  state_exports="$("$DOMAINSHARE_BINARY" export-shell --state-root "$STATE_ROOT")"
-  source /dev/stdin <<<"$state_exports"
-  unset state_exports
+  if [[ "${DOMAINSHARE_SAMBA_ONLY:-false}" != "true" ]]; then
+    state_exports="$("$DOMAINSHARE_BINARY" export-shell --state-root "$STATE_ROOT")"
+    source /dev/stdin <<<"$state_exports"
+    unset state_exports
+  fi
 elif [[ "${DOMAINSHARE_SUPERVISED:-false}" == "true" ]]; then
   source <(python3 /app/configuration.py export-shell)
 fi

@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
+case "${1:-}" in
+  ''|--restart-samba) ;;
+  *) printf 'Usage: ./redeploy [--restart-samba]\n' >&2; exit 1 ;;
+esac
+
 printf '[redeploy] Pulling latest changes\n'
 git pull
-printf '[redeploy] Building while the current service remains running\n'
-docker compose build --no-cache
-./setup --skip-build
+
+./setup "$@"
 printf '[redeploy] Complete; configuration and data volumes retained.\n'

@@ -13,8 +13,17 @@ func (run *runner) nativeService(name string, args ...string) []string {
 }
 
 func (run *runner) servicesReady(snapshot config.Snapshot) bool {
-	return snapshot.Phase == "configured" && run.domain != nil && !run.domain.exited() &&
-		exists(filepath.Join(run.options.RunRoot, "domainshare-services-ready"))
+	if snapshot.Phase != "configured" || (run.options.Role != "management" && (run.domain == nil || run.domain.exited())) {
+		return false
+	}
+	return exists(filepath.Join(run.options.RunRoot, "domainshare-services-ready"))
+}
+
+func (run *runner) stopWorkers() {
+	for _, child := range []*process{run.audit, run.index, run.reconcile, run.trash} {
+		child.stop()
+	}
+	run.audit, run.index, run.reconcile, run.trash = nil, nil, nil, nil
 }
 
 func (run *runner) nativeWorkers(env map[string]string, now time.Time) error {

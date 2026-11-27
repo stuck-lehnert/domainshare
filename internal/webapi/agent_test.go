@@ -38,7 +38,7 @@ func (ad *fixtureDirectory) AccountLogin(user string) (string, error) {
 
 func (ad *fixtureDirectory) ResolveAccount(_ context.Context, sam string) (string, error) {
 	switch strings.ToLower(sam) {
-	case "alice":
+	case "alice", "alice@ad.example", "ally@people.example":
 		if ad.enabled.Load() {
 			return userSID, nil
 		}
@@ -172,6 +172,7 @@ func TestLiveAgentTLS(t *testing.T) {
 		{"GET", list + "?username=alice&user%6eame=administrator", issued.Raw, false, 400},
 		{"GET", list + "?username=%FF", issued.Raw, false, 400},
 		{"GET", list + "?username=administrator", issued.Raw, false, 403},
+		{"GET", list + "?username=alice@unknown.example", issued.Raw, false, 403},
 		{"GET", list + "?username=alice" + strings.Repeat("&a=1", 24), issued.Raw, false, 400},
 		{"GET", agentPrefix + "/%6cist?username=alice", issued.Raw, false, 404},
 		{"POST", list + "?username=alice", issued.Raw, false, 405},
@@ -186,6 +187,13 @@ func TestLiveAgentTLS(t *testing.T) {
 	if code != 200 || !strings.Contains(body, "data:reports") || headers.Get("Cache-Control") != "no-store" {
 		t.Fatalf("source listing: %d %q", code, body)
 	}
+	for _, alias := range []string{"alice@AD.EXAMPLE", "Ally@people.example"} {
+		code, _, aliased := request("GET", list+"?username="+url.QueryEscape(alias), issued.Raw, false, "")
+		if code != 200 || aliased != body {
+			t.Fatalf("alias %q resolved to different sources: %d %q", alias, code, aliased)
+		}
+	}
+
 	code, _, body = request("GET", list+"?username=alice&source=data:reports&limit=1", issued.Raw, false, "")
 	if code != 200 || !strings.Contains(body, "Q3 überblick.pdf") || strings.Contains(body, `"link"`) {
 		t.Fatalf("folder listing: %d %q", code, body)

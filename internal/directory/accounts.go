@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/text/cases"
@@ -52,21 +53,30 @@ func IsExcludedUser(user string) bool {
 	return name == "krbtgt" || strings.HasPrefix(name, "msol_")
 }
 
-// AccountLogin accepts a mandatory sAMAccountName or configured DOMAIN\user.
+// AccountLogin validates an AD sign-in name without guessing the account
+// behind a UPN. An alternate UPN's prefix need not be its sAMAccountName.
 func (client Client) AccountLogin(username string) (string, error) {
 	name := strings.TrimSpace(username)
 	if !utf8.ValidString(username) || utf8.RuneCountInString(username) > 256 || name == "" {
 		return "", errors.New("Benutzername ist erforderlich")
 	}
+	if strings.IndexFunc(username, unicode.IsControl) >= 0 || strings.Contains(name, "/") {
+		return "", errors.New("Ungültiger Benutzername")
+	}
 	if domain, account, ok := strings.Cut(name, "\\"); ok {
-		if fold(domain) != fold(client.env("WORKGROUP")) || domain == "" {
+		if domain == "" || (!strings.EqualFold(domain, client.env("WORKGROUP")) && !strings.EqualFold(domain, client.env("REALM"))) {
 			return "", errors.New("Benutzername gehört nicht zur konfigurierten Domäne")
 		}
-		name = account
+		if account != "" && !strings.ContainsAny(account, `\@`) {
+			return account, nil
+		}
+		return "", errors.New("Ungültiger Benutzername")
 	}
 
-	if name == "" || strings.ContainsAny(name, `\/@`) || strings.IndexFunc(name, func(r rune) bool { return r < 32 || r == 127 }) >= 0 {
-		return "", errors.New("Ungültiger Benutzername")
+	if local, suffix, ok := strings.Cut(name, "@"); ok {
+		if local == "" || suffix == "" || strings.Contains(suffix, "@") || strings.IndexFunc(suffix, unicode.IsSpace) >= 0 {
+			return "", errors.New("Ungültiger Benutzername")
+		}
 	}
 	return name, nil
 }
@@ -79,26 +89,55 @@ const (
 // ResolveAccount performs a live lookup, not a winbind name-cache lookup.
 // It returns ErrAccount for absent, disabled, locked and expired users.
 func (client Client) ResolveAccount(ctx context.Context, username string) (string, error) {
-	sam, err := client.AccountLogin(username)
+	name, err := client.AccountLogin(username)
 	if err != nil {
 		return "", err
 	}
+	return client.resolveLogin(ctx, name, client.Search, time.Now())
+}
+
+func (client Client) resolveLogin(ctx context.Context, name string, search func(context.Context, string, []string) ([]Entry, error), now time.Time) (string, error) {
+	lookup := func(attribute, value string) ([]Entry, error) {
+		filter := "(&(objectClass=user)(!(objectClass=computer))(" + attribute + "=" + EscapeFilter(value) + "))"
+		return search(ctx, filter, []string{
+			"distinguishedName", "sAMAccountName", "userPrincipalName", "objectSid", "userAccountControl", "accountExpires",
+			"msDS-User-Account-Control-Computed", "lockoutTime",
+		})
+	}
+
+	sam := name
+	if local, suffix, upn := strings.Cut(name, "@"); upn {
+		entries, err := lookup("userPrincipalName", name)
+		if err != nil {
+			return "", err
+		}
+		if len(entries) > 0 {
+			if len(entries) != 1 || !strings.EqualFold(entries[0].First("userPrincipalName"), name) {
+				return "", ErrAccount
+			}
+			return enabledAccount(entries, entries[0].First("sAMAccountName"), now)
+		}
+
+		// Implicit UPNs use sAMAccountName and the actual AD DNS realm.
+		// An unknown alternate suffix must never resolve to a bare account.
+		if !strings.EqualFold(suffix, client.env("REALM")) {
+			return "", ErrAccount
+		}
+		sam = local
+	}
+
 	if IsExcludedUser(sam) || strings.HasSuffix(sam, "$") {
 		return "", ErrAccount
 	}
-	filter := "(&(objectClass=user)(!(objectClass=computer))(sAMAccountName=" + EscapeFilter(sam) + "))"
-	entries, err := client.Search(ctx, filter, []string{
-		"distinguishedName", "sAMAccountName", "objectSid", "userAccountControl", "accountExpires",
-		"msDS-User-Account-Control-Computed", "lockoutTime",
-	})
+	entries, err := lookup("sAMAccountName", sam)
 	if err != nil {
 		return "", err
 	}
-	return enabledAccount(entries, sam, time.Now())
+	return enabledAccount(entries, sam, now)
 }
 
 func enabledAccount(entries []Entry, sam string, now time.Time) (string, error) {
-	if len(entries) != 1 {
+	if len(entries) != 1 || sam == "" || IsExcludedUser(sam) || strings.HasSuffix(sam, "$") {
 		return "", ErrAccount
 	}
 	entry := entries[0]

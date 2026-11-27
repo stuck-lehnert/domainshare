@@ -8,7 +8,7 @@ The Agent API offers read-only file access over HTTPS. A token identifies the ag
 
 In the administration console, open **Agenten-Tokens**. Give the token a name, explicitly list up to ten AD usernames, and set its validity period (1–365 days, 30 by default). Copy the bearer token when it appears; it cannot be retrieved later. The server stores only its hash. Issue separate tokens for separate agents and revoke them from the same screen when no longer needed. Tokens persist across restarts but are not part of DomainShare backups. Reissue them after restoring to a new installation.
 
-Use the account's `sAMAccountName` (for example, `alice` or `EXAMPLE\alice`), not an email address or UPN. Scope is tied to AD security identifiers (SIDs), so an account recreated with the same name does not inherit a token. Access is checked on each request. An admin account, if explicitly allowed on the token, has the same read access to active Data folders as in the web portal. No account can browse another user's Private folder through this API. FSLogix, archived folders and trash are not exposed.
+Use an AD sign-in name: `alice`, `EXAMPLE\alice`, `alice@example.test`, or the account's assigned UPN such as `alice.smith@people.example.test`. An email address works only if it is also a valid AD sign-in name. DomainShare resolves the name in the configured AD domain and checks the resulting SID on every request. An account recreated with the same name does not inherit a token. An admin account, if explicitly allowed on the token, has the same read access to active Data folders as in the web portal. No account can browse another user's Private folder through this API. FSLogix, archived folders and trash are not exposed.
 
 ## Requests
 

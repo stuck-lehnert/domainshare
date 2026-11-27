@@ -32,19 +32,25 @@ Kerberos requires close time alignment.
 
 ## Setup
 
-No environment file is required. Run `./setup` to build and start the service, then open `http://<server>/`. HTTP exposes only HTTPS configuration: enter the separate HTTPS setup code from `docker compose logs samba`, choose the HTTPS hostname and ACME directory URL, and optionally upload a PEM root CA certificate. Public CAs use the system trust bundle. The ACME CA must resolve the hostname and reach its HTTP-01 challenge on port 80.
+No environment file is required. Run `./setup` to build and start the services, then open `http://<server>/`. HTTP exposes only HTTPS configuration: enter the separate HTTPS setup code from `docker compose logs management`, choose the HTTPS hostname and ACME directory URL, and optionally upload a PEM root CA certificate. Public CAs use the system trust bundle. The ACME CA must resolve the hostname and reach its HTTP-01 challenge on port 80.
 
 Once issuance succeeds, follow the HTTPS link. Enter the second, independent setup code from the container log. This code is used only over HTTPS. Configure the AD realm, NetBIOS domain, controller, domain-join/LDAP credentials and server names. After the domain join succeeds, select the AD groups for login, administration and FSLogix, and verify an account in the selected administrator group. Folder permissions remain individual assignments.
 
 The web UI remains available if joining AD fails. Correct the settings and retry without removing any data volumes. The setup capability stops working after completion. Domain-join credentials are retained for LDAP; use an account with the necessary directory read and join permissions, or replace its credentials in administration after joining.
 
-Administrators manage server settings at `/admin/settings` and backup destinations, schedules, retention and encryption at `/admin/backup`. Settings are stored in the root-only `/state/configuration.db`. Backup changes apply to the next run. Other changes restart the service processes, preserving files and the existing domain join; active SMB connections may reconnect. Switching to a different AD domain is deliberately rejected after setup.
+Administrators manage server settings at `/admin/settings` and backup destinations, schedules, retention and encryption at `/admin/backup`. Settings are stored in the root-only `/state/configuration.db`. Backup changes apply to the next run. Management and TLS changes do not restart Samba. Samba-specific changes, such as the FSLogix access group, can restart SMB daemons. Switching to a different AD domain is deliberately rejected after setup.
 
 For an existing installation, run `./setup` or `./redeploy`: the previous container’s resolved configuration is imported once when available; otherwise, its `.env` is imported without executing it. The original domain join, storage paths, access database, volumes, backup password, destinations and backup history are preserved. A configured installation ignores later `.env` edits. An unconfigured installation can also import its old file from the HTTPS setup screen. Keep the same Compose project name and volume names during the upgrade. Never use `docker compose down -v` on retained data.
 
 Before upgrading from the Python backend, retain the previous image and Compose file, and take a consistent snapshot of the state, Samba and data volumes while DomainShare is stopped. If a rollback is needed, stop the Go container before starting the previous version. Restore the pre-upgrade snapshot if needed, accounting for files changed since then. Do not run both versions against the same writable volumes.
 
-The DomainShare rename changes the container and image names, not the Compose service (`samba`) or its volumes. If you move or rename an existing checkout, set `COMPOSE_PROJECT_NAME` to the previous Compose project name before running `./setup` or `./redeploy`, so Compose finds the existing volumes. Saved Samba DNS and NetBIOS names stay in place. Web users need to sign in again after the rename.
+### Redeploying without disconnecting SMB clients
+
+The `samba` container owns SMB and Winbind. The separate `management` container serves HTTPS, the web UI, and the Agent API, and runs the management workers. They share the existing data, configuration and AD membership volumes. Keep the same `COMPOSE_PROJECT_NAME` if you move the checkout.
+
+- `./redeploy` pulls the current branch and normally rebuilds and updates only `management`. Open SMB connections and FSLogix handles stay with the running Samba container. The web UI may briefly reconnect.
+- `./redeploy --restart-samba` also rebuilds and replaces Samba. Use it for Samba package, image, or template updates, and schedule it outside active FSLogix sessions. The setup script stops management before replacing the Samba container that owns its PID namespace.
+- Migrating an older combined container requires **one SMB interruption** to split the services. `./setup` or `./redeploy` detects the old container and keeps its existing volumes, machine identity, credentials and ACLs. Do not run `down -v`.
 
 Compose publishes fixed ports 80 and 443, plus SMB 139 and 445. A deployment requiring different host ports can use a Compose override; it does not configure application credentials or backup destinations. TLS, AD settings and backup configuration are managed in the browser.
 
@@ -189,18 +195,17 @@ The versioned key format is `adfs-backup-archive-v1`: standard BIP39 English phr
 ## Useful Commands
 
 ```bash
-docker compose logs -f samba
-docker compose logs -f samba | grep -E '\\[web\\]|\\[audit\\]'
-docker compose exec samba domainshare healthcheck
-docker compose exec samba domainshare reconcile
-docker compose exec samba domainshare backup
-docker compose exec samba sqlite3 /state/shares.db 'PRAGMA quick_check;'
-docker compose exec samba sqlite3 /state/shares.db 'SELECT action, count(*) FROM audit_events GROUP BY action;'
+docker compose logs -f samba management
+docker compose exec management domainshare healthcheck
+docker compose exec management domainshare reconcile
+docker compose exec management domainshare backup
+docker compose exec management sqlite3 /state/shares.db 'PRAGMA quick_check;'
+docker compose exec management sqlite3 /state/shares.db 'SELECT action, count(*) FROM audit_events GROUP BY action;'
 docker compose exec samba testparm -s
 docker compose exec samba sh -lc 'tail -n 200 /var/log/samba/log.*'
-docker compose exec samba sh -lc 'tail -n 200 /var/log/backup.log'
-docker compose exec samba cat /state/backup-status.json
-docker compose exec samba cat /state/reconcile-status.json
+docker compose exec management tail -n 200 /var/log/backup.log
+docker compose exec management cat /state/backup-status.json
+docker compose exec management cat /state/reconcile-status.json
 ```
 
 ## Troubleshooting
@@ -228,7 +233,7 @@ docker compose exec samba cat /state/reconcile-status.json
 - Recreate/restart the container so startup re-registers AD DNS:
 
   ```bash
-  docker compose up -d --force-recreate samba
+  ./setup --restart-samba
   ```
 
 ### Winbind user/group resolution fails
@@ -253,8 +258,8 @@ docker compose exec samba cat /state/reconcile-status.json
 - Check the reconciliation status and logs if the one-time import or an ACL update fails:
 
   ```bash
-  docker compose exec samba domainshare reconcile
-  docker compose exec samba tail -n 100 /var/log/reconcile.log
+  docker compose exec management domainshare reconcile
+  docker compose exec management tail -n 100 /var/log/reconcile.log
   ```
 
 - Inspect Windows ACLs with `smbcacls //server/Data '<folder>' -U 'DOMAIN\admin'`; `getfacl` does not show the enforced Data permissions.
@@ -265,7 +270,7 @@ docker compose exec samba cat /state/reconcile-status.json
 - Force a recursive repair for all active Data group folders with:
 
   ```bash
-  docker compose exec -e REPAIR_DATA_ACLS=1 samba domainshare reconcile
+  docker compose exec -e REPAIR_DATA_ACLS=1 management domainshare reconcile
   ```
 
 - After a successful repair, scheduled reconciliations return to root-only Data ACL refreshes unless group ACLs change again.
@@ -275,9 +280,7 @@ docker compose exec samba cat /state/reconcile-status.json
 This indicates a legacy GUID directory still referenced by an already-migrated database. Update the application code/image and restart using the existing volumes:
 
 ```bash
-docker compose stop samba
-docker compose build samba
-docker compose up -d --no-deps samba
+./setup --restart-samba
 docker compose logs --tail=100 samba
 ```
 
@@ -289,8 +292,7 @@ Startup repairs stored legacy paths without reimporting AD membership. It logs `
 - Rebuild and restart with the updated image:
 
   ```bash
-  docker compose down
-  docker compose up -d --build
+  ./setup --restart-samba
   ```
 
 - Verify modules exist:
@@ -304,7 +306,7 @@ Startup repairs stored legacy paths without reimporting AD membership. It logs `
 - Re-run reconciliation to rebuild private directories and ACLs:
 
   ```bash
-  docker compose exec samba domainshare reconcile
+  docker compose exec management domainshare reconcile
   ```
 
 - Check identity resolution for a user:
