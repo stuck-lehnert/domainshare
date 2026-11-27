@@ -6,9 +6,11 @@ The Agent API offers read-only file access over HTTPS. A token identifies the ag
 
 ## Issue and revoke tokens
 
-In the administration console, open **Agenten-Tokens**. Give the token a name, explicitly list up to ten AD usernames, and set its validity period (1–365 days, 30 by default). Copy the bearer token when it appears; it cannot be retrieved later. The server stores only its hash. Issue separate tokens for separate agents and revoke them from the same screen when no longer needed. Tokens persist across restarts but are not part of DomainShare backups. Reissue them after restoring to a new installation.
+In the administration console, open **Agenten-Tokens**. Give the token a name and set its validity period (1–365 days, 30 by default). List up to ten AD usernames to restrict the token, or leave the field empty and confirm access for all current and future eligible AD users, including administrators. In the token management API, use an explicit `"usernames": []` for this scope; missing or `null` values are rejected.
 
-Use an AD sign-in name: `alice`, `EXAMPLE\alice`, `alice@example.test`, or the account's assigned UPN such as `alice.smith@people.example.test`. An email address works only if it is also a valid AD sign-in name. DomainShare resolves the name in the configured AD domain and checks the resulting SID on every request. An account recreated with the same name does not inherit a token. An admin account, if explicitly allowed on the token, has the same read access to active Data folders as in the web portal. No account can browse another user's Private folder through this API. FSLogix, archived folders and trash are not exposed.
+Copy the bearer token when it appears; it cannot be retrieved later. The server stores only its hash. Issue separate tokens for separate agents and revoke them from the same screen when no longer needed. Tokens persist across restarts but are not part of DomainShare backups. Reissue them after restoring to a new installation.
+
+Use an AD sign-in name: `alice`, `EXAMPLE\alice`, `alice@example.test`, or the account's assigned UPN such as `alice.smith@people.example.test`. An email address works only if it is also a valid AD sign-in name. DomainShare resolves the name in the configured AD domain on every request. Restricted tokens check the resulting SID against their stored list; a recreated account does not inherit access through those tokens. All-user tokens still require a username and use only that account's current permissions. An admin account covered by either scope has the same read access to active Data folders as in the web portal. No account can browse another user's Private folder through this API. FSLogix, archived folders and trash are not exposed.
 
 ## Requests
 

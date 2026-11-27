@@ -167,13 +167,14 @@ async function navigate(path, replace = false) {
 }
 
 async function renderAgentTokens() {
-  content.innerHTML = pageHead('Agenten-Tokens', 'Lesezugriff für Agenten im Namen ausdrücklich freigegebener AD-Benutzer.') + `
+  content.innerHTML = pageHead('Agenten-Tokens', 'Lesezugriff für Agenten im Namen von AD-Benutzern.') + `
     <section class="panel">
       <h2>Token erstellen</h2>
-      <p>Jede Anfrage braucht einen Benutzernamen. Der Agent erhält dessen aktuelle Dateirechte. Gib Administratorkonten nur frei, wenn der Agent auf alle Data-Ordner zugreifen soll.</p>
+      <p>Jede Anfrage braucht weiterhin einen Benutzernamen und verwendet dessen aktuelle Dateirechte.</p>
       <form id="agent-token-form" class="stack">
         <label>Bezeichnung<input name="label" maxlength="100" required></label>
-        <label>AD-Benutzernamen (ein Name pro Zeile, bis zu zehn)<textarea name="usernames" rows="3" maxlength="2560" required></textarea></label>
+        <label>AD-Benutzernamen (optional)<textarea name="usernames" rows="3" maxlength="2560" aria-describedby="agent-token-users-help"></textarea></label>
+        <p id="agent-token-users-help">Leer lassen für alle aktuellen und zukünftigen AD-Benutzer, einschließlich Administratoren. Zum Eingrenzen bis zu zehn Namen eingeben, einen pro Zeile.</p>
         <label>Gültig für (Tage)<input name="days" type="number" min="1" max="365" value="30" required></label>
         <div class="toolbar"><button type="submit">Token erstellen</button></div>
       </form>
@@ -211,7 +212,7 @@ async function renderAgentTokens() {
       <thead><tr><th>Bezeichnung</th><th>Benutzer</th><th>Gültig bis</th><th>Erstellt von</th><th>Aktion</th></tr></thead>
       <tbody>${tokens.map(token => `<tr>
         <td>${esc(token.label)}</td>
-        <td>${esc(token.usernames.join(', '))}</td>
+        <td>${token.allUsers ? 'Alle aktuellen und zukünftigen AD-Benutzer' : esc(token.usernames.join(', '))}</td>
         <td>${esc(utcTime(token.expiresAt * 1000))}${token.expiresAt * 1000 <= Date.now() ? ' (abgelaufen)' : ''}</td>
         <td>${esc(token.createdBy)}</td>
         <td><button type="button" data-revoke="${esc(token.id)}">Widerrufen</button></td>
@@ -226,13 +227,17 @@ async function renderAgentTokens() {
   form.addEventListener('submit', async event => {
     event.preventDefault();
     showError('');
+
+    const usernames = form.elements.usernames.value.split(/\r?\n/).map(name => name.trim()).filter(Boolean);
+    if (usernames.length === 0 && !window.confirm('Token für alle aktuellen und zukünftigen AD-Benutzer einschließlich Administratoren erstellen?')) return;
+
     const button = form.querySelector('button[type="submit"]');
     button.disabled = true;
 
     try {
       const result = await api('/api/agent-tokens', {method: 'POST', body: JSON.stringify({
         label: form.elements.label.value,
-        usernames: form.elements.usernames.value.split(/\r?\n/).map(name => name.trim()).filter(Boolean),
+        usernames,
         expiresInDays: Number(form.elements.days.value),
       })});
       output.value = result.token;

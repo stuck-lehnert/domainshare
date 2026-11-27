@@ -102,11 +102,14 @@ func (admin AgentAdmin) issue(writer http.ResponseWriter, request *http.Request,
 	}
 
 	var usernames []string
-	if json.Unmarshal(body["usernames"], &usernames) != nil || len(usernames) < 1 || len(usernames) > 10 {
-		writeError(writer, http.StatusBadRequest, "Ein bis zehn AD-Benutzernamen sind erforderlich")
+	// Only an explicit empty array grants the all-user scope. Missing or null
+	// input must not silently broaden a client's intended scope.
+	if json.Unmarshal(body["usernames"], &usernames) != nil || usernames == nil || len(usernames) > 10 {
+		writeError(writer, http.StatusBadRequest, "usernames muss eine Liste mit höchstens zehn AD-Benutzernamen sein")
 		return
 	}
-	if admin.API.Accounts == nil {
+	allUsers := len(usernames) == 0
+	if !allUsers && admin.API.Accounts == nil {
 		admin.unavailable(writer, "directory")
 		return
 	}
@@ -131,13 +134,19 @@ func (admin AgentAdmin) issue(writer http.ResponseWriter, request *http.Request,
 		accounts[sid] = sam
 	}
 
-	issued, err := admin.API.Tokens.Issue(ctx, label, accounts, days, identity.Username)
+	var issued agenttoken.Issued
+	var err error
+	if allUsers {
+		issued, err = admin.API.Tokens.IssueForAllUsers(ctx, label, days, identity.Username)
+	} else {
+		issued, err = admin.API.Tokens.Issue(ctx, label, accounts, days, identity.Username)
+	}
 	if err != nil {
 		admin.unavailable(writer, "issuance")
 		return
 	}
 	if admin.API.Logger != nil {
-		admin.API.Logger.Info("Agent token issued", "id", issued.ID, "adminSID", identity.SID)
+		admin.API.Logger.Info("Agent token issued", "id", issued.ID, "adminSID", identity.SID, "allUsers", allUsers)
 	}
 	writeJSON(writer, http.StatusCreated, issued)
 }

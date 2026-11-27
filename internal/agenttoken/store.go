@@ -21,6 +21,10 @@ import (
 
 const DatabaseName = "agent-tokens.db"
 
+// Store the all-user scope explicitly. Empty or null scopes never grant access.
+// The reserved key is not an AD SID, so older releases deny these tokens.
+const allUsersScope = `{"*":"*"}`
+
 var (
 	ErrInvalid = errors.New("invalid or expired agent token")
 	ErrID      = errors.New("Ungültige Token-ID")
@@ -36,6 +40,7 @@ type Store struct {
 
 type Token struct {
 	ID       string
+	AllUsers bool
 	Accounts map[string]string // SID to display name; display names are never authoritative.
 }
 
@@ -48,6 +53,7 @@ type Issued struct {
 type Record struct {
 	ID        string   `json:"id"`
 	Label     string   `json:"label"`
+	AllUsers  bool     `json:"allUsers"`
 	Usernames []string `json:"usernames"`
 	CreatedBy string   `json:"createdBy"`
 	CreatedAt int64    `json:"createdAt"`
@@ -82,16 +88,9 @@ func digest(raw string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// Issue persists only the hash of Raw. The caller must have checked the
+// Issue creates a restricted token. The caller must have checked the
 // administrator's identity and resolved the allowed users directly in AD.
 func (store *Store) Issue(ctx context.Context, label string, accounts map[string]string, days int, actor string) (Issued, error) {
-	label = strings.TrimSpace(label)
-	if label == "" || utf8.RuneCountInString(label) > 100 {
-		return Issued{}, errors.New("Eine Bezeichnung mit 1 bis 100 Zeichen ist erforderlich")
-	}
-	if days < 1 || days > 365 {
-		return Issued{}, errors.New("Die Laufzeit muss zwischen 1 und 365 Tagen liegen")
-	}
 	if len(accounts) < 1 || len(accounts) > 10 {
 		return Issued{}, errors.New("Ein bis zehn AD-Benutzernamen sind erforderlich")
 	}
@@ -99,6 +98,29 @@ func (store *Store) Issue(ctx context.Context, label string, accounts map[string
 		if !validSID.MatchString(sid) || name == "" {
 			return Issued{}, errors.New("Ungültiger AD-Benutzer")
 		}
+	}
+
+	scope, err := json.Marshal(accounts)
+	if err != nil {
+		return Issued{}, err
+	}
+	return store.issue(ctx, label, string(scope), days, actor)
+}
+
+// IssueForAllUsers grants delegation without a fixed SID list. Each request
+// must still resolve a current eligible AD account and enforce its permissions.
+func (store *Store) IssueForAllUsers(ctx context.Context, label string, days int, actor string) (Issued, error) {
+	return store.issue(ctx, label, allUsersScope, days, actor)
+}
+
+// issue persists only the hash of the generated bearer credential.
+func (store *Store) issue(ctx context.Context, label, scope string, days int, actor string) (Issued, error) {
+	label = strings.TrimSpace(label)
+	if label == "" || utf8.RuneCountInString(label) > 100 {
+		return Issued{}, errors.New("Eine Bezeichnung mit 1 bis 100 Zeichen ist erforderlich")
+	}
+	if days < 1 || days > 365 {
+		return Issued{}, errors.New("Die Laufzeit muss zwischen 1 und 365 Tagen liegen")
 	}
 
 	var random [44]byte
@@ -110,12 +132,8 @@ func (store *Store) Issue(ctx context.Context, label string, accounts map[string
 	now := store.now().Unix()
 	expires := now + int64(days)*86400
 
-	scope, err := json.Marshal(accounts)
-	if err != nil {
-		return Issued{}, err
-	}
-	_, err = store.db.ExecContext(ctx, `INSERT INTO agent_tokens VALUES(?,?,?,?,?,?,?)`,
-		identifier, digest(raw), label, string(scope), actor, now, expires)
+	_, err := store.db.ExecContext(ctx, `INSERT INTO agent_tokens VALUES(?,?,?,?,?,?,?)`,
+		identifier, digest(raw), label, scope, actor, now, expires)
 	if err != nil {
 		return Issued{}, err
 	}
@@ -136,6 +154,11 @@ func (store *Store) Authenticate(ctx context.Context, raw string) (Token, error)
 	if err != nil {
 		return Token{}, err
 	}
+	if string(scope) == allUsersScope {
+		token.AllUsers = true
+		return token, nil
+	}
+
 	if err := json.Unmarshal(scope, &token.Accounts); err != nil {
 		return Token{}, err
 	}
@@ -157,9 +180,15 @@ func (store *Store) Inventory(ctx context.Context) ([]Record, error) {
 		if err := rows.Scan(&item.ID, &item.Label, &scope, &item.CreatedBy, &item.CreatedAt, &item.ExpiresAt); err != nil {
 			return nil, err
 		}
-		item.Usernames, err = namesInStoredOrder(scope)
-		if err != nil {
-			return nil, err
+
+		if scope == allUsersScope {
+			item.AllUsers = true
+			item.Usernames = []string{}
+		} else {
+			item.Usernames, err = namesInStoredOrder(scope)
+			if err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, item)
 	}

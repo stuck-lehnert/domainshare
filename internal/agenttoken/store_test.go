@@ -35,7 +35,7 @@ func TestTokenExpiryAndRevocationAcrossReopen(t *testing.T) {
 	}
 	defer store.Close()
 	value, err := store.Authenticate(ctx, issued.Raw)
-	if err != nil || value.ID != issued.ID || !reflect.DeepEqual(accounts, value.Accounts) {
+	if err != nil || value.ID != issued.ID || value.AllUsers || !reflect.DeepEqual(accounts, value.Accounts) {
 		t.Fatal("token could not be used with its original SID scope")
 	}
 	store.now = func() time.Time { return time.Unix(issued.ExpiresAt, 0) }
@@ -48,6 +48,48 @@ func TestTokenExpiryAndRevocationAcrossReopen(t *testing.T) {
 	}
 	if _, err := store.Authenticate(ctx, issued.Raw); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("revoked token accepted: %v", err)
+	}
+}
+
+func TestAllUserScopeIsExplicitAndPersistent(t *testing.T) {
+	ctx := t.Context()
+	root := t.TempDir()
+	store, err := Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Issue(ctx, "empty", nil, 1, "admin"); err == nil {
+		t.Fatal("an empty restricted scope accidentally issued a token")
+	}
+	issued, err := store.IssueForAllUsers(ctx, "all users", 1, "admin")
+	store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	token, err := store.Authenticate(ctx, issued.Raw)
+	if err != nil || token.ID != issued.ID || !token.AllUsers || len(token.Accounts) != 0 {
+		t.Fatalf("all-user scope after reopen: %+v, %v", token, err)
+	}
+	rows, err := store.Inventory(ctx)
+	if err != nil || len(rows) != 1 || !rows[0].AllUsers || rows[0].Usernames == nil || len(rows[0].Usernames) != 0 {
+		t.Fatalf("inventory did not identify the all-user scope: %v, %v", rows, err)
+	}
+
+	for _, scope := range []string{`{}`, `null`, `{"*":"anything else"}`} {
+		if _, err := store.db.ExecContext(ctx, `UPDATE agent_tokens SET accounts=? WHERE id=?`, scope, issued.ID); err != nil {
+			t.Fatal(err)
+		}
+		token, err := store.Authenticate(ctx, issued.Raw)
+		if err == nil && token.AllUsers {
+			t.Fatalf("invalid stored scope %s was treated as all users", scope)
+		}
 	}
 }
 

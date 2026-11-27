@@ -100,7 +100,8 @@ func (api AgentAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request)
 		return
 	}
 	const denied = "Benutzer ist für diesen Token nicht freigegeben"
-	if _, scoped := token.Accounts[sid]; err != nil || sid == "" || !scoped {
+	_, scoped := token.Accounts[sid]
+	if err != nil || sid == "" || (!token.AllUsers && !scoped) {
 		writeError(writer, http.StatusForbidden, denied)
 		return
 	}

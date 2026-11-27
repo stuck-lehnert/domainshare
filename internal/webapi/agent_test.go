@@ -24,12 +24,14 @@ import (
 )
 
 const (
-	userSID  = "S-1-5-21-1-2-3-1001"
-	adminSID = "S-1-5-21-1-2-3-1002"
+	userSID   = "S-1-5-21-1-2-3-1001"
+	adminSID  = "S-1-5-21-1-2-3-1002"
+	futureSID = "S-1-5-21-1-2-3-1003"
 )
 
 type fixtureDirectory struct {
 	enabled atomic.Bool
+	future  atomic.Bool
 }
 
 func (ad *fixtureDirectory) AccountLogin(user string) (string, error) {
@@ -44,14 +46,21 @@ func (ad *fixtureDirectory) ResolveAccount(_ context.Context, sam string) (strin
 		}
 	case "administrator":
 		return adminSID, nil
+	case "future":
+		if ad.future.Load() {
+			return futureSID, nil
+		}
 	}
 	return "", directory.ErrAccount
 }
 
 func (*fixtureDirectory) CurrentIdentity(_ context.Context, sid string) (directory.Identity, error) {
 	role, username := "user", `AD\alice`
-	if sid == adminSID {
+	switch sid {
+	case adminSID:
 		role, username = "domain-admin", `AD\administrator`
+	case futureSID:
+		username = `AD\future`
 	}
 	return directory.Identity{SID: sid, Username: username, Role: role}, nil
 }
@@ -282,14 +291,19 @@ func TestAgentManagementRequiresAdminAndCSRF(t *testing.T) {
 	}
 
 	const grant = `{"label":"Automatisierung","usernames":["alice"],"expiresInDays":30}`
+	const grantAll = `{"label":"Alle Konten","usernames":[]}`
 	for _, tc := range []struct {
 		token, csrf, origin, body string
 		status                    int
 	}{
 		{user, userCSRF, "", grant, 403},
+		{user, userCSRF, "", grantAll, 403},
 		{token, "", "", grant, 403},
 		{token, csrf, "https://evil.test", grant, 403},
 		{token, csrf, "https://files.ad.test", `{"label":"Null","usernames":["alice"],"expiresInDays":null}`, 400},
+		{token, csrf, "https://files.ad.test", `{"label":"Missing usernames"}`, 400},
+		{token, csrf, "https://files.ad.test", `{"label":"Null usernames","usernames":null}`, 400},
+		{token, csrf, "https://files.ad.test", `{"label":"Invalid username","usernames":[null]}`, 400},
 	} {
 		response := request("POST", agentAdminPath, tc.token, tc.csrf, tc.origin, tc.body)
 		if response.Code != tc.status {
@@ -308,6 +322,51 @@ func TestAgentManagementRequiresAdminAndCSRF(t *testing.T) {
 	if response = request("GET", agentAdminPath, issued.Raw, "", "", ""); response.Code != 401 {
 		t.Fatalf("agent credential accepted as admin session: %d", response.Code)
 	}
+
+	response = request("POST", agentAdminPath, token, csrf, "https://files.ad.test", grantAll)
+	var all agenttoken.Issued
+	if response.Code != 201 || json.Unmarshal(response.Body.Bytes(), &all) != nil || all.Raw == "" {
+		t.Fatalf("grant all-user scope: HTTP %d", response.Code)
+	}
+	response = request("GET", agentAdminPath, token, "", "", "")
+	if response.Code != 200 || !strings.Contains(response.Body.String(), `"allUsers":true`) || strings.Contains(response.Body.String(), all.Raw) {
+		t.Fatal("inventory did not show the all-user scope safely")
+	}
+
+	list := func(credential, query string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "https://files.ad.test"+agentPrefix+"/list"+query, nil)
+		req.Header.Set("Authorization", "Bearer "+credential)
+		res := httptest.NewRecorder()
+		api.ServeHTTP(res, req)
+		return res
+	}
+	if res := list(all.Raw, ""); res.Code != 400 {
+		t.Fatalf("all-user scope accepted a request without username: HTTP %d", res.Code)
+	}
+	if res := list(all.Raw, "?username=future"); res.Code != 403 {
+		t.Fatalf("unknown account was not rejected: HTTP %d", res.Code)
+	}
+	ad.future.Store(true)
+	if res := list(all.Raw, "?username=future"); res.Code != 200 || strings.Contains(res.Body.String(), "data:reports") {
+		t.Fatalf("future account was not included with only its own rights: HTTP %d, %s", res.Code, res.Body)
+	}
+	if res := list(issued.Raw, "?username=future"); res.Code != 403 {
+		t.Fatalf("restricted token scope was broadened: HTTP %d", res.Code)
+	}
+	if res := list(all.Raw, "?username=administrator"); res.Code != 200 || !strings.Contains(res.Body.String(), "data:reports") {
+		t.Fatalf("all-user scope did not cover current administrator rights: HTTP %d, %s", res.Code, res.Body)
+	}
+	ad.enabled.Store(false)
+	if res := list(all.Raw, "?username=alice"); res.Code != 403 {
+		t.Fatalf("all-user scope accepted a disabled account: HTTP %d", res.Code)
+	}
+	if res := request("POST", agentAdminPath+"/revoke", token, csrf, "", `{"id":"`+all.ID+`"}`); res.Code != 200 {
+		t.Fatalf("revoking the all-user token returned HTTP %d", res.Code)
+	}
+	if res := list(all.Raw, "?username=future"); res.Code != 401 {
+		t.Fatalf("revoked all-user token was accepted: HTTP %d", res.Code)
+	}
+
 	response = request("POST", agentAdminPath+"/revoke", token, csrf, "", `{"id":"`+issued.ID+`"}`)
 	if response.Code != 200 {
 		t.Fatalf("revoke status %d: %s", response.Code, response.Body)
