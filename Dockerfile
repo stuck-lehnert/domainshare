@@ -13,7 +13,7 @@ RUN mkdir /out \
         internal/sambaacl/helper/main.c -o /out/domainshare-sambaacl -ldl \
     && go clean -cache -modcache
 
-FROM docker.io/library/debian:12-slim AS runtime
+FROM docker.io/library/debian:13-slim AS runtime
 
 LABEL org.opencontainers.image.title="DomainShare"
 
