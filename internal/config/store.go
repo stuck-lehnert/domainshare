@@ -167,7 +167,36 @@ CREATE TABLE IF NOT EXISTS scheduled_backups (slot TEXT PRIMARY KEY);
 	); err != nil {
 		return err
 	}
+
+	if err := migrateSessionLifetime(ctx, tx); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func migrateSessionLifetime(ctx context.Context, tx *sql.Tx) error {
+	var version int
+	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version >= 1 {
+		return nil
+	}
+
+	// Old configurations did not distinguish the eight-hour default from an
+	// explicit eight-hour setting. Migrate that value once, leaving the key
+	// and any other custom duration intact. Switch to the next revision only
+	// for edited configurations; revision zero still permits legacy import.
+	if _, err := tx.ExecContext(ctx, `
+UPDATE configuration
+SET settings=json_set(settings, '$.WEB_JWT_TTL_SECONDS', 345600),
+    revision=CASE WHEN revision=0 AND phase='unconfigured' THEN 0 ELSE revision+1 END
+WHERE id=1 AND json_extract(settings, '$.WEB_JWT_TTL_SECONDS')=28800`); err != nil {
+		return err
+	}
+
+	_, err := tx.ExecContext(ctx, "PRAGMA user_version=1")
+	return err
 }
 
 func (store *Store) Snapshot(ctx context.Context) (Snapshot, error) {

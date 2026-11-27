@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stuck-lehnert/domainshare/internal/config"
 	"github.com/stuck-lehnert/domainshare/internal/directory"
 	"github.com/stuck-lehnert/domainshare/internal/state"
 )
@@ -115,6 +116,95 @@ func TestRevokeDuringRefresh(t *testing.T) {
 	if _, err := manager.Verify(t.Context(), token, true); !errors.Is(err, ErrSession) {
 		t.Fatalf("refresh resurrected session: %v", err)
 	}
+}
+
+func TestFourDaySessionSurvivesRestart(t *testing.T) {
+	const lifetime = 4 * 24 * time.Hour
+
+	ctx, root := t.Context(), t.TempDir()
+	start := time.Unix(1_790_000_000, 0)
+	now := start
+	id := sampleIdentity()
+	resolve := func(context.Context, string) (directory.Identity, error) { return id, nil }
+
+	// A new management process reads the key from configuration.db and opens
+	// the policy database anew. Keep no live connection or manager between runs.
+	startManager := func(run func(*Manager)) {
+		t.Helper()
+		store, err := config.Open(ctx, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		snapshot, err := store.Snapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db, err := state.OpenPrivate(ctx, filepath.Join(root, "shares.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+
+		ttl := time.Duration(snapshot.Values.Int("WEB_JWT_TTL_SECONDS")) * time.Second
+		secret := snapshot.Values.String("WEB_JWT_SECRET")
+		manager, err := New(ctx, db, secret, ttl, time.Minute, resolve)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager.now = func() time.Time { return now }
+		run(manager)
+	}
+
+	var token, loggedOut, legacyToken string
+	startManager(func(manager *Manager) {
+		var err error
+		var session Session
+		token, session, err = manager.Issue(ctx, id)
+		if err != nil || session.ExpiresAt-session.IssuedAt != int64(lifetime/time.Second) {
+			t.Fatalf("new session did not get four days: expiry=%d, issued=%d, err=%v", session.ExpiresAt, session.IssuedAt, err)
+		}
+
+		loggedOut, session, err = manager.Issue(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Revoke(ctx, session); err != nil {
+			t.Fatal(err)
+		}
+
+		// The new default must not extend a JWT issued with the previous TTL.
+		previous := *manager
+		previous.ttl = 8 * time.Hour
+		legacyToken, _, err = previous.Issue(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	startManager(func(manager *Manager) {
+		now = start.Add(7 * time.Hour)
+		if _, err := manager.Verify(ctx, legacyToken, true); err != nil {
+			t.Fatalf("still-valid eight-hour session rejected after restart: %v", err)
+		}
+
+		now = start.Add(lifetime - time.Second)
+		if session, err := manager.Verify(ctx, token, true); err != nil || session.SID != id.SID {
+			t.Fatalf("unexpired session rejected after restart: %v", err)
+		}
+		if _, err := manager.Verify(ctx, loggedOut, true); !errors.Is(err, ErrSession) {
+			t.Fatalf("logged-out session accepted after restart: %v", err)
+		}
+		if _, err := manager.Verify(ctx, legacyToken, true); !errors.Is(err, ErrSession) {
+			t.Fatalf("eight-hour session retained beyond its original expiration: %v", err)
+		}
+
+		now = start.Add(lifetime)
+		if _, err := manager.Verify(ctx, token, true); !errors.Is(err, ErrSession) {
+			t.Fatalf("session accepted at or after four-day expiration: %v", err)
+		}
+	})
 }
 
 func TestOriginAndCSRF(t *testing.T) {

@@ -62,7 +62,7 @@ FIELDS = {
     'WEB_TLS_CERT_PEM': field('tls', 'HTTPS-Zertifikat (PEM)', kind='pem'),
     'WEB_TLS_KEY_PEM': field('tls', 'Privater HTTPS-Schlüssel (PEM)', kind='secretpem'),
     'WEB_TRUSTED_ORIGINS': field('web', 'Weitere HTTPS-Origins (kommagetrennt)', kind='origins'),
-    'WEB_JWT_TTL_SECONDS': field('web', 'Sitzungsdauer (Sekunden)', 28800, 'int', 300, 604800),
+    'WEB_JWT_TTL_SECONDS': field('web', 'Sitzungsdauer (Sekunden)', 345600, 'int', 300, 604800),
     'WEB_AUTH_RECHECK_SECONDS': field('web', 'AD-Rechte erneut prüfen (Sekunden)', 60, 'int', 5, 300),
     'WEB_LOGIN_ATTEMPTS_PER_5_MIN': field('web', 'Anmeldeversuche pro IP / 5 Minuten', 10, 'int', 3, 100),
     'WEB_LOGIN_ACCOUNT_ATTEMPTS_PER_5_MIN': field('web', 'Anmeldeversuche pro Konto / 5 Minuten', 10, 'int', 3, 100),
@@ -192,6 +192,14 @@ class Store:
                 nonce TEXT PRIMARY KEY, owner TEXT NOT NULL, expires REAL NOT NULL, revision INTEGER NOT NULL,
                 password TEXT NOT NULL, key_id TEXT NOT NULL, format TEXT NOT NULL)''')
             conn.execute('CREATE TABLE IF NOT EXISTS scheduled_backups (slot TEXT PRIMARY KEY)')
+
+            # Keep the shared configuration.db migration in sync with the Go backend.
+            if conn.execute('PRAGMA user_version').fetchone()[0] < 1:
+                conn.execute('''UPDATE configuration
+                    SET settings=json_set(settings, '$.WEB_JWT_TTL_SECONDS', 345600),
+                        revision=CASE WHEN revision=0 AND phase='unconfigured' THEN 0 ELSE revision+1 END
+                    WHERE id=1 AND json_extract(settings, '$.WEB_JWT_TTL_SECONDS')=28800''')
+                conn.execute('PRAGMA user_version=1')
 
     @contextlib.contextmanager
     def connect(self):

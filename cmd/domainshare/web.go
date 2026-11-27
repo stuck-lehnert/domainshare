@@ -136,7 +136,7 @@ func configureWeb(ctx context.Context, store *config.Store, snapshot config.Snap
 	client := directoryClient(env)
 	ttl := time.Duration(snapshot.Values.Int("WEB_JWT_TTL_SECONDS")) * time.Second
 	recheck := time.Duration(snapshot.Values.Int("WEB_AUTH_RECHECK_SECONDS")) * time.Second
-	sessions, err := webauth.New(ctx, policy, env["WEB_JWT_SECRET"], ttl, recheck, client.CurrentIdentity)
+	sessions, err := webauth.New(ctx, policy, snapshot.Values.String("WEB_JWT_SECRET"), ttl, recheck, client.CurrentIdentity)
 	if err != nil {
 		return nil, err
 	}

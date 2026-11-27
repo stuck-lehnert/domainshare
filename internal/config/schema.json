@@ -295,7 +295,7 @@
       "key": "WEB_JWT_TTL_SECONDS",
       "section": "web",
       "label": "Sitzungsdauer (Sekunden)",
-      "default": 28800,
+      "default": 345600,
       "kind": "int",
       "minimum": 300,
       "maximum": 604800

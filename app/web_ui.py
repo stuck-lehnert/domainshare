@@ -791,11 +791,12 @@ def tls_summary() -> Dict[str, object]:
 
 
 class App:
-    def __init__(self, agent_tokens=None):
+    def __init__(self, settings, agent_tokens=None):
         self.agent_tokens = agent_tokens
-        secret = os.environ.get("WEB_JWT_SECRET", "")
-        self.tokens = TokenManager(secret, env_int("WEB_JWT_TTL_SECONDS", 28800, 300, 604800),
-                                   web_security.Sessions(STATE_DB), current_identity)
+        self.tokens = TokenManager(
+            settings["WEB_JWT_SECRET"], settings["WEB_JWT_TTL_SECONDS"],
+            web_security.Sessions(STATE_DB), current_identity,
+        )
         removed = drop_legacy_web_cache()
         if removed:
             log(f"Dropped {removed} legacy web cache file(s)")
@@ -1795,7 +1796,7 @@ def main() -> int:
     os.environ.update(CONFIG.environment())
     if not os.path.isfile(TLS_CERT_FILE) or not os.path.isfile(TLS_KEY_FILE):
         raise RuntimeError("TLS certificate or key is missing")
-    APP = App(agent_api.TokenStore(CONFIG.root))
+    APP = App(CONFIG.snapshot()['values'], agent_api.TokenStore(CONFIG.root))
     serve_https()
     return 0
 
