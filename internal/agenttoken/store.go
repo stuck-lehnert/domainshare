@@ -21,6 +21,10 @@ import (
 
 const DatabaseName = "agent-tokens.db"
 
+// NoExpiry opts out of expiry. The same sentinel is stored in expires_at,
+// allowing older releases to reject these tokens without a schema change.
+const NoExpiry = -1
+
 // Store the all-user scope explicitly. Empty or null scopes never grant access.
 // The reserved key is not an AD SID, so older releases deny these tokens.
 const allUsersScope = `{"*":"*"}`
@@ -47,7 +51,7 @@ type Token struct {
 type Issued struct {
 	ID        string `json:"id"`
 	Raw       string `json:"token"`
-	ExpiresAt int64  `json:"expiresAt"`
+	ExpiresAt *int64 `json:"expiresAt"`
 }
 
 type Record struct {
@@ -57,7 +61,7 @@ type Record struct {
 	Usernames []string `json:"usernames"`
 	CreatedBy string   `json:"createdBy"`
 	CreatedAt int64    `json:"createdAt"`
-	ExpiresAt int64    `json:"expiresAt"`
+	ExpiresAt *int64   `json:"expiresAt"`
 }
 
 func Open(ctx context.Context, root string) (*Store, error) {
@@ -119,8 +123,8 @@ func (store *Store) issue(ctx context.Context, label, scope string, days int, ac
 	if label == "" || utf8.RuneCountInString(label) > 100 {
 		return Issued{}, errors.New("Eine Bezeichnung mit 1 bis 100 Zeichen ist erforderlich")
 	}
-	if days < 1 || days > 365 {
-		return Issued{}, errors.New("Die Laufzeit muss zwischen 1 und 365 Tagen liegen")
+	if days != NoExpiry && (days < 1 || days > 365) {
+		return Issued{}, errors.New("Die Laufzeit muss zwischen 1 und 365 Tagen liegen oder leer bleiben")
 	}
 
 	var random [44]byte
@@ -129,15 +133,26 @@ func (store *Store) issue(ctx context.Context, label, scope string, days int, ac
 	}
 	identifier := hex.EncodeToString(random[:12])
 	raw := "dsat_" + base64.RawURLEncoding.EncodeToString(random[12:])
+
 	now := store.now().Unix()
-	expires := now + int64(days)*86400
+	expires := int64(NoExpiry)
+	if days != NoExpiry {
+		expires = now + int64(days)*86400
+	}
 
 	_, err := store.db.ExecContext(ctx, `INSERT INTO agent_tokens VALUES(?,?,?,?,?,?,?)`,
 		identifier, digest(raw), label, scope, actor, now, expires)
 	if err != nil {
 		return Issued{}, err
 	}
-	return Issued{ID: identifier, Raw: raw, ExpiresAt: expires}, nil
+	return Issued{ID: identifier, Raw: raw, ExpiresAt: expiryTimestamp(expires)}, nil
+}
+
+func expiryTimestamp(expires int64) *int64 {
+	if expires == NoExpiry {
+		return nil
+	}
+	return &expires
 }
 
 func (store *Store) Authenticate(ctx context.Context, raw string) (Token, error) {
@@ -146,8 +161,8 @@ func (store *Store) Authenticate(ctx context.Context, raw string) (Token, error)
 	}
 	var token Token
 	var scope []byte
-	err := store.db.QueryRowContext(ctx, "SELECT id,accounts FROM agent_tokens WHERE digest=? AND expires_at>?",
-		digest(raw), store.now().Unix()).Scan(&token.ID, &scope)
+	err := store.db.QueryRowContext(ctx, `SELECT id,accounts FROM agent_tokens
+		WHERE digest=? AND (expires_at=? OR expires_at>?)`, digest(raw), NoExpiry, store.now().Unix()).Scan(&token.ID, &scope)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Token{}, ErrInvalid
 	}
@@ -177,9 +192,11 @@ func (store *Store) Inventory(ctx context.Context) ([]Record, error) {
 	for rows.Next() {
 		var item Record
 		var scope string
-		if err := rows.Scan(&item.ID, &item.Label, &scope, &item.CreatedBy, &item.CreatedAt, &item.ExpiresAt); err != nil {
+		var expires int64
+		if err := rows.Scan(&item.ID, &item.Label, &scope, &item.CreatedBy, &item.CreatedAt, &expires); err != nil {
 			return nil, err
 		}
+		item.ExpiresAt = expiryTimestamp(expires)
 
 		if scope == allUsersScope {
 			item.AllUsers = true

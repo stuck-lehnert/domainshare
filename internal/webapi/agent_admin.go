@@ -94,10 +94,15 @@ func (admin AgentAdmin) issue(writer http.ResponseWriter, request *http.Request,
 
 	days := 30
 	if raw, exists := body["expiresInDays"]; exists {
-		days = 0 // A JSON null is not an integer; the default only applies when absent.
-		if json.Unmarshal(raw, &days) != nil || days < 1 || days > 365 {
-			writeError(writer, http.StatusBadRequest, "Die Laufzeit muss zwischen 1 und 365 Tagen liegen")
+		var requestedDays *int
+		if json.Unmarshal(raw, &requestedDays) != nil || (requestedDays != nil && (*requestedDays < 1 || *requestedDays > 365)) {
+			writeError(writer, http.StatusBadRequest, "Die Laufzeit muss zwischen 1 und 365 Tagen liegen oder leer bleiben")
 			return
+		}
+		if requestedDays == nil {
+			days = agenttoken.NoExpiry
+		} else {
+			days = *requestedDays
 		}
 	}
 
@@ -146,7 +151,8 @@ func (admin AgentAdmin) issue(writer http.ResponseWriter, request *http.Request,
 		return
 	}
 	if admin.API.Logger != nil {
-		admin.API.Logger.Info("Agent token issued", "id", issued.ID, "adminSID", identity.SID, "allUsers", allUsers)
+		admin.API.Logger.Info("Agent token issued", "id", issued.ID, "adminSID", identity.SID,
+			"allUsers", allUsers, "neverExpires", issued.ExpiresAt == nil)
 	}
 	writeJSON(writer, http.StatusCreated, issued)
 }

@@ -292,6 +292,7 @@ func TestAgentManagementRequiresAdminAndCSRF(t *testing.T) {
 
 	const grant = `{"label":"Automatisierung","usernames":["alice"],"expiresInDays":30}`
 	const grantAll = `{"label":"Alle Konten","usernames":[]}`
+	const grantUnlimited = `{"label":"Unbegrenzt","usernames":["alice"],"expiresInDays":null}`
 	for _, tc := range []struct {
 		token, csrf, origin, body string
 		status                    int
@@ -300,7 +301,12 @@ func TestAgentManagementRequiresAdminAndCSRF(t *testing.T) {
 		{user, userCSRF, "", grantAll, 403},
 		{token, "", "", grant, 403},
 		{token, csrf, "https://evil.test", grant, 403},
-		{token, csrf, "https://files.ad.test", `{"label":"Null","usernames":["alice"],"expiresInDays":null}`, 400},
+		{user, userCSRF, "", grantUnlimited, 403},
+		{token, "", "", grantUnlimited, 403},
+		{token, csrf, "https://files.ad.test", `{"label":"Zero","usernames":["alice"],"expiresInDays":0}`, 400},
+		{token, csrf, "https://files.ad.test", `{"label":"Negative","usernames":["alice"],"expiresInDays":-1}`, 400},
+		{token, csrf, "https://files.ad.test", `{"label":"Out of range","usernames":["alice"],"expiresInDays":366}`, 400},
+		{token, csrf, "https://files.ad.test", `{"label":"String","usernames":["alice"],"expiresInDays":""}`, 400},
 		{token, csrf, "https://files.ad.test", `{"label":"Missing usernames"}`, 400},
 		{token, csrf, "https://files.ad.test", `{"label":"Null usernames","usernames":null}`, 400},
 		{token, csrf, "https://files.ad.test", `{"label":"Invalid username","usernames":[null]}`, 400},
@@ -328,9 +334,26 @@ func TestAgentManagementRequiresAdminAndCSRF(t *testing.T) {
 	if response.Code != 201 || json.Unmarshal(response.Body.Bytes(), &all) != nil || all.Raw == "" {
 		t.Fatalf("grant all-user scope: HTTP %d", response.Code)
 	}
+	if all.ExpiresAt == nil {
+		t.Fatal("omitting the validity field issued a permanent token")
+	}
+	const defaultLifetime = 30 * 24 * time.Hour
+	if ttl := time.Until(time.Unix(*all.ExpiresAt, 0)); ttl < defaultLifetime-time.Minute || ttl > defaultLifetime {
+		t.Fatalf("omitting the validity field should give 30 days, got %v", ttl)
+	}
+
+	response = request("POST", agentAdminPath, token, csrf, "https://files.ad.test", grantUnlimited)
+	var unlimited agenttoken.Issued
+	if response.Code != 201 || json.Unmarshal(response.Body.Bytes(), &unlimited) != nil || unlimited.Raw == "" ||
+		!strings.Contains(response.Body.String(), `"expiresAt":null`) {
+		t.Fatalf("grant non-expiring token: HTTP %d", response.Code)
+	}
+
 	response = request("GET", agentAdminPath, token, "", "", "")
-	if response.Code != 200 || !strings.Contains(response.Body.String(), `"allUsers":true`) || strings.Contains(response.Body.String(), all.Raw) {
-		t.Fatal("inventory did not show the all-user scope safely")
+	if response.Code != 200 || !strings.Contains(response.Body.String(), `"allUsers":true`) ||
+		!strings.Contains(response.Body.String(), `"expiresAt":null`) ||
+		strings.Contains(response.Body.String(), all.Raw) || strings.Contains(response.Body.String(), unlimited.Raw) {
+		t.Fatal("inventory did not report token scope and expiry safely")
 	}
 
 	list := func(credential, query string) *httptest.ResponseRecorder {
@@ -349,6 +372,12 @@ func TestAgentManagementRequiresAdminAndCSRF(t *testing.T) {
 	ad.future.Store(true)
 	if res := list(all.Raw, "?username=future"); res.Code != 200 || strings.Contains(res.Body.String(), "data:reports") {
 		t.Fatalf("future account was not included with only its own rights: HTTP %d, %s", res.Code, res.Body)
+	}
+	if res := list(unlimited.Raw, "?username=alice"); res.Code != 200 {
+		t.Fatalf("non-expiring token did not permit its scoped user: HTTP %d", res.Code)
+	}
+	if res := list(unlimited.Raw, "?username=future"); res.Code != 403 {
+		t.Fatalf("non-expiring token granted an unscoped user access: HTTP %d", res.Code)
 	}
 	if res := list(issued.Raw, "?username=future"); res.Code != 403 {
 		t.Fatalf("restricted token scope was broadened: HTTP %d", res.Code)

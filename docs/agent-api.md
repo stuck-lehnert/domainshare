@@ -6,7 +6,9 @@ The Agent API offers read-only file access over HTTPS. A token identifies the ag
 
 ## Issue and revoke tokens
 
-In the administration console, open **Agenten-Tokens**. Give the token a name and set its validity period (1–365 days, 30 by default). List up to ten AD usernames to restrict the token, or leave the field empty and confirm access for all current and future eligible AD users, including administrators. In the token management API, use an explicit `"usernames": []` for this scope; missing or `null` values are rejected.
+In the administration console, open **Agenten-Tokens**. Give the token a name and set its validity period (1–365 days, 30 by default), or clear the days field to create a token that is valid until revoked. In the management API, send `"expiresInDays": null` for a token without expiry; omitting it keeps the 30-day default. A token without expiry shows `"expiresAt": null` when issued or listed.
+
+List up to ten AD usernames to restrict the token, or leave the field empty and confirm access for all current and future eligible AD users, including administrators. In the token management API, use an explicit `"usernames": []` for this scope; missing or `null` values are rejected.
 
 Copy the bearer token when it appears; it cannot be retrieved later. The server stores only its hash. Issue separate tokens for separate agents and revoke them from the same screen when no longer needed. Tokens persist across restarts but are not part of DomainShare backups. Reissue them after restoring to a new installation.
 

@@ -175,7 +175,8 @@ async function renderAgentTokens() {
         <label>Bezeichnung<input name="label" maxlength="100" required></label>
         <label>AD-Benutzernamen (optional)<textarea name="usernames" rows="3" maxlength="2560" aria-describedby="agent-token-users-help"></textarea></label>
         <p id="agent-token-users-help">Leer lassen für alle aktuellen und zukünftigen AD-Benutzer, einschließlich Administratoren. Zum Eingrenzen bis zu zehn Namen eingeben, einen pro Zeile.</p>
-        <label>Gültig für (Tage)<input name="days" type="number" min="1" max="365" value="30" required></label>
+        <label>Gültig für (Tage, optional)<input name="days" type="number" min="1" max="365" value="30" aria-describedby="agent-token-days-help"></label>
+        <p id="agent-token-days-help">Leer lassen für einen Token ohne Ablaufdatum.</p>
         <div class="toolbar"><button type="submit">Token erstellen</button></div>
       </form>
       <div id="agent-token-issued" hidden>
@@ -213,7 +214,9 @@ async function renderAgentTokens() {
       <tbody>${tokens.map(token => `<tr>
         <td>${esc(token.label)}</td>
         <td>${token.allUsers ? 'Alle aktuellen und zukünftigen AD-Benutzer' : esc(token.usernames.join(', '))}</td>
-        <td>${esc(utcTime(token.expiresAt * 1000))}${token.expiresAt * 1000 <= Date.now() ? ' (abgelaufen)' : ''}</td>
+        <td>${token.expiresAt === null
+          ? 'Unbegrenzt'
+          : esc(utcTime(token.expiresAt * 1000)) + (token.expiresAt * 1000 <= Date.now() ? ' (abgelaufen)' : '')}</td>
         <td>${esc(token.createdBy)}</td>
         <td><button type="button" data-revoke="${esc(token.id)}">Widerrufen</button></td>
       </tr>`).join('')}</tbody></table></div>`;
@@ -229,7 +232,13 @@ async function renderAgentTokens() {
     showError('');
 
     const usernames = form.elements.usernames.value.split(/\r?\n/).map(name => name.trim()).filter(Boolean);
-    if (usernames.length === 0 && !window.confirm('Token für alle aktuellen und zukünftigen AD-Benutzer einschließlich Administratoren erstellen?')) return;
+    const days = form.elements.days.value;
+    const expiresInDays = days === '' ? null : Number(days);
+
+    const warnings = [];
+    if (usernames.length === 0) warnings.push('Dieser Token gilt für alle aktuellen und zukünftigen AD-Benutzer einschließlich Administratoren.');
+    if (expiresInDays === null) warnings.push('Dieser Token läuft nicht ab und bleibt bis zum Widerruf gültig.');
+    if (warnings.length && !window.confirm(`${warnings.join('\n')}\n\nToken erstellen?`)) return;
 
     const button = form.querySelector('button[type="submit"]');
     button.disabled = true;
@@ -238,7 +247,7 @@ async function renderAgentTokens() {
       const result = await api('/api/agent-tokens', {method: 'POST', body: JSON.stringify({
         label: form.elements.label.value,
         usernames,
-        expiresInDays: Number(form.elements.days.value),
+        expiresInDays,
       })});
       output.value = result.token;
       issued.hidden = false;

@@ -38,7 +38,10 @@ func TestTokenExpiryAndRevocationAcrossReopen(t *testing.T) {
 	if err != nil || value.ID != issued.ID || value.AllUsers || !reflect.DeepEqual(accounts, value.Accounts) {
 		t.Fatal("token could not be used with its original SID scope")
 	}
-	store.now = func() time.Time { return time.Unix(issued.ExpiresAt, 0) }
+	if issued.ExpiresAt == nil {
+		t.Fatal("finite token was issued without an expiry")
+	}
+	store.now = func() time.Time { return time.Unix(*issued.ExpiresAt, 0) }
 	if _, err := store.Authenticate(ctx, issued.Raw); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("token accepted at expiry: %v", err)
 	}
@@ -48,6 +51,58 @@ func TestTokenExpiryAndRevocationAcrossReopen(t *testing.T) {
 	}
 	if _, err := store.Authenticate(ctx, issued.Raw); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("revoked token accepted: %v", err)
+	}
+}
+
+func TestNonExpiringTokenSurvivesTimeAndRemainsRevocable(t *testing.T) {
+	for _, allUsers := range []bool{false, true} {
+		name := "restricted"
+		if allUsers {
+			name = "all users"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			root := t.TempDir()
+			store, err := Open(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var issued Issued
+			if allUsers {
+				issued, err = store.IssueForAllUsers(ctx, name, NoExpiry, "admin")
+			} else {
+				issued, err = store.Issue(ctx, name, map[string]string{"S-1-5-21-1000": "sam"}, NoExpiry, "admin")
+			}
+			store.Close()
+			if err != nil || issued.ExpiresAt != nil {
+				t.Fatalf("could not issue a token without expiry: %v", err)
+			}
+
+			store, err = Open(ctx, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			future := time.Now().AddDate(100, 0, 0)
+			store.now = func() time.Time { return future }
+
+			token, err := store.Authenticate(ctx, issued.Raw)
+			if err != nil || token.ID != issued.ID || token.AllUsers != allUsers {
+				t.Fatalf("non-expiring token did not retain its scope in the future: %v", err)
+			}
+			rows, err := store.Inventory(ctx)
+			if err != nil || len(rows) != 1 || rows[0].ExpiresAt != nil {
+				t.Fatalf("inventory should have no expiry for this token: %v, %v", rows, err)
+			}
+
+			if revoked, err := store.Revoke(ctx, issued.ID); err != nil || !revoked {
+				t.Fatalf("could not revoke the non-expiring token: %v", err)
+			}
+			if _, err := store.Authenticate(ctx, issued.Raw); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("revoked non-expiring token was accepted: %v", err)
+			}
+		})
 	}
 }
 
