@@ -571,6 +571,10 @@ def main() -> int:
     check(http("/api/documents/"+scanned["id"]+"/preview", token=user_token).body.startswith(b"\xff\xd8"), "scan JPEG preview is absent")
     downloaded_scan = http("/api/documents/"+scanned["id"]+"/download", token=user_token)
     check(downloaded_scan.status == 200 and downloaded_scan.body.startswith(b"%PDF-"), "original scan download failed")
+    inline_scan = http("/api/documents/"+scanned["id"]+"/content", token=user_token)
+    check(inline_scan.status == 200 and inline_scan.headers.get("Content-Type") == "application/pdf"
+          and inline_scan.body == downloaded_scan.body, "PDF viewer did not receive the original scan")
+
     # An admin cannot use the user portal to inspect someone else's home either.
     check(http(query_path("/api/documents", {"q":"BOBPRIVATE742"}), token=token).json()["total"] == 0, "admin user portal exposes another home")
     office = eventually("Office document full text", lambda: http(query_path("/api/documents", {"q":"OFFICETEXT742"}), token=user_token),

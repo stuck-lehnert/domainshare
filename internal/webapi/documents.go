@@ -92,7 +92,8 @@ func (api DocumentAPI) ServeIdentity(w http.ResponseWriter, r *http.Request, pat
 			writeFile(w, r, file, document.Size, "application/octet-stream", document.Name, "attachment", false)
 			return
 		}
-		if document.Extension != ".pdf" {
+		// Download returns the public document metadata, without a leading dot.
+		if document.Extension != "pdf" {
 			documentError(w, os.ErrNotExist)
 			return
 		}
