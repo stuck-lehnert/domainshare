@@ -211,21 +211,24 @@ def prepare_upgrade(path):
                         timeout=60).json()["events"]
     event = next(item for item in events if is_upgrade_write(item))
 
-    agent = http("/admin/api/agent-tokens", method="POST", token=admin_session,
-                 value={"label": "Python upgrade fixture", "usernames": ["alice"], "expiresInDays": 1})
-    check(agent.status == 201, "unable to create Python agent token")
     policy = finance_policy(admin_session)
     check(policy["active"] and policy["permissions"], "the Finance share has no policy to migrate")
 
     fixture = {
         "admin": admin_session,
         "alice": alice_session,
-        "agent": agent.json()["token"],
         "policy": policy,
         "document": document["id"],
         "event": event["id"],
         "eventPath": event["path"],
     }
+    if os.environ.get("PREVIEW_BACKEND") != "split":
+        # The deployed baseline predates Agent tokens. The regular upgrade
+        # suite covers their preservation from the later Python backend.
+        agent = http("/admin/api/agent-tokens", method="POST", token=admin_session,
+                     value={"label": "Python upgrade fixture", "usernames": ["alice"], "expiresInDays": 1})
+        check(agent.status == 201, "unable to create Python agent token")
+        fixture["agent"] = agent.json()["token"]
     Path(path).write_text(json.dumps(fixture), encoding="utf-8")
 
 
@@ -253,10 +256,16 @@ def verify_upgrade(path):
         "source": "data:" + fixture["policy"]["id"],
         "path": f"Reports/{UPGRADE_NAME}",
     }
-    download = http(query_path("/api/agent/v1/file", file_params), token=fixture["agent"])
-    check(download.status == 200 and download.body == UPGRADE_CONTENT, "Python agent token could not read the migrated file")
+    agent_token = fixture.get("agent")
+    if agent_token is None:
+        agent = http("/admin/api/agent-tokens", method="POST", token=fixture["admin"],
+                     value={"label": "Migrated account", "usernames": ["alice"], "expiresInDays": 1})
+        check(agent.status == 201, "unable to issue a token for the migrated account")
+        agent_token = agent.json()["token"]
+    download = http(query_path("/api/agent/v1/file", file_params), token=agent_token)
+    check(download.status == 200 and download.body == UPGRADE_CONTENT, "agent token could not read the migrated file")
     file_params["username"] = "bob"
-    check(http(query_path("/api/agent/v1/file", file_params), token=fixture["agent"]).status == 403,
+    check(http(query_path("/api/agent/v1/file", file_params), token=agent_token).status == 403,
           "upgrade widened the old agent token scope")
 
 

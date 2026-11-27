@@ -51,6 +51,8 @@ jobs:
       DEV_BACKEND: ${{ matrix.backend }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - run: docker compose config --quiet
       - name: Run AD/Samba end-to-end tests
         shell: bash
@@ -63,6 +65,7 @@ jobs:
           # Keep the failure visible in the Checks API as well as the job log.
           failure=$(
             grep -E '(^\[e2e\]|^error:)' "$log" | tail -n 12 || true
+            awk '/^switching the disposable Python server to Go/{upgrading=1; next} /^===== /{upgrading=0} upgrading' "$log" | tail -n 24
             awk '/^===== [^ ]+-(files|management) =====/{print; found=1; next} /^===== /{found=0} found' "$log" | tail -n 32
           )
           failure=${failure:0:6000}

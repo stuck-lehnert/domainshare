@@ -53,8 +53,8 @@ switch, Go must serve that data and preserve the access restrictions. Both
 runs then use the same end-to-end suite. Do not run the preview against a live
 domain or production volumes.
 
-The split check upgrades the old combined server using `setup` and the real
-Compose service definitions on the preview network. It replaces management
+The split check builds the deployed revision `88f803d` and upgrades it using
+`setup` and the real Compose service definitions on the preview network. It replaces management
 while an SMB3 file handle is still open on FSLogix, then reads through the
 same handle and checks that Samba was not restarted.
 

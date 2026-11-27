@@ -46,6 +46,7 @@ case "$backend" in
 esac
 go_command=(/usr/local/bin/domainshare supervise --native)
 python_command=(python3 /app/entrypoint.py)
+legacy_revision=88f803daf29313571ff0266a421ed261015e2142
 
 dev_realm=${DEV_REALM:-DEV.TEST}
 dev_workgroup=${DEV_WORKGROUP:-DEV}
@@ -118,9 +119,13 @@ ca_root_file=
 upgrade_fixture=
 preview_compose=
 split_volumes=()
+legacy_source=
+legacy_container="$run_id-legacy"
+samba_container="$run_id-files"
 
 if [[ $backend == split ]]; then
-  containers=("$management_container" "${containers[@]}")
+  containers=("$management_container" "$legacy_container" "${containers[@]}")
+  files_container=$legacy_container
   for volume in samba_conf samba_run samba_cache samba_logs samba_readiness; do
     split_volumes+=("${run_id}_$volume")
   done
@@ -185,6 +190,9 @@ cleanup() {
   if [[ -n $preview_compose ]]; then
     rm -f -- "$preview_compose"
   fi
+  if [[ -n $legacy_source ]]; then
+    rm -rf -- "$legacy_source"
+  fi
   exit "$status"
 }
 
@@ -196,7 +204,7 @@ trap 'exit 131' QUIT
 
 show_logs() {
   local container
-  for container in "$dc_container" "$ca_container" "$backup_container" "$run_id-files" "$management_container" "$client_container"; do
+  for container in "$dc_container" "$ca_container" "$backup_container" "$legacy_container" "$samba_container" "$management_container" "$client_container"; do
     if "$engine" inspect "$container" >/dev/null 2>&1; then
       printf '\n===== %s =====\n' "$container" >&2
       "$engine" logs --tail 160 "$container" >&2 || true
@@ -264,7 +272,12 @@ printf 'engine: %s\n' "$engine"
 if [[ ${DEV_SKIP_BUILD:-0} != 1 ]]; then
   printf 'building file server image: %s\n' "$server_image"
   "$engine" build -t "$server_image" -f "$repo_root/Dockerfile" "$repo_root"
-  if [[ $backend != go ]]; then
+  if [[ $backend == split ]]; then
+    printf 'building the deployed legacy revision: %s\n' "$legacy_revision"
+    legacy_source=$(mktemp -d)
+    git archive "$legacy_revision" | tar -x -C "$legacy_source"
+    "$engine" build -t "$python_image" -f "$legacy_source/Dockerfile" "$legacy_source"
+  elif [[ $backend != go ]]; then
     printf 'building the Python compatibility image: %s\n' "$python_image"
     "$engine" build --target python-compat -t "$python_image" -f "$repo_root/Dockerfile" "$repo_root"
   fi
@@ -608,9 +621,9 @@ if [[ $backend == upgrade || $backend == split ]]; then
     preview_compose=$(mktemp --suffix=.json)
     COMPOSE_PROJECT_NAME="$run_id" docker compose -f "$repo_root/docker-compose.yml" config --format json |
       python3 "$repo_root/dev/split-compose.py" "$network_name" "$files_ip" "${subnet_prefix}31" \
-        "$dc_ip" "$dev_dns_domain" "$dev_https_port" "$files_container" "$management_container" "$server_image" \
+        "$dc_ip" "$dev_dns_domain" "$dev_https_port" "$samba_container" "$management_container" "$server_image" \
         "$private_volume" "$fslogix_volume" "$groups_volume" "$state_volume" "$samba_volume" > "$preview_compose"
-    export COMPOSE_FILE="$preview_compose" COMPOSE_PROJECT_NAME="$run_id" PREVIEW_SAMBA_CONTAINER="$files_container"
+    export COMPOSE_FILE="$preview_compose" COMPOSE_PROJECT_NAME="$run_id" PREVIEW_SAMBA_CONTAINER="$samba_container"
     if ! "$repo_root/setup" --skip-build; then
       show_logs
       die 'Compose split migration failed'
