@@ -619,7 +619,7 @@ if [[ $backend == upgrade || $backend == split ]]; then
   printf 'switching the disposable Python server to Go on the same AD account and volumes\n'
   if [[ $backend == split ]]; then
     preview_compose=$(mktemp --suffix=.json)
-    COMPOSE_PROJECT_NAME="$run_id" docker compose -f "$repo_root/docker-compose.yml" config --format json |
+    COMPOSE_PROJECT_NAME="$run_id" docker compose -f "$repo_root/docker-compose.yml" --profile tools config --format json |
       python3 "$repo_root/dev/split-compose.py" "$network_name" "$files_ip" "${subnet_prefix}31" \
         "$dc_ip" "$dev_dns_domain" "$dev_https_port" "$samba_container" "$management_container" "$server_image" \
         "$private_volume" "$fslogix_volume" "$groups_volume" "$state_volume" "$samba_volume" > "$preview_compose"

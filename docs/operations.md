@@ -50,7 +50,7 @@ The `samba` container owns SMB and Winbind. The separate `management` container 
 
 - `./redeploy` pulls the current branch and normally rebuilds and updates only `management`. Open SMB connections and FSLogix handles stay with the running Samba container. The web UI may briefly reconnect.
 - `./redeploy --restart-samba` also rebuilds and replaces Samba. Use it for Samba package, image, or template updates, and schedule it outside active FSLogix sessions. The setup script stops management before replacing the Samba container that owns its PID namespace.
-- Migrating an older combined container requires **one SMB interruption** to split the services. `./setup` or `./redeploy` detects the old container and keeps its existing volumes, machine identity, credentials and ACLs. Do not run `down -v`.
+- Migrating an older combined container requires **one SMB interruption** to split the services. `./setup` or `./redeploy` detects the old container and keeps its existing volumes, machine identity, credentials and ACLs. Keep the existing checkout and Compose project; if Git is detached at a commit, first switch to a tracked release branch. Do not run `down -v`.
 
 Compose publishes fixed ports 80 and 443, plus SMB 139 and 445. A deployment requiring different host ports can use a Compose override; it does not configure application credentials or backup destinations. TLS, AD settings and backup configuration are managed in the browser.
 

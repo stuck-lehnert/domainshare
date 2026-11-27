@@ -31,7 +31,7 @@ case "$*" in
   'inspect previous-container --format {{json .Config.Env}}')
     printf '["REALM=EXAMPLE.TEST"]\\n'
     ;;
-  'compose run --rm --no-deps -T samba domainshare import-runtime')
+  'compose --profile tools run --rm --no-deps -T config-import domainshare import-runtime')
     [[ $(cat) == '["REALM=EXAMPLE.TEST"]' ]]
     ;;
 esac
@@ -65,7 +65,7 @@ esac
         self.assertEqual(commands[0], "compose build samba management")
         self.assertCountEqual(commands[1:3], [
             "inspect previous-container --format {{json .Config.Env}}",
-            "compose run --rm --no-deps -T samba domainshare import-runtime",
+            "compose --profile tools run --rm --no-deps -T config-import domainshare import-runtime",
         ])
         self.assertEqual(commands[3:], [
             "compose stop management",

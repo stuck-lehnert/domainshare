@@ -32,9 +32,9 @@ fi
 # container with no published ports or dependency on a running smbd.
 if [[ "$migrate" == 1 ]]; then
   docker inspect "$previous_container" --format '{{json .Config.Env}}' |
-    docker compose run --rm --no-deps -T samba domainshare import-runtime
+    docker compose --profile tools run --rm --no-deps -T config-import domainshare import-runtime
 elif [[ -z "$previous_container" && -f .env ]]; then
-  docker compose run --rm --no-deps -T samba domainshare import-legacy < .env
+  docker compose --profile tools run --rm --no-deps -T config-import domainshare import-legacy < .env
 fi
 
 if [[ "$migrate" == 1 || "$restart_samba" == 1 ]]; then

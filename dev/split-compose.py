@@ -36,6 +36,7 @@ def main():
         )
 
     compose["services"]["management"]["ports"] = [f"127.0.0.1:{https_port}:8443"]
+    compose["services"]["config-import"]["image"] = image
     json.dump(compose, sys.stdout)
 
 

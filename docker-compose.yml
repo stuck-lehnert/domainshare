@@ -53,6 +53,15 @@ services:
       retries: 5
       start_period: 45s
 
+  config-import:
+    profiles: ["tools"]
+    image: domainshare-samba:latest
+    pull_policy: never
+    network_mode: none
+    command: ["true"]
+    volumes:
+      - state_data:/state
+
 volumes:
   private_data:
   fslogix_data:
