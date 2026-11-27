@@ -636,6 +636,14 @@ if [[ "${1:-}" == "--configure-tls" ]]; then
   configure_web_tls
   exit 0
 fi
+if [[ "${1:-}" == "--renew-tls" ]]; then
+  configure_web_tls
+  case "$ACTIVE_WEB_TLS_MODE" in
+    acme) start_acme_renewal_daemon; wait "$!" ;;
+    ca) exec step ca renew --daemon --force "$WEB_TLS_CERT_FILE" "$WEB_TLS_KEY_FILE" ;;
+  esac
+  exit 0
+fi
 if [[ "${1:-}" == "--bootstrap-domain" ]]; then
   export DOMAIN_USERS_SID="${DOMAIN_USERS_SID:-S-1-5-32-545}"
   export DOMAIN_ADMINS_SID="${DOMAIN_ADMINS_SID:-S-1-5-32-544}"
@@ -702,7 +710,9 @@ else
   python3 /app/trash.py --cleanup
 fi
 
-start_observability_services
+if [[ "${DOMAINSHARE_SAMBA_ONLY:-false}" != "true" ]]; then
+  start_observability_services
+fi
 
 if [[ -n "${BACKUP_DESTINATION:-}" ]] && env_is_true "${BACKUP_AUTO_ENABLED:-true}"; then
   log "Backups enabled: automatic daily run at ${BACKUP_START_HOUR}:00 UTC and manual runs available."

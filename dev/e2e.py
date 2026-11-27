@@ -192,7 +192,7 @@ def finance_policy(session):
 
 
 def prepare_upgrade(path):
-    announce("creating a live SMB file, audit event, catalog row, sessions and agent token with Python")
+    announce("creating a live SMB file, audit event, catalog row and sessions with Python")
     admin = http("/api/login", method="POST", value={"username": ADMIN_USER, "password": ADMIN_PASSWORD})
     alice = http("/api/login", method="POST", value={"username": "alice", "password": USER_PASSWORD})
     check(admin.status == alice.status == 200, "unable to start Python upgrade sessions")
@@ -233,10 +233,20 @@ def prepare_upgrade(path):
 
 
 def verify_upgrade(path):
-    announce("verifying Python sessions, share policy, audit, index and agent file access after the Go switch")
+    announce("verifying share policy, audit, index and agent access after the Go switch")
     fixture = json.loads(Path(path).read_text(encoding="utf-8"))
     session = http("/api/session", token=fixture["alice"])
-    check(session.status == 200 and session.json()["user"] == f"{WORKGROUP}\\alice", "Python session was not preserved")
+    if os.environ.get("PREVIEW_BACKEND") == "split":
+        # 88f803d predates the DomainShare JWT issuer and cookie names. As in
+        # the original rename, its browser sessions must not be carried over.
+        check(session.status == 401, f"pre-rename browser session was not expired: HTTP {session.status}")
+        for key, username, password in (("admin", ADMIN_USER, ADMIN_PASSWORD), ("alice", "alice", USER_PASSWORD)):
+            login = http("/api/login", method="POST", value={"username": username, "password": password})
+            check(login.status == 200, f"cannot sign in after upgrading as {username}: HTTP {login.status}")
+            fixture[key] = login.json()["token"]
+    else:
+        check(session.status == 200 and session.json()["user"] == f"{WORKGROUP}\\alice",
+              f"Python session was not preserved: HTTP {session.status}")
     check(finance_policy(fixture["admin"]) == fixture["policy"], "the Finance share policy changed during the upgrade")
 
     activity = upgrade_activity(fixture["admin"])

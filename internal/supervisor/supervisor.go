@@ -30,10 +30,12 @@ type runner struct {
 	options             Options
 	ui, domain, http    *process
 	backup, certificate *process
+	renewal             *process
 	audit, index        *process
 	reconcile, trash    *process
 	revision            int64
 	nextDomain, nextTLS time.Time
+	nextRenewal         time.Time
 	lastServiceStatus   string
 	backupAttempt       string
 	lastReconcile       string
@@ -102,7 +104,7 @@ func Run(ctx context.Context, store *config.Store, options Options) error {
 	run := &runner{store: store, options: options, revision: -1}
 	defer func() {
 		_ = run.removeReadiness()
-		for _, child := range []*process{run.ui, run.audit, run.index, run.reconcile, run.trash, run.domain, run.backup, run.certificate, run.http} {
+		for _, child := range []*process{run.ui, run.audit, run.index, run.reconcile, run.trash, run.domain, run.backup, run.certificate, run.renewal, run.http} {
 			child.stop()
 		}
 		_ = run.removeReadiness()
@@ -165,6 +167,10 @@ func (run *runner) tick(ctx context.Context, now time.Time) error {
 		if err := run.domainTick(ctx, snapshot, environment, now, tlsReady); err != nil {
 			return err
 		}
+	} else if tlsReady {
+		if err := run.renewTLS(snapshot, environment, now); err != nil {
+			return err
+		}
 	}
 	if run.options.Native {
 		if !run.servicesReady(snapshot) {
@@ -183,10 +189,11 @@ func (run *runner) restartServices(ctx context.Context, revision int64) error {
 		return err
 	}
 
-	for _, child := range []*process{run.ui, run.audit, run.index, run.reconcile, run.trash, run.domain, run.certificate} {
+	for _, child := range []*process{run.ui, run.audit, run.index, run.reconcile, run.trash, run.domain, run.certificate, run.renewal} {
 		child.stop()
 	}
 	run.domain, run.certificate, run.ui = nil, nil, nil
+	run.renewal = nil
 	run.audit, run.index, run.reconcile, run.trash = nil, nil, nil, nil
 	if err := run.removeReadiness(); err != nil {
 		return err
@@ -194,6 +201,7 @@ func (run *runner) restartServices(ctx context.Context, revision int64) error {
 
 	run.revision = revision
 	run.nextDomain, run.nextTLS = time.Time{}, time.Time{}
+	run.nextRenewal = time.Time{}
 	if err := tlssetup.Prepare(ctx, run.store); err != nil {
 		return run.serviceStatus("failed", "HTTPS-Zertifikat konnte nicht eingerichtet werden")
 	}
@@ -214,9 +222,11 @@ func (run *runner) tls(ctx context.Context, snapshot config.Snapshot, environmen
 		}
 	}
 
-	wantsACME := snapshot.Values.String("WEB_TLS_MODE") == "acme" && snapshot.Values.String("ACME_CA_SERVER") != ""
+	mode := snapshot.Values.String("WEB_TLS_MODE")
+	wantsCertificate := (mode == "acme" && snapshot.Values.String("ACME_CA_SERVER") != "") ||
+		(run.options.Role == "management" && mode == "ca")
 	marker := tlssetup.BootstrapMarker(environment["WEB_TLS_CERT_FILE"])
-	pending := wantsACME && exists(marker)
+	pending := wantsCertificate && exists(marker)
 	if pending && run.certificate == nil && !now.Before(run.nextTLS) && ctx.Err() == nil {
 		if err := tlssetup.WriteStatus(run.store.Root(), tlssetup.Status{State: "working", Message: "ACME-Zertifikat wird angefordert"}); err != nil {
 			return false, err
@@ -228,7 +238,29 @@ func (run *runner) tls(ctx context.Context, snapshot config.Snapshot, environmen
 		}
 		run.certificate = child
 	}
-	return !wantsACME || (!pending && run.certificate == nil), nil
+	return !wantsCertificate || (!pending && run.certificate == nil), nil
+}
+
+func (run *runner) renewTLS(snapshot config.Snapshot, environment map[string]string, now time.Time) error {
+	mode := snapshot.Values.String("WEB_TLS_MODE")
+	if !snapshot.Values.Bool("WEB_TLS_AUTORENEW") || (mode != "acme" && mode != "ca") {
+		return nil
+	}
+	if run.renewal != nil && !run.renewal.exited() {
+		return nil
+	}
+	if now.Before(run.nextRenewal) {
+		return nil
+	}
+
+	run.renewal.stop()
+	child, err := run.launchInit(environment, "--renew-tls")
+	if err != nil {
+		return err
+	}
+	run.renewal = child
+	run.nextRenewal = now.Add(time.Minute)
+	return nil
 }
 
 func (run *runner) domainTick(ctx context.Context, snapshot config.Snapshot, environment map[string]string, now time.Time, tlsReady bool) error {
