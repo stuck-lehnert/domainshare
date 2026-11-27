@@ -1,13 +1,13 @@
 module github.com/stuck-lehnert/domainshare
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/google/uuid v1.6.0
 	golang.org/x/crypto v0.42.0
-	golang.org/x/image v0.31.0
-	golang.org/x/sys v0.36.0
-	golang.org/x/text v0.29.0
+	golang.org/x/image v0.48.0
+	golang.org/x/sys v0.50.0
+	golang.org/x/text v0.44.0
 	modernc.org/sqlite v1.39.1
 )
 
