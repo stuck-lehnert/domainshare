@@ -212,6 +212,7 @@ mark { background: #fff0a0; color: #111; }
 .document-dialog::backdrop { background: #0006; }
 .document-dialog-head { display: flex; align-items: start; justify-content: space-between; gap: 1rem; padding: 1rem; border-bottom: 1px solid #aaa; }
 .document-dialog-head > div:first-child { min-width: 0; }
+.document-dialog-head .row-actions { flex-shrink: 0; flex-wrap: nowrap; }
 .document-dialog-head h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: .3rem; }
 .document-dialog-head p { font-size: .85rem; overflow-wrap: anywhere; margin-bottom: 0; }
 .document-detail { height: calc(100% - 95px); min-height: 0; }
@@ -249,7 +250,6 @@ mark { background: #fff0a0; color: #111; }
   .document-detail { display: block; height: auto; }
   .document-dialog { overflow: auto; }
   .document-dialog-head { gap: .5rem; }
-  .document-dialog-head .row-actions { flex-wrap: nowrap; }
 }
 
 /* Setup and configuration use the existing typography, borders and controls. */

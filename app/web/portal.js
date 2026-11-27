@@ -120,7 +120,9 @@ async function loadDetail(id, open = true) {
     $("#document-download").download = row.name;
     $("#document-download").innerHTML = icon("download");
     $("#document-close").innerHTML = icon("close");
-    const previewUrl = isPdf ? `/assets/vendor/pdfjs/6.3.289-app1/web/viewer.html?file=${encodeURIComponent(`/api/documents/${id}/content?v=${row.version}`)}#zoom=page-width` : row.hasPreview ? `/api/documents/${id}/preview?v=${row.version}` : "";
+    const previewUrl = isPdf
+      ? `/assets/vendor/pdfjs/6.3.289-app1/web/viewer.html?file=${encodeURIComponent(`/api/documents/${id}/content?v=${row.version}`)}#zoom=page-fit`
+      : row.hasPreview ? `/api/documents/${id}/preview?v=${row.version}` : "";
     if ($("#document-preview").dataset.url !== previewUrl) {
       $("#document-preview").dataset.url = previewUrl;
       $("#document-preview").innerHTML = isPdf ? `<iframe id="document-pdf-viewer" src="${esc(previewUrl)}" title="PDF-Vorschau" allowfullscreen sandbox="allow-scripts allow-same-origin allow-downloads allow-modals"></iframe>` : previewUrl ? `<img src="${previewUrl}" alt="Dokumentvorschau">` : `<div class="document-placeholder">${icon("file")}<p>Keine Bildvorschau verfügbar.</p></div>`;

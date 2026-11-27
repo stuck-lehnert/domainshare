@@ -18,6 +18,14 @@ const fixtures=[
  ['Umsatzübersicht.csv','csv','data:finance','',false],
  ['Gescanntes Protokoll.pdf','pdf','data:projects','',true]
 ].map(([name,extension,sourceId,text,hasPreview],index)=>({id:(index+1).toString(16).padStart(32,'0'),name,extension,sourceId,text,path:'Dokumente/'+name,source:sources.find(source=>source.id===sourceId).label,kind:sources.find(source=>source.id===sourceId).kind,size:143360+index*1024,modified:1791023400-index*86400,state:index===4?'ocr':'ready',pages:extension==='pdf'?3:0,hasPreview,version:'aaaaaaaaaaaaaaaa',snippet:text}));
+fixtures[0].path = [
+ 'Kaufmännische Unterlagen und monatliche Auswertungen',
+ 'Abgeschlossene Projekte und internationale Niederlassungen',
+ 'Rechnungen und Zahlungsbelege aus dem vierten Quartal',
+ 'Büroausstattung für die neuen Arbeitsplätze und Besprechungsräume',
+ fixtures[0].name,
+].join('/');
+
 // A small native three-page PDF exercises the real viewer, including its find bar.
 function viewerPdf() {
  const objects=['<< /Type /Catalog /Pages 2 0 R >>','<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>'];
@@ -94,6 +102,31 @@ try {
  });
  const shot=async name=>{await page.waitForFunction(()=>Array.from(document.images).filter(img=>img.loading!=='lazy'||img.getBoundingClientRect().top<innerHeight).every(img=>img.complete));await page.screenshot({path:path.join(out,name+'.png'),fullPage:!await page.locator('#document-dialog').isVisible()});};
  const all=()=>page.waitForFunction(()=>document.querySelectorAll('.document-card').length===5);
+ const viewer = page.frameLocator('#document-pdf-viewer');
+ const checkPdfOpening = async () => {
+  const firstPage = viewer.locator('.page[data-page-number="1"] canvas');
+  await firstPage.waitFor();
+
+  const download = await page.locator('#document-download').boundingBox();
+  const close = await page.locator('#document-close').boundingBox();
+  const header = await page.locator('.document-dialog-head').boundingBox();
+
+  assert.ok(Math.abs(download.y - close.y) <= 1, 'Download and close icons must stay on the same row');
+  assert.ok(download.x + download.width <= close.x && close.x + close.width <= header.x + header.width,
+   'Both actions must fit in the header');
+
+  const { scale, bounds, viewport } = await firstPage.evaluate(canvas => ({
+   scale: window.PDFViewerApplication.pdfViewer.currentScaleValue,
+   bounds: canvas.getBoundingClientRect().toJSON(),
+   viewport: document.querySelector('#viewerContainer').getBoundingClientRect().toJSON(),
+  }));
+  const fullyVisible = bounds.top >= viewport.top - 1 && bounds.bottom <= viewport.bottom + 1 &&
+   bounds.left >= viewport.left - 1 && bounds.right <= viewport.right + 1;
+
+  assert.equal(scale, 'page-fit', 'PDF previews must start in whole-page mode');
+  assert.ok(fullyVisible, `The first page must be fully visible: ${JSON.stringify({ bounds, viewport })}`);
+ };
+
  await page.goto('http://domainshare.test/');await all();
  assert.equal(await page.locator('#admin-link').isHidden(),true);
  assert.equal(await page.locator('nav a[href^="/admin"]').count(),0);
@@ -110,8 +143,7 @@ try {
  await page.locator('[data-document]').click();
  await page.locator('#document-dialog').waitFor({state:'visible'});
  assert.equal(await page.locator('.document-text, #document-content').count(),0);
- const viewer=page.frameLocator('#document-pdf-viewer');
- await viewer.locator('.page canvas').first().waitFor();
+ await checkPdfOpening();
  assert.deepEqual(await page.locator('#document-dialog').boundingBox(),{x:0,y:0,width:1500,height:1050});
  await viewer.locator('#pageNumber').fill('2');await viewer.locator('#pageNumber').press('Enter');
  await page.waitForFunction(()=>document.querySelector('#document-pdf-viewer').contentWindow.PDFViewerApplication.page===2);
@@ -206,7 +238,7 @@ try {
  await page.locator('[data-document]').first().click();
  await page.locator('#document-dialog').waitFor({state:'visible'});
  assert.equal(await page.evaluate(()=>document.querySelector('#document-dialog').scrollWidth>document.querySelector('#document-dialog').clientWidth),false);
- await page.frameLocator('#document-pdf-viewer').locator('.page canvas').first().waitFor();
+ await checkPdfOpening();
  assert.deepEqual(await page.locator('#document-dialog').boundingBox(),{x:0,y:0,width:390,height:844});
  const backgroundScroll=await page.evaluate(()=>scrollY);
  assert.ok(backgroundScroll>0,'Use a genuinely scrolled background for the modal test');
@@ -266,6 +298,6 @@ try {
  assert.equal(await page.locator('#admin-link').isVisible(),true);
  assert.ok(pendingRequests.includes('FINANZ742')&&pendingRequests.includes('SCANLIVE742'));
  assert.deepEqual(errors,[]);
- console.log('PASS: user login, admin separation, live content search, own-private filter, cursor pagination and reset, exact/lower-bound counts, preview/download links, OCR refresh, revocation, grid/list, desktop/mobile, portrait/landscape image fitting.');
+ console.log('PASS: user login, admin separation, live content search, own-private filter, cursor pagination and reset, exact/lower-bound counts, preview/download links, OCR refresh, revocation, grid/list, desktop/mobile, PDF page fit and header actions, portrait/landscape image fitting.');
  console.log('Screenshots: '+out);
 } finally {await browser.close();}
